@@ -491,4 +491,466 @@ class Tests_Cache extends WP_UnitTestCase {
 
 		$this->assertSame( $expected, $found );
 	}
+
+	/**
+	 * Ensures a group is only accounted for once it has actually been read.
+	 *
+	 * @covers WP_Object_Cache::get
+	 */
+	public function test_get_records_a_miss_for_an_untouched_group() {
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
+		}
+
+		$this->assertSame(
+			array(),
+			$this->cache->cache_group_stats,
+			'A new cache object should not report statistics for any group.'
+		);
+
+		$this->assertFalse(
+			$this->cache->get( 'test_untouched_group', 'group-a' ),
+			'Reading a key that was never set should return false.'
+		);
+
+		$this->assertSame(
+			array(
+				'group-a' => array(
+					'hits'   => 0,
+					'misses' => 1,
+				),
+			),
+			$this->cache->cache_group_stats,
+			'The first read of a group should record a single miss for that group alone.'
+		);
+	}
+
+	/**
+	 * Ensures hits and misses are counted for the right group, and not swapped.
+	 *
+	 * @covers WP_Object_Cache::get
+	 */
+	public function test_get_records_a_hit_after_the_value_is_set() {
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
+		}
+
+		$this->cache->set( 'foo', 'bar', 'group-a' );
+
+		$this->assertSame( 'bar', $this->cache->get( 'foo', 'group-a' ), 'The stored value should be returned.' );
+
+		$this->assertSame(
+			array(
+				'hits'   => 1,
+				'misses' => 0,
+			),
+			$this->cache->cache_group_stats['group-a'],
+			'Reading a stored value should record a hit and no miss.'
+		);
+
+		$this->assertFalse( $this->cache->get( 'missing', 'group-a' ), 'A key that was never set should return false.' );
+
+		$this->assertSame(
+			array(
+				'hits'   => 1,
+				'misses' => 1,
+			),
+			$this->cache->cache_group_stats['group-a'],
+			'A miss should not be counted as a hit, or the other way around.'
+		);
+	}
+
+	/**
+	 * Ensures reads without a group are attributed to the default group.
+	 *
+	 * @covers WP_Object_Cache::get
+	 */
+	public function test_get_normalizes_an_empty_group_to_default() {
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
+		}
+
+		$this->assertFalse( $this->cache->get( 'foo', '' ), 'Reading a key that was never set should return false.' );
+		$this->assertFalse( $this->cache->get( 'foo', null ), 'Reading a key that was never set should return false.' );
+
+		$this->assertArrayNotHasKey(
+			'',
+			$this->cache->cache_group_stats,
+			'An empty group name should not be recorded as a group of its own.'
+		);
+
+		$this->assertSame(
+			array(
+				'hits'   => 0,
+				'misses' => 2,
+			),
+			$this->cache->cache_group_stats['default'],
+			'Both reads should be attributed to the default group.'
+		);
+	}
+
+	/**
+	 * Ensures one group missing does not distort the figures of another.
+	 *
+	 * @covers WP_Object_Cache::get
+	 */
+	public function test_get_keeps_the_statistics_of_each_group_separate() {
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
+		}
+
+		$this->cache->set( 'foo', 'bar', 'group-a' );
+
+		$this->assertSame( 'bar', $this->cache->get( 'foo', 'group-a' ), 'The stored value should be returned.' );
+		$this->assertFalse( $this->cache->get( 'foo', 'group-b' ), 'The key was only stored in group-a.' );
+		$this->assertFalse( $this->cache->get( 'missing', 'group-a' ), 'A key that was never set should return false.' );
+
+		$this->assertSame(
+			array(
+				'hits'   => 1,
+				'misses' => 1,
+			),
+			$this->cache->cache_group_stats['group-a'],
+			'Only the reads made against group-a should be counted for it.'
+		);
+
+		$this->assertSame(
+			array(
+				'hits'   => 0,
+				'misses' => 1,
+			),
+			$this->cache->cache_group_stats['group-b'],
+			'Only the reads made against group-b should be counted for it.'
+		);
+
+		$this->assertArrayNotHasKey(
+			'default',
+			$this->cache->cache_group_stats,
+			'A read with an explicit group should not be attributed to the default group.'
+		);
+	}
+
+	/**
+	 * Ensures a global group is recorded under its own name.
+	 *
+	 * Global groups skip the blog prefix a Multisite install otherwise adds to the
+	 * key, so this confirms the statistics are keyed by group either way.
+	 *
+	 * @covers WP_Object_Cache::get
+	 */
+	public function test_get_attributes_statistics_to_a_global_group() {
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
+		}
+
+		// 'global-cache-test' is registered as a global group by init_cache().
+		$this->cache->set( 'foo', 'bar', 'global-cache-test' );
+
+		$this->assertSame( 'bar', $this->cache->get( 'foo', 'global-cache-test' ), 'The stored value should be returned.' );
+		$this->assertFalse( $this->cache->get( 'missing', 'global-cache-test' ), 'A key that was never set should return false.' );
+
+		$this->assertSame(
+			array(
+				'hits'   => 1,
+				'misses' => 1,
+			),
+			$this->cache->cache_group_stats['global-cache-test'],
+			'A global group should be recorded under its own name.'
+		);
+	}
+
+	/**
+	 * Ensures a multi-key read is counted once per key rather than once per call.
+	 *
+	 * @covers WP_Object_Cache::get_multiple
+	 */
+	public function test_get_multiple_records_one_result_for_each_key() {
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
+		}
+
+		$this->cache->set( 'foo1', 'bar', 'group1' );
+		$this->cache->set( 'foo2', 'bar', 'group1' );
+
+		$this->cache->get_multiple( array( 'foo1', 'foo2', 'foo3' ), 'group1' );
+
+		$this->assertSame(
+			array(
+				'hits'   => 2,
+				'misses' => 1,
+			),
+			$this->cache->cache_group_stats['group1'],
+			'Each requested key should be counted separately.'
+		);
+	}
+
+	/**
+	 * Ensures the per-group figures add up to the totals they break down.
+	 *
+	 * @covers WP_Object_Cache::get
+	 */
+	public function test_group_statistics_add_up_to_the_overall_totals() {
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
+		}
+
+		$this->cache->set( 'foo', 'bar', 'group-a' );
+		$this->cache->set( 'foo', 'bar', 'group-b' );
+
+		$this->cache->get( 'foo', 'group-a' );
+		$this->cache->get( 'foo', 'group-a' );
+		$this->cache->get( 'foo', 'group-b' );
+		$this->cache->get( 'missing', 'group-a' );
+		$this->cache->get( 'missing', 'group-c' );
+
+		$hits   = 0;
+		$misses = 0;
+
+		foreach ( $this->cache->cache_group_stats as $group_stats ) {
+			$hits   += $group_stats['hits'];
+			$misses += $group_stats['misses'];
+		}
+
+		$this->assertSame( 3, $hits, 'Three of the reads should have been counted as hits.' );
+		$this->assertSame( 2, $misses, 'Two of the reads should have been counted as misses.' );
+		$this->assertSame( $this->cache->cache_hits, $hits, 'The per-group hits should add up to the overall hit count.' );
+		$this->assertSame( $this->cache->cache_misses, $misses, 'The per-group misses should add up to the overall miss count.' );
+	}
+
+	/**
+	 * Ensures a rejected key does not bring a group into the statistics.
+	 *
+	 * @covers WP_Object_Cache::get
+	 */
+	public function test_get_does_not_record_a_group_for_an_invalid_key() {
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
+		}
+
+		$this->setExpectedIncorrectUsage( 'WP_Object_Cache::get' );
+
+		$this->assertFalse( $this->cache->get( '', 'group-a' ), 'An empty key is not valid, so the read should fail.' );
+
+		$this->assertSame(
+			array(),
+			$this->cache->cache_group_stats,
+			'A read that never got as far as the cache should not create a group entry.'
+		);
+	}
+
+	/**
+	 * Ensures emptying the cache does not discard what has been measured so far.
+	 *
+	 * @covers WP_Object_Cache::flush
+	 */
+	public function test_flush_does_not_reset_the_group_statistics() {
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
+		}
+
+		$this->cache->set( 'foo', 'bar', 'group-a' );
+		$this->cache->get( 'foo', 'group-a' );
+
+		$this->cache->flush();
+
+		$this->assertArrayHasKey(
+			'group-a',
+			$this->cache->cache_group_stats,
+			'Flushing the cache should not discard the statistics collected so far.'
+		);
+
+		$this->assertSame(
+			array(
+				'hits'   => 1,
+				'misses' => 0,
+			),
+			$this->cache->cache_group_stats['group-a'],
+			'Flushing the cache should not change the statistics collected so far.'
+		);
+
+		$this->assertFalse( $this->cache->get( 'foo', 'group-a' ), 'The value should be gone after a flush.' );
+
+		$this->assertSame(
+			array(
+				'hits'   => 1,
+				'misses' => 1,
+			),
+			$this->cache->cache_group_stats['group-a'],
+			'The read after the flush should be added to the existing counters.'
+		);
+	}
+
+	/**
+	 * Ensures emptying a single group does not discard its measurements or another's.
+	 *
+	 * @covers WP_Object_Cache::flush_group
+	 */
+	public function test_flush_group_does_not_reset_the_group_statistics() {
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
+		}
+
+		$this->cache->set( 'foo', 'bar', 'group-a' );
+		$this->cache->set( 'foo', 'bar', 'group-b' );
+		$this->cache->get( 'foo', 'group-a' );
+		$this->cache->get( 'foo', 'group-b' );
+
+		$this->cache->flush_group( 'group-a' );
+
+		$this->assertArrayHasKey(
+			'group-a',
+			$this->cache->cache_group_stats,
+			'Flushing a group should not discard the statistics collected for it.'
+		);
+
+		$this->assertSame(
+			array(
+				'hits'   => 1,
+				'misses' => 0,
+			),
+			$this->cache->cache_group_stats['group-a'],
+			'Flushing a group should not change the statistics collected for it.'
+		);
+
+		$this->assertSame(
+			array(
+				'hits'   => 1,
+				'misses' => 0,
+			),
+			$this->cache->cache_group_stats['group-b'],
+			'Flushing one group should not affect the statistics of another.'
+		);
+
+		$this->assertFalse( $this->cache->get( 'foo', 'group-a' ), 'The value should be gone after the group was flushed.' );
+		$this->assertSame( 'bar', $this->cache->get( 'foo', 'group-b' ), 'The other group should still hold its value.' );
+
+		$this->assertSame(
+			array(
+				'hits'   => 1,
+				'misses' => 1,
+			),
+			$this->cache->cache_group_stats['group-a'],
+			'The read after the group was flushed should be added to the existing counters.'
+		);
+	}
+
+	/**
+	 * Ensures the deprecated key reset does not discard what has been measured.
+	 *
+	 * @covers WP_Object_Cache::reset
+	 */
+	public function test_reset_does_not_reset_the_group_statistics() {
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
+		}
+
+		$this->setExpectedDeprecated( 'reset' );
+
+		$this->cache->set( 'foo', 'bar', 'group-a' );
+		$this->cache->get( 'foo', 'group-a' );
+		$this->cache->get( 'missing', 'group-a' );
+
+		$this->cache->reset();
+
+		$this->assertArrayHasKey(
+			'group-a',
+			$this->cache->cache_group_stats,
+			'Resetting the cache keys should not discard the statistics collected so far.'
+		);
+
+		$this->assertSame(
+			array(
+				'hits'   => 1,
+				'misses' => 1,
+			),
+			$this->cache->cache_group_stats['group-a'],
+			'Resetting the cache keys should not change the statistics collected so far.'
+		);
+	}
+
+	/**
+	 * Ensures the statistics output carries the figures of each stored group.
+	 *
+	 * @covers WP_Object_Cache::stats
+	 */
+	public function test_stats_reports_the_hits_and_misses_of_each_group() {
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
+		}
+
+		$this->cache->set( 'foo', 'bar', 'group-a' );
+		$this->cache->get( 'foo', 'group-a' );
+		$this->cache->get( 'missing', 'group-a' );
+
+		ob_start();
+		$this->cache->stats();
+		$output = ob_get_clean();
+
+		$this->assertStringContainsString( '<strong>Cache Hits:</strong> 1', $output, 'The totals should still be reported.' );
+		$this->assertStringContainsString( '<strong>Cache Misses:</strong> 1', $output, 'The totals should still be reported.' );
+		$this->assertStringContainsString( 'group-a', $output, 'The stored group should be listed.' );
+		$this->assertStringContainsString( '1 hits, 1 misses', $output, 'The group line should carry its own hit and miss counts.' );
+	}
+
+	/**
+	 * Ensures a group that only ever missed is reported rather than left out.
+	 *
+	 * The list of stored groups cannot show it, which is the blind spot the
+	 * per-group counters exist to close.
+	 *
+	 * @covers WP_Object_Cache::stats
+	 */
+	public function test_stats_lists_groups_that_were_requested_but_never_stored() {
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
+		}
+
+		$this->cache->set( 'foo', 'bar', 'group-a' );
+		$this->cache->get( 'foo', 'group-a' );
+		$this->cache->get( 'foo', 'group-missing' );
+		$this->cache->get( 'bar', 'group-missing' );
+
+		ob_start();
+		$this->cache->stats();
+		$output = ob_get_clean();
+
+		$this->assertStringContainsString(
+			'Groups requested but not currently stored',
+			$output,
+			'A group that was only ever missed should still be reported.'
+		);
+
+		$this->assertStringContainsString(
+			'<li><strong>Group:</strong> group-missing - 0 hits, 2 misses</li>',
+			$output,
+			'The group that was never stored should carry its own miss count.'
+		);
+	}
+
+	/**
+	 * Ensures group names are escaped wherever they are printed.
+	 *
+	 * @covers WP_Object_Cache::stats
+	 */
+	public function test_stats_escapes_the_group_names() {
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
+		}
+
+		$stored_group   = '<script>alert(1)</script>';
+		$unstored_group = '<em>missing</em>';
+
+		$this->cache->set( 'foo', 'bar', $stored_group );
+		$this->cache->get( 'foo', $stored_group );
+		$this->cache->get( 'foo', $unstored_group );
+
+		ob_start();
+		$this->cache->stats();
+		$output = ob_get_clean();
+
+		$this->assertStringNotContainsString( '<script>', $output, 'A group name should not be printed as markup.' );
+		$this->assertStringNotContainsString( '<em>', $output, 'A group name should not be printed as markup.' );
+		$this->assertStringContainsString( esc_html( $stored_group ), $output, 'The stored group name should be escaped.' );
+		$this->assertStringContainsString( esc_html( $unstored_group ), $output, 'The group name that was never stored should be escaped as well.' );
+	}
 }

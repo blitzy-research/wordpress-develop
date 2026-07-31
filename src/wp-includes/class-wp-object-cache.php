@@ -49,13 +49,10 @@ class WP_Object_Cache {
 	public $cache_misses = 0;
 
 	/**
-	 * Amount of times the cache was hit and missed, broken down by cache group.
-	 *
-	 * Keyed by cache group name, each entry holding a 'hits' and a 'misses' count.
-	 * Unlike the totals above, this reveals which individual group is missing.
+	 * Per-group cache hit and miss counts.
 	 *
 	 * @since 7.0.0
-	 * @var int[][]
+	 * @var array<string, array{hits: int, misses: int}>
 	 */
 	public $cache_group_stats = array();
 
@@ -647,10 +644,13 @@ class WP_Object_Cache {
 	/**
 	 * Echoes the stats of the caching.
 	 *
-	 * Gives the cache hits, and cache misses. Also prints every cached group,
-	 * key and the data.
+	 * Prints the global hit and miss totals, then each group currently held in the
+	 * cache with its serialized size and its per-group hit and miss counts, followed
+	 * by any group that has request counters but no current entries.
 	 *
 	 * @since 2.0.0
+	 * @since 7.0.0 Added per-group hit and miss counts and the list of groups with
+	 *              counters but no current entries.
 	 */
 	public function stats() {
 		echo '<p>';
@@ -667,10 +667,10 @@ class WP_Object_Cache {
 		echo '</ul>';
 
 		/*
-		 * The loop above walks the stored data, so it can only report groups that
-		 * currently hold something. Groups that were requested but never stored -
-		 * the all-miss groups these per-group counters exist to expose - would be
-		 * invisible there, so they are listed separately rather than left out.
+		 * Request counters accumulate for the whole request, while stored data can be
+		 * removed by delete(), flush() or flush_group(). A group can therefore hold
+		 * counters in $cache_group_stats while being absent from $this->cache, so
+		 * those groups are reported separately rather than left out.
 		 */
 		$unstored_groups = array_diff_key( $this->cache_group_stats, $this->cache );
 

@@ -1,16 +1,10 @@
 <?php
 
 /**
- * Records and returns the duration of the WordPress bootstrap sequence, in seconds.
+ * Stores or retrieves the duration of the WordPress bootstrap sequence, in seconds.
  *
- * The duration is captured once per request by the 'wp_loaded' callback registered
- * below, and is read back by both of the 'shutdown' callbacks in this file.
- *
- * Routing the value through a single accessor is what keeps the metric comparable
- * between scenarios: 'wp_loaded' is the final hook of the bootstrap sequence, so it is
- * reached at the same point of the request lifecycle on the front end and in the admin,
- * whereas 'before-template' has no admin equivalent. It also avoids reaching for
- * $timestart inside the front-end 'shutdown' callback, which does not import it.
+ * Capturing the duration at 'wp_loaded' gives the front-end and admin scenarios the
+ * same bootstrap boundary, so the metric is comparable between them.
  *
  * @ignore
  * @since 7.0.0
@@ -28,6 +22,83 @@ function wp_perf_bootstrap_duration( $duration = null ) {
 	}
 
 	return $bootstrap;
+}
+
+/**
+ * Returns the object cache hit and miss counters as validated integers.
+ *
+ * The object cache global can be replaced wholesale by an 'object-cache.php' drop-in,
+ * which is free to omit these counters, declare them non-public, expose them through
+ * magic accessors, or keep something other than a number in them. Reading the
+ * properties directly would therefore be able to run drop-in code, throw, or emit a
+ * conversion notice from inside a 'shutdown' callback that has already pulled the
+ * response body out of the output buffer, which would corrupt the measured response
+ * and leak internal error detail whenever display errors are on.
+ *
+ * get_object_vars() is called from outside the class, so the snapshot it returns holds
+ * only genuinely public properties and no magic accessor is ever consulted. Anything
+ * that is not a numeric scalar with an integer representation is reported as 0, which is
+ * the same value an entirely absent counter reports, so the metric degrades without ever
+ * being omitted.
+ *
+ * @ignore
+ * @since 7.0.0
+ * @access private
+ *
+ * @return int[] {
+ *     Object cache counters, both 0 when the counter is unavailable or unusable.
+ *
+ *     @type int $hits   Number of object cache hits.
+ *     @type int $misses Number of object cache misses.
+ * }
+ */
+function wp_perf_object_cache_counters() {
+	$counters = array(
+		'hits'   => 0,
+		'misses' => 0,
+	);
+
+	if ( ! isset( $GLOBALS['wp_object_cache'] ) || ! is_object( $GLOBALS['wp_object_cache'] ) ) {
+		return $counters;
+	}
+
+	$public_properties = get_object_vars( $GLOBALS['wp_object_cache'] );
+
+	$counter_properties = array(
+		'hits'   => 'cache_hits',
+		'misses' => 'cache_misses',
+	);
+
+	foreach ( $counter_properties as $counter => $property ) {
+		if ( ! isset( $public_properties[ $property ] ) ) {
+			continue;
+		}
+
+		$counter_value = $public_properties[ $property ];
+
+		if ( is_int( $counter_value ) ) {
+			$counters[ $counter ] = $counter_value;
+			continue;
+		}
+
+		if ( ! is_numeric( $counter_value ) ) {
+			continue;
+		}
+
+		/*
+		 * A numeric string or a float is still usable, but only when it has an integer
+		 * representation: casting a non-finite or out-of-range float emits
+		 * "The float ... is not representable as an int" as of PHP 8.5, which is exactly
+		 * the kind of notice this function exists to keep out of the measured response.
+		 */
+		$counter_number = (float) $counter_value;
+
+		if ( is_finite( $counter_number ) && $counter_number >= (float) PHP_INT_MIN && $counter_number < (float) PHP_INT_MAX ) {
+			$counters[ $counter ] = (int) $counter_number;
+		}
+	}
+
+	return $counters;
 }
 
 add_action(
@@ -62,6 +133,9 @@ add_filter(
 
 				$server_timing_values['total'] = $server_timing_values['before-template'] + $server_timing_values['template'];
 
+				// Both cache metrics come from one validated snapshot, so a replacement object cache is never touched twice.
+				$cache_counters = wp_perf_object_cache_counters();
+
 				/*
 				 * While values passed via Server-Timing are intended to be durations,
 				 * any numeric value can actually be passed.
@@ -74,8 +148,8 @@ add_filter(
 				$server_timing_values['ext-obj-cache'] = wp_using_ext_object_cache() ? 1 : 0;
 				$server_timing_values['memory-peak']   = (int) memory_get_peak_usage( false );
 				$server_timing_values['files-loaded']  = (int) count( get_included_files() );
-				$server_timing_values['cache-hits']    = isset( $GLOBALS['wp_object_cache']->cache_hits ) ? (int) $GLOBALS['wp_object_cache']->cache_hits : 0;
-				$server_timing_values['cache-misses']  = isset( $GLOBALS['wp_object_cache']->cache_misses ) ? (int) $GLOBALS['wp_object_cache']->cache_misses : 0;
+				$server_timing_values['cache-hits']    = $cache_counters['hits'];
+				$server_timing_values['cache-misses']  = $cache_counters['misses'];
 				$server_timing_values['bootstrap']     = wp_perf_bootstrap_duration();
 
 				$header_values = array();
@@ -113,6 +187,9 @@ add_action(
 
 				$server_timing_values['total'] = microtime( true ) - $timestart;
 
+				// Both cache metrics come from one validated snapshot, so a replacement object cache is never touched twice.
+				$cache_counters = wp_perf_object_cache_counters();
+
 				/*
 				 * While values passed via Server-Timing are intended to be durations,
 				 * any numeric value can actually be passed.
@@ -125,8 +202,8 @@ add_action(
 				$server_timing_values['ext-obj-cache'] = wp_using_ext_object_cache() ? 1 : 0;
 				$server_timing_values['memory-peak']   = (int) memory_get_peak_usage( false );
 				$server_timing_values['files-loaded']  = (int) count( get_included_files() );
-				$server_timing_values['cache-hits']    = isset( $GLOBALS['wp_object_cache']->cache_hits ) ? (int) $GLOBALS['wp_object_cache']->cache_hits : 0;
-				$server_timing_values['cache-misses']  = isset( $GLOBALS['wp_object_cache']->cache_misses ) ? (int) $GLOBALS['wp_object_cache']->cache_misses : 0;
+				$server_timing_values['cache-hits']    = $cache_counters['hits'];
+				$server_timing_values['cache-misses']  = $cache_counters['misses'];
 				$server_timing_values['bootstrap']     = wp_perf_bootstrap_duration();
 
 				$header_values = array();
