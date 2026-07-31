@@ -112,7 +112,7 @@ function formatValue( metric, value ) {
 		return 'N/A';
 	}
 
-	if ( 'wpMemoryUsage' === metric ) {
+	if ( 'wpMemoryUsage' === metric || 'wpMemoryPeak' === metric ) {
 		return `${ ( value / Math.pow( 10, 6 ) ).toFixed( 2 ) } MB`;
 	}
 
@@ -120,7 +120,12 @@ function formatValue( metric, value ) {
 		return 1 === value ? 'yes' : 'no';
 	}
 
-	if ( 'wpDbQueries' === metric ) {
+	if (
+		'wpDbQueries' === metric ||
+		'wpFilesLoaded' === metric ||
+		'wpCacheHits' === metric ||
+		'wpCacheMisses' === metric
+	) {
 		return value;
 	}
 
