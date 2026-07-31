@@ -10,6 +10,7 @@ import { camelCaseDashes, locales } from '../utils';
 
 const results = {
 	timeToFirstByte: [],
+	domContentLoaded: [],
 };
 
 test.describe( 'Admin', () => {
@@ -33,6 +34,7 @@ test.describe( 'Admin', () => {
 				} );
 
 				results.timeToFirstByte = [];
+				results.domContentLoaded = [];
 			} );
 
 			test.afterAll( async ( {}, testInfo ) => {
@@ -66,6 +68,11 @@ test.describe( 'Admin', () => {
 
 					const ttfb = await metrics.getTimeToFirstByte();
 					results.timeToFirstByte.push( ttfb );
+
+					// Measured from the end of the response, so it excludes server time.
+					const { domContentLoaded } =
+						await metrics.getLoadingDurations();
+					results.domContentLoaded.push( domContentLoaded );
 				} );
 			}
 		} );
