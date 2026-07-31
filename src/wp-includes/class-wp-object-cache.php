@@ -49,6 +49,17 @@ class WP_Object_Cache {
 	public $cache_misses = 0;
 
 	/**
+	 * Amount of times the cache was hit and missed, broken down by cache group.
+	 *
+	 * Keyed by cache group name, each entry holding a 'hits' and a 'misses' count.
+	 * Unlike the totals above, this reveals which individual group is missing.
+	 *
+	 * @since 7.0.0
+	 * @var int[][]
+	 */
+	public $cache_group_stats = array();
+
+	/**
 	 * List of global cache groups.
 	 *
 	 * @since 3.0.0
@@ -372,9 +383,19 @@ class WP_Object_Cache {
 			$key = $this->blog_prefix . $key;
 		}
 
+		// Seed both per-group counters together so either branch below can
+		// increment without emitting an undefined array key warning.
+		if ( ! isset( $this->cache_group_stats[ $group ] ) ) {
+			$this->cache_group_stats[ $group ] = array(
+				'hits'   => 0,
+				'misses' => 0,
+			);
+		}
+
 		if ( $this->_exists( $key, $group ) ) {
 			$found             = true;
 			$this->cache_hits += 1;
+			++$this->cache_group_stats[ $group ]['hits'];
 			if ( is_object( $this->cache[ $group ][ $key ] ) ) {
 				return clone $this->cache[ $group ][ $key ];
 			} else {
@@ -384,6 +405,7 @@ class WP_Object_Cache {
 
 		$found               = false;
 		$this->cache_misses += 1;
+		++$this->cache_group_stats[ $group ]['misses'];
 		return false;
 	}
 
@@ -637,8 +659,28 @@ class WP_Object_Cache {
 		echo '</p>';
 		echo '<ul>';
 		foreach ( $this->cache as $group => $cache ) {
-			echo '<li><strong>Group:</strong> ' . esc_html( $group ) . ' - ( ' . number_format( strlen( serialize( $cache ) ) / KB_IN_BYTES, 2 ) . 'k )</li>';
+			$group_hits   = (int) ( $this->cache_group_stats[ $group ]['hits'] ?? 0 );
+			$group_misses = (int) ( $this->cache_group_stats[ $group ]['misses'] ?? 0 );
+
+			echo '<li><strong>Group:</strong> ' . esc_html( $group ) . ' - ( ' . number_format( strlen( serialize( $cache ) ) / KB_IN_BYTES, 2 ) . 'k ) - ' . $group_hits . ' hits, ' . $group_misses . ' misses</li>';
 		}
 		echo '</ul>';
+
+		/*
+		 * The loop above walks the stored data, so it can only report groups that
+		 * currently hold something. Groups that were requested but never stored -
+		 * the all-miss groups these per-group counters exist to expose - would be
+		 * invisible there, so they are listed separately rather than left out.
+		 */
+		$unstored_groups = array_diff_key( $this->cache_group_stats, $this->cache );
+
+		if ( ! empty( $unstored_groups ) ) {
+			echo '<p><strong>Groups requested but not currently stored:</strong></p>';
+			echo '<ul>';
+			foreach ( $unstored_groups as $group => $group_stats ) {
+				echo '<li><strong>Group:</strong> ' . esc_html( $group ) . ' - ' . (int) ( $group_stats['hits'] ?? 0 ) . ' hits, ' . (int) ( $group_stats['misses'] ?? 0 ) . ' misses</li>';
+			}
+			echo '</ul>';
+		}
 	}
 }
