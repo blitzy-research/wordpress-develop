@@ -52,9 +52,37 @@ const requiredServerTimingMetrics = [
  */
 const perDescribeMetrics = Object.keys( results );
 
+/**
+ * Measured iterations per theme and locale, from the TEST_RUNS environment variable.
+ *
+ * Read once at module scope so the count the measured tests are generated from is the
+ * very same count the check below reads. A value that cannot be honored (an empty
+ * string, a zero, a negative or a non-numeric one) generates no measured tests at all,
+ * which leaves nothing to attach and nothing to compare.
+ */
+const iterations = Number( process.env.TEST_RUNS );
+
 test.describe( 'Single Post', () => {
 	test.use( {
 		storageState: {}, // User will be logged out.
+	} );
+
+	/*
+	 * Fails the run when the configured iteration count cannot be measured.
+	 *
+	 * Reporting success over zero measurements is the most dangerous outcome this
+	 * suite can have, because a later comparison would read the resulting empty
+	 * artifact as an absence of change rather than as an absence of data. Checking the
+	 * count in a test of its own keeps that outcome loud even though the describes it
+	 * would silence never run.
+	 */
+	test( 'measures at least one iteration per theme and locale', () => {
+		expect(
+			Number.isInteger( iterations ) && 0 < iterations,
+			`TEST_RUNS should be a positive integer, received ${ JSON.stringify(
+				process.env.TEST_RUNS
+			) }`
+		).toBe( true );
 	} );
 
 	for ( const theme of themes ) {
@@ -100,7 +128,6 @@ test.describe( 'Single Post', () => {
 					}
 				} );
 
-				const iterations = Number( process.env.TEST_RUNS );
 				for ( let i = 1; i <= iterations; i++ ) {
 					test( `Measure load time metrics (${ i } of ${ iterations })`, async ( {
 						page,
