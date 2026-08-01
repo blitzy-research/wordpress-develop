@@ -53,37 +53,54 @@ const requiredServerTimingMetrics = [
 const perDescribeMetrics = Object.keys( results );
 
 /**
- * Measured iterations per theme and locale, from the TEST_RUNS environment variable.
+ * Highest iteration count this spec will generate measured tests for.
  *
- * Read once at module scope so the count the measured tests are generated from is the
- * very same count the check below reads. A value that cannot be honored (an empty
- * string, a zero, a negative or a non-numeric one) generates no measured tests at all,
- * which leaves nothing to attach and nothing to compare.
+ * The count is consumed while the module is evaluated, so it decides how many
+ * Playwright tests exist rather than how one behaves. An unbounded value therefore
+ * cannot be caught by an assertion inside a test: a non-finite count makes the
+ * registration loop below run forever and an astronomically large one runs long
+ * enough to be indistinguishable from a hang, so collection never finishes and the
+ * check never gets to report anything. An explicit ceiling makes that outcome
+ * impossible while leaving ample headroom over the 20 runs
+ * `tests/performance/playwright.config.js` defaults TEST_RUNS to.
  */
+const maxIterations = 1000;
+
+// Read once at module scope so test generation and validation use the same count.
 const iterations = Number( process.env.TEST_RUNS );
+
+/**
+ * Whether that count can actually be measured.
+ *
+ * Resolved here, synchronously, because the value has already done its damage by the
+ * time any test runs. `Number.isSafeInteger()` rejects `NaN`, `Infinity` and integers
+ * past 2^53 in one step, so an empty string, a zero, a negative, a fractional, a
+ * non-numeric and a non-finite value all fail alongside a value that is merely
+ * absurd, and the ceiling above rejects what remains.
+ */
+const hasMeasurableIterations =
+	Number.isSafeInteger( iterations ) &&
+	0 < iterations &&
+	iterations <= maxIterations;
 
 test.describe( 'Single Post', () => {
 	test.use( {
 		storageState: {}, // User will be logged out.
 	} );
 
-	/*
-	 * Fails the run when the configured iteration count cannot be measured.
-	 *
-	 * Reporting success over zero measurements is the most dangerous outcome this
-	 * suite can have, because a later comparison would read the resulting empty
-	 * artifact as an absence of change rather than as an absence of data. Checking the
-	 * count in a test of its own keeps that outcome loud even though the describes it
-	 * would silence never run.
-	 */
 	test( 'measures at least one iteration per theme and locale', () => {
 		expect(
-			Number.isInteger( iterations ) && 0 < iterations,
-			`TEST_RUNS should be a positive integer, received ${ JSON.stringify(
+			hasMeasurableIterations,
+			`TEST_RUNS should be an integer between 1 and ${ maxIterations }, received ${ JSON.stringify(
 				process.env.TEST_RUNS
 			) }`
 		).toBe( true );
 	} );
+
+	if ( ! hasMeasurableIterations ) {
+		// Nothing measurable to register, and the check above already fails the run.
+		return;
+	}
 
 	for ( const theme of themes ) {
 		for ( const locale of locales ) {

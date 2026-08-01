@@ -34,6 +34,7 @@
  *              `edit_app_password`, `delete_app_passwords`, `delete_app_password`,
  *              and `update_https` capabilities.
  * @since 6.7.0 Added the `edit_block_binding` capability.
+ * @since 7.0.0 Eligible unfiltered mappings may be memoized for the duration of the request.
  *
  * @global array $post_type_meta_caps Used to get post type meta capabilities.
  *
@@ -43,6 +44,27 @@
  * @return string[] Primitive capabilities required of the user.
  */
 function map_meta_cap( $cap, $user_id, ...$args ) {
+	/*
+	 * Answer from the request-scoped memo when this exact question has already been
+	 * asked and answered during this request. The key is derived from the capability
+	 * as it was passed in, because the switch below rewrites $cap on two paths, and it
+	 * is an empty string whenever the answer could legitimately differ between two
+	 * otherwise identical calls.
+	 *
+	 * Calls that pass no further arguments are the majority of all capability checks
+	 * and are answered by the cheap arms of the switch, so they skip the memo without
+	 * even the cost of a call to the function that would decline them.
+	 */
+	$memo_key = empty( $args ) ? '' : _wp_map_meta_cap_memo_key( $cap, $user_id, $args );
+
+	if ( '' !== $memo_key ) {
+		$memoized_caps = _wp_map_meta_cap_memo( $memo_key );
+
+		if ( null !== $memoized_caps ) {
+			return $memoized_caps;
+		}
+	}
+
 	$caps = array();
 
 	switch ( $cap ) {
@@ -876,7 +898,167 @@ function map_meta_cap( $cap, $user_id, ...$args ) {
 	 * @param array    $args    Adds context to the capability check, typically
 	 *                          starting with an object ID.
 	 */
-	return apply_filters( 'map_meta_cap', $caps, $cap, $user_id, $args );
+	$caps = apply_filters( 'map_meta_cap', $caps, $cap, $user_id, $args );
+
+	/*
+	 * Only the filtered result is memoized, so a memo hit returns exactly what the
+	 * filter produced. Nothing is stored when the key is empty, and nothing is stored
+	 * on the custom post type path above, which returns before reaching this point and
+	 * leaves the recursive call it delegates to to memoize under its own key.
+	 */
+	if ( '' !== $memo_key ) {
+		_wp_map_meta_cap_memo( $memo_key, $caps );
+	}
+
+	return $caps;
+}
+
+/**
+ * Builds the canonical memo key for a `map_meta_cap()` call.
+ *
+ * `map_meta_cap()` is re-entered on every capability check, and a single request asks
+ * the same object capability question many times over. Memoizing the answer removes
+ * that duplicated work, but only where the answer provably cannot change between two
+ * identical calls, so this function returns an empty string, meaning "do not
+ * memoize", for every case where it could.
+ *
+ * A call is not memoized when:
+ *
+ *  - No further arguments were passed. Those calls resolve through the cheap arms of
+ *    the switch, where building and looking up a key costs about as much as the
+ *    mapping it would replace.
+ *  - `$cap` is not a string, or `$user_id` is not a scalar, so the key could not
+ *    describe them faithfully.
+ *  - Any further argument is neither scalar nor null. Objects, arrays and resources
+ *    cannot be reduced to a key without either serializing them or losing
+ *    information, and `edit_block_binding` is passed a block editor context object.
+ *  - `$cap` names a metadata capability. `edit_post_meta` and its eleven siblings
+ *    resolve through the `auth_{$object_type}_meta_{$meta_key}` filters that
+ *    `register_meta()` installs, and through `is_protected_meta()` and
+ *    `get_object_subtype_{$object_type}`, none of which fire an action to invalidate
+ *    against, so their answer can change part way through a request.
+ *  - A `map_meta_cap` callback is registered. A callback may legitimately answer
+ *    differently for identical arguments, and core relies on that itself:
+ *    `WP_Customize_Manager` adds one for the duration of a single operation and
+ *    removes it again afterwards.
+ *
+ * Every variable-length part of the key is written with its type and its length, so
+ * that `array( 1, '2' )`, `array( '1', 2 )` and `array( '1|2' )` cannot collide. The
+ * key also carries the current site ID, because `current_user_can_for_site()` and
+ * `user_can_for_site()` switch sites around the check, and the sizes of the
+ * registries the mapping consults, because `register_post_status()` fires no action
+ * at all and the post type, post status and taxonomy registries are also mutated by
+ * code that unsets a key directly.
+ *
+ * @since 7.0.0
+ *
+ * @ignore
+ * @access private
+ *
+ * @global array      $wp_post_types    Post type registry.
+ * @global array      $wp_post_statuses Post status registry.
+ * @global array      $wp_taxonomies    Taxonomy registry.
+ * @global array|null $super_admins     Super admin logins, when they are defined.
+ *
+ * @param string $cap     Capability being checked.
+ * @param int    $user_id User ID.
+ * @param array  $args    Further parameters passed to `map_meta_cap()`.
+ * @return string Canonical memo key, or an empty string when the call must not be
+ *                memoized.
+ */
+function _wp_map_meta_cap_memo_key( $cap, $user_id, $args ) {
+	global $wp_post_types, $wp_post_statuses, $wp_taxonomies, $super_admins;
+
+	if ( empty( $args )
+		|| ! is_string( $cap )
+		|| ! is_scalar( $user_id )
+		|| str_ends_with( $cap, '_meta' )
+		|| has_filter( 'map_meta_cap' )
+	) {
+		return '';
+	}
+
+	$key = get_current_blog_id()
+		. '|' . ( is_array( $wp_post_types ) ? count( $wp_post_types ) : -1 )
+		. '|' . ( is_array( $wp_post_statuses ) ? count( $wp_post_statuses ) : -1 )
+		. '|' . ( is_array( $wp_taxonomies ) ? count( $wp_taxonomies ) : -1 )
+		. '|' . ( is_array( $super_admins ) ? count( $super_admins ) : -1 )
+		. '|' . strlen( $cap ) . ':' . $cap;
+
+	$user_part = (string) $user_id;
+	$key      .= '|' . gettype( $user_id ) . ':' . strlen( $user_part ) . ':' . $user_part;
+	$key      .= '|' . count( $args );
+
+	foreach ( $args as $index => $arg ) {
+		if ( null !== $arg && ! is_scalar( $arg ) ) {
+			return '';
+		}
+
+		$arg_part = (string) $arg;
+		$key     .= '|' . $index . ':' . gettype( $arg ) . ':' . strlen( $arg_part ) . ':' . $arg_part;
+	}
+
+	return $key;
+}
+
+/**
+ * Reads from, writes to, or discards the request-scoped `map_meta_cap()` memo.
+ *
+ * The memo lives for the duration of one request only. It is deliberately not written
+ * to the object cache: a capability mapping is derived from post, comment, term, user,
+ * option and registry state that a persistent, cross-request cache would have no
+ * reliable way to invalidate against.
+ *
+ * @since 7.0.0
+ *
+ * @ignore
+ * @access private
+ *
+ * @param string        $key  Canonical key from `_wp_map_meta_cap_memo_key()`. Pass an
+ *                            empty string to discard everything memoized so far.
+ * @param string[]|null $caps Optional. Primitive capabilities to memoize under `$key`.
+ *                            Default null, which reads instead of writing.
+ * @return string[]|null The memoized capabilities, or null when nothing is memoized
+ *                       against `$key`.
+ */
+function _wp_map_meta_cap_memo( $key, $caps = null ) {
+	static $memo = array();
+
+	if ( '' === $key ) {
+		$memo = array();
+
+		return null;
+	}
+
+	if ( null !== $caps ) {
+		$memo[ $key ] = $caps;
+
+		return $caps;
+	}
+
+	// array_key_exists() rather than isset(), so a memoized empty result still hits.
+	return array_key_exists( $key, $memo ) ? $memo[ $key ] : null;
+}
+
+/**
+ * Discards the request-scoped `map_meta_cap()` memo.
+ *
+ * Registered below against the actions that fire once something the mapping reads has
+ * already changed, so that the next mapping is computed against the new state. It also
+ * keeps the memo from leaking between tests, which matters because `phpunit.xml.dist`
+ * sets `backupGlobals="false"` and a single PHP process runs the whole suite.
+ *
+ * Discarding everything is deliberate. It is one array assignment, and it cannot leave
+ * behind a narrower invalidation rule that a later change to one of the mappings would
+ * silently outgrow.
+ *
+ * @since 7.0.0
+ *
+ * @ignore
+ * @access private
+ */
+function _wp_reset_map_meta_cap_memo() {
+	_wp_map_meta_cap_memo( '' );
 }
 
 /**
@@ -1364,6 +1546,58 @@ function wp_maybe_grant_site_health_caps( $allcaps, $caps, $args, $user ) {
 
 	return $allcaps;
 }
+
+/*
+ * Discards the request-scoped map_meta_cap() memo on the state changes enumerated below.
+ * Each of those actions fires after its mutation has been applied, which is why the super
+ * admin pair is granted_super_admin/revoked_super_admin rather than the
+ * grant_super_admin/revoke_super_admin actions that fire beforehand. State a mapping reads
+ * without passing through one of these actions is handled by the memo key instead, which
+ * carries the registry sizes that register_post_status() and its siblings change without
+ * firing an action of their own. Discarding costs no more than a recomputation, whereas
+ * retaining a mapping that no longer holds would be an authorization bug.
+ *
+ * These registrations live here rather than in default-filters.php because the memo is
+ * an implementation detail of this file, following the same pattern as the file-scope
+ * add_action() call at the end of block-patterns.php.
+ */
+foreach (
+	array(
+		// Post author, status, type and parent, and the trashed status stored in meta.
+		'clean_post_cache',
+		'added_post_meta',
+		'updated_post_meta',
+		'deleted_post_meta',
+		// Comment, term and user objects read by the comment, term and user mappings.
+		'clean_comment_cache',
+		'clean_term_cache',
+		'clean_user_cache',
+		// Role membership, which decides which primitive capabilities a user holds.
+		'set_user_role',
+		'add_user_role',
+		'remove_user_role',
+		// Super admin membership, once the change has been stored.
+		'granted_super_admin',
+		'revoked_super_admin',
+		// The capability maps registered for post types and taxonomies.
+		'registered_post_type',
+		'unregistered_post_type',
+		'registered_taxonomy',
+		'unregistered_taxonomy',
+		// Options and network options that individual mappings compare against.
+		'added_option',
+		'updated_option',
+		'deleted_option',
+		'add_site_option',
+		'update_site_option',
+		'delete_site_option',
+		// Site context, for the current_user_can_for_site() family.
+		'switch_blog',
+	) as $hook
+) {
+	add_action( $hook, '_wp_reset_map_meta_cap_memo', 10, 0 );
+}
+unset( $hook );
 
 return;
 
