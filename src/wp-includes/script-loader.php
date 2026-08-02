@@ -2755,6 +2755,52 @@ function wp_should_load_block_assets_on_demand() {
 }
 
 /**
+ * Checks whether the Command Palette assets should be enqueued on the current screen.
+ *
+ * The Command Palette is delivered by the `wp-commands` and `wp-core-commands` script
+ * bundles, which depend on the `wp-components` package and therefore pull in the largest
+ * part of the admin JavaScript payload. Those bundles are only inexpensive to add on screens
+ * that already load that dependency chain, so by default they are limited to block editor
+ * screens, detected the same way as in {@see wp_should_load_block_editor_scripts_and_styles()}.
+ *
+ * On every other admin screen the assets are skipped. A screen can opt back in through the
+ * {@see 'should_load_command_palette_assets'} filter.
+ *
+ * @since 7.0.0
+ * @see wp_should_load_block_editor_scripts_and_styles()
+ *
+ * @global WP_Screen $current_screen WordPress current screen object.
+ *
+ * @return bool Whether the Command Palette assets should be enqueued.
+ */
+function wp_should_load_command_palette_assets() {
+	global $current_screen;
+
+	// The Command Palette only exists in the admin, so this guard is intentionally not filterable.
+	if ( ! is_admin() ) {
+		return false;
+	}
+
+	$should_load = ( $current_screen instanceof WP_Screen ) && $current_screen->is_block_editor();
+
+	/**
+	 * Filters whether the Command Palette assets are enqueued on the current screen.
+	 *
+	 * Returning true enqueues the `wp-commands` and `wp-core-commands` bundles along with
+	 * their dependencies. Returning false skips them, and the Command Palette is not
+	 * available on the screen.
+	 *
+	 * This filter is not applied outside the admin, where the assets are never enqueued.
+	 *
+	 * @since 7.0.0
+	 *
+	 * @param bool $should_load Current value of the flag. Default true on block editor
+	 *                          screens, false on every other admin screen.
+	 */
+	return apply_filters( 'should_load_command_palette_assets', $should_load );
+}
+
+/**
  * Enqueues registered block scripts and styles, depending on current rendered
  * context (only enqueuing editor scripts while in context of the editor).
  *
@@ -3492,6 +3538,10 @@ function wp_enqueue_classic_theme_styles() {
  */
 function wp_enqueue_command_palette_assets() {
 	global $menu, $submenu;
+
+	if ( ! wp_should_load_command_palette_assets() ) {
+		return;
+	}
 
 	$command_palette_settings = array(
 		'is_network_admin' => is_network_admin(),
