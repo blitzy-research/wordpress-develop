@@ -1531,6 +1531,20 @@ function register_post_status( $post_status, $args = array() ) {
 
 	$wp_post_statuses[ $post_status ] = $args;
 
+	/**
+	 * Fires after a post status is registered.
+	 *
+	 * Registering a post status name that is already registered replaces its arguments,
+	 * so this also fires on re-registration, where the size of the registry does not
+	 * change but the behavior of the status does.
+	 *
+	 * @since 7.0.0
+	 *
+	 * @param string   $post_status Post status.
+	 * @param stdClass $args        Arguments used to register the post status.
+	 */
+	do_action( 'registered_post_status', $post_status, $args );
+
 	return $args;
 }
 
