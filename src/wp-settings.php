@@ -36,6 +36,15 @@ require ABSPATH . WPINC . '/compat-utf8.php';
 require ABSPATH . WPINC . '/compat.php';
 require ABSPATH . WPINC . '/load.php';
 
+/*
+ * Register the core class autoloader before anything else, so that every class,
+ * interface and trait file listed in the generated class map can be loaded the
+ * first time the name it declares is referenced rather than being required
+ * eagerly below. Registration reads nothing from disk: the class map is loaded
+ * lazily on the first autoload miss.
+ */
+require ABSPATH . WPINC . '/autoload.php';
+
 // Check the server requirements.
 wp_check_php_mysql_versions();
 
@@ -279,125 +288,62 @@ require ABSPATH . WPINC . '/html-api/class-wp-html-processor.php';
 require ABSPATH . WPINC . '/class-wp-block-processor.php';
 require ABSPATH . WPINC . '/class-wp-http.php';
 require ABSPATH . WPINC . '/class-wp-http-streams.php';
-require ABSPATH . WPINC . '/class-wp-http-curl.php';
-require ABSPATH . WPINC . '/class-wp-http-proxy.php';
-require ABSPATH . WPINC . '/class-wp-http-cookie.php';
-require ABSPATH . WPINC . '/class-wp-http-encoding.php';
-require ABSPATH . WPINC . '/class-wp-http-response.php';
-require ABSPATH . WPINC . '/class-wp-http-requests-response.php';
-require ABSPATH . WPINC . '/class-wp-http-requests-hooks.php';
+/*
+ * From here to the end of this block a class, interface or trait file is left to
+ * the autoloader registered above, which loads it the first time the name it
+ * declares is referenced, instead of being required eagerly. A file is still
+ * required here when it declares functions that are registered or called by
+ * name, when including it has side effects such as registering a block support,
+ * when the name it declares is absent from the generated class map, or when that
+ * name is referenced on every request anyway so that deferring it would save
+ * nothing.
+ */
 require ABSPATH . WPINC . '/php-ai-client/autoload.php';
-require ABSPATH . WPINC . '/ai-client/adapters/class-wp-ai-client-http-client.php';
 require ABSPATH . WPINC . '/ai-client/adapters/class-wp-ai-client-cache.php';
 require ABSPATH . WPINC . '/ai-client/adapters/class-wp-ai-client-discovery-strategy.php';
 require ABSPATH . WPINC . '/ai-client/adapters/class-wp-ai-client-event-dispatcher.php';
-require ABSPATH . WPINC . '/ai-client/class-wp-ai-client-ability-function-resolver.php';
-require ABSPATH . WPINC . '/ai-client/class-wp-ai-client-prompt-builder.php';
 require ABSPATH . WPINC . '/ai-client.php';
 require ABSPATH . WPINC . '/class-wp-connector-registry.php';
 require ABSPATH . WPINC . '/connectors.php';
-require ABSPATH . WPINC . '/class-wp-icons-registry.php';
 require ABSPATH . WPINC . '/widgets.php';
 require ABSPATH . WPINC . '/class-wp-widget.php';
 require ABSPATH . WPINC . '/class-wp-widget-factory.php';
 require ABSPATH . WPINC . '/nav-menu-template.php';
 require ABSPATH . WPINC . '/nav-menu.php';
 require ABSPATH . WPINC . '/admin-bar.php';
-require ABSPATH . WPINC . '/class-wp-application-passwords.php';
-require ABSPATH . WPINC . '/abilities-api/class-wp-ability-category.php';
-require ABSPATH . WPINC . '/abilities-api/class-wp-ability-categories-registry.php';
-require ABSPATH . WPINC . '/abilities-api/class-wp-ability.php';
-require ABSPATH . WPINC . '/abilities-api/class-wp-abilities-registry.php';
 require ABSPATH . WPINC . '/abilities-api.php';
 require ABSPATH . WPINC . '/abilities.php';
-require ABSPATH . WPINC . '/collaboration/interface-wp-sync-storage.php';
-require ABSPATH . WPINC . '/collaboration/class-wp-sync-post-meta-storage.php';
-require ABSPATH . WPINC . '/collaboration/class-wp-http-polling-sync-server.php';
 require ABSPATH . WPINC . '/collaboration.php';
 require ABSPATH . WPINC . '/rest-api.php';
-require ABSPATH . WPINC . '/rest-api/class-wp-rest-server.php';
-require ABSPATH . WPINC . '/rest-api/class-wp-rest-response.php';
-require ABSPATH . WPINC . '/rest-api/class-wp-rest-request.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-posts-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-attachments-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-global-styles-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-post-types-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-post-statuses-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-revisions-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-global-styles-revisions-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-template-revisions-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-autosaves-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-template-autosaves-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-taxonomies-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-terms-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-menu-items-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-menus-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-menu-locations-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-users-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-comments-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-search-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-blocks-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-block-types-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-block-renderer-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-settings-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-themes-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-plugins-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-block-directory-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-edit-site-export-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-pattern-directory-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-block-patterns-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-block-pattern-categories-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-application-passwords-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-site-health-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-sidebars-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-widget-types-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-widgets-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-templates-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-url-details-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-navigation-fallback-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-font-families-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-font-faces-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-font-collections-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-icons-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-abilities-v1-categories-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-abilities-v1-list-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-abilities-v1-run-controller.php';
-require ABSPATH . WPINC . '/rest-api/fields/class-wp-rest-meta-fields.php';
-require ABSPATH . WPINC . '/rest-api/fields/class-wp-rest-comment-meta-fields.php';
-require ABSPATH . WPINC . '/rest-api/fields/class-wp-rest-post-meta-fields.php';
-require ABSPATH . WPINC . '/rest-api/fields/class-wp-rest-term-meta-fields.php';
-require ABSPATH . WPINC . '/rest-api/fields/class-wp-rest-user-meta-fields.php';
-require ABSPATH . WPINC . '/rest-api/search/class-wp-rest-search-handler.php';
-require ABSPATH . WPINC . '/rest-api/search/class-wp-rest-post-search-handler.php';
-require ABSPATH . WPINC . '/rest-api/search/class-wp-rest-term-search-handler.php';
-require ABSPATH . WPINC . '/rest-api/search/class-wp-rest-post-format-search-handler.php';
+/*
+ * The REST API infrastructure, controller, field and search handler classes are
+ * resolved by the autoloader rather than required here. They are instantiated
+ * only by create_initial_rest_routes(), which is hooked to the rest_api_init
+ * action, and that action fires from rest_get_server() alone, so a request that
+ * never dispatches a REST route never references any of them. rest-api.php
+ * itself stays eager because it declares the functions that default-filters.php
+ * registers by name.
+ */
 require ABSPATH . WPINC . '/sitemaps.php';
 require ABSPATH . WPINC . '/sitemaps/class-wp-sitemaps.php';
 require ABSPATH . WPINC . '/sitemaps/class-wp-sitemaps-index.php';
 require ABSPATH . WPINC . '/sitemaps/class-wp-sitemaps-provider.php';
 require ABSPATH . WPINC . '/sitemaps/class-wp-sitemaps-registry.php';
 require ABSPATH . WPINC . '/sitemaps/class-wp-sitemaps-renderer.php';
-require ABSPATH . WPINC . '/sitemaps/class-wp-sitemaps-stylesheet.php';
 require ABSPATH . WPINC . '/sitemaps/providers/class-wp-sitemaps-posts.php';
 require ABSPATH . WPINC . '/sitemaps/providers/class-wp-sitemaps-taxonomies.php';
 require ABSPATH . WPINC . '/sitemaps/providers/class-wp-sitemaps-users.php';
 require ABSPATH . WPINC . '/class-wp-block-bindings-source.php';
 require ABSPATH . WPINC . '/class-wp-block-bindings-registry.php';
-require ABSPATH . WPINC . '/class-wp-block-editor-context.php';
 require ABSPATH . WPINC . '/class-wp-block-type.php';
 require ABSPATH . WPINC . '/class-wp-block-pattern-categories-registry.php';
 require ABSPATH . WPINC . '/class-wp-block-patterns-registry.php';
 require ABSPATH . WPINC . '/class-wp-block-styles-registry.php';
 require ABSPATH . WPINC . '/class-wp-block-type-registry.php';
-require ABSPATH . WPINC . '/class-wp-block.php';
-require ABSPATH . WPINC . '/class-wp-block-list.php';
 require ABSPATH . WPINC . '/class-wp-block-metadata-registry.php';
 require ABSPATH . WPINC . '/class-wp-block-parser-block.php';
 require ABSPATH . WPINC . '/class-wp-block-parser-frame.php';
 require ABSPATH . WPINC . '/class-wp-block-parser.php';
-require ABSPATH . WPINC . '/class-wp-classic-to-block-menu-converter.php';
-require ABSPATH . WPINC . '/class-wp-navigation-fallback.php';
 require ABSPATH . WPINC . '/block-bindings.php';
 require ABSPATH . WPINC . '/block-bindings/pattern-overrides.php';
 require ABSPATH . WPINC . '/block-bindings/post-data.php';
@@ -431,25 +377,15 @@ require ABSPATH . WPINC . '/block-supports/anchor.php';
 require ABSPATH . WPINC . '/block-supports/block-visibility.php';
 require ABSPATH . WPINC . '/block-supports/custom-css.php';
 require ABSPATH . WPINC . '/style-engine.php';
-require ABSPATH . WPINC . '/style-engine/class-wp-style-engine.php';
-require ABSPATH . WPINC . '/style-engine/class-wp-style-engine-css-declarations.php';
-require ABSPATH . WPINC . '/style-engine/class-wp-style-engine-css-rule.php';
-require ABSPATH . WPINC . '/style-engine/class-wp-style-engine-css-rules-store.php';
-require ABSPATH . WPINC . '/style-engine/class-wp-style-engine-processor.php';
 require ABSPATH . WPINC . '/fonts/class-wp-font-face-resolver.php';
 require ABSPATH . WPINC . '/fonts/class-wp-font-collection.php';
-require ABSPATH . WPINC . '/fonts/class-wp-font-face.php';
 require ABSPATH . WPINC . '/fonts/class-wp-font-library.php';
 require ABSPATH . WPINC . '/fonts/class-wp-font-utils.php';
 require ABSPATH . WPINC . '/fonts.php';
 require ABSPATH . WPINC . '/class-wp-script-modules.php';
 require ABSPATH . WPINC . '/script-modules.php';
 require ABSPATH . WPINC . '/interactivity-api/class-wp-interactivity-api.php';
-require ABSPATH . WPINC . '/interactivity-api/class-wp-interactivity-api-directives-processor.php';
 require ABSPATH . WPINC . '/interactivity-api/interactivity-api.php';
-require ABSPATH . WPINC . '/class-wp-plugin-dependencies.php';
-require ABSPATH . WPINC . '/class-wp-url-pattern-prefixer.php';
-require ABSPATH . WPINC . '/class-wp-speculation-rules.php';
 require ABSPATH . WPINC . '/speculative-loading.php';
 require ABSPATH . WPINC . '/view-transitions.php';
 
@@ -752,11 +688,33 @@ unset( $theme, $wp_theme );
  */
 do_action( 'after_setup_theme' );
 
-// Create an instance of WP_Site_Health so that Cron events may fire.
-if ( ! class_exists( 'WP_Site_Health' ) ) {
-	require_once ABSPATH . 'wp-admin/includes/class-wp-site-health.php';
+/*
+ * Create an instance of WP_Site_Health so that Cron events may fire. Every hook
+ * its constructor adds is either admin-only or the scheduled check's own cron
+ * handler, so the 3,868 lines of wp-admin/includes/class-wp-site-health.php are
+ * only worth parsing in those two contexts.
+ */
+if ( is_admin() || wp_doing_cron() ) {
+	if ( ! class_exists( 'WP_Site_Health' ) ) {
+		require_once ABSPATH . 'wp-admin/includes/class-wp-site-health.php';
+	}
+	WP_Site_Health::get_instance();
 }
-WP_Site_Health::get_instance();
+
+/*
+ * create_initial_rest_routes() also needs WP_Site_Health, and that class lives in
+ * wp-admin, out of reach of the core class map. Load it when a REST server is
+ * actually created, which is the only time those routes are registered.
+ */
+add_action(
+	'rest_api_init',
+	static function () {
+		if ( ! class_exists( 'WP_Site_Health' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/class-wp-site-health.php';
+		}
+	},
+	0
+);
 
 // Set up current user.
 $GLOBALS['wp']->init();
