@@ -1387,6 +1387,19 @@ module.exports = function(grunt) {
 								regex += '\t$partials = array( ' + partials + ' );\n';
 								regex += '\t// END: emoji arrays';
 
+								/*
+								 * Both lists are PHP array bodies built from HTML entities, so a body
+								 * without a single entity means the fetch or the filtering above produced
+								 * nothing. Report that, then throw: grunt.fatal() would not stop the write,
+								 * because grunt.util.exit() returns to its caller while it waits for the
+								 * output streams to drain, and only an exception keeps grunt-replace from
+								 * writing the emptied marker block back to the file.
+								 */
+								if ( -1 === entities.indexOf( '&#x' ) || -1 === partials.indexOf( '&#x' ) ) {
+									grunt.log.error( 'Emoji arrays are empty; refusing to write an empty replacement to ' + SOURCE_DIR + 'wp-includes/emoji-arrays.php.' );
+									assert.fail( 'Emoji arrays are empty.' );
+								}
+
 								return regex;
 							}
 						}
@@ -1397,7 +1410,7 @@ module.exports = function(grunt) {
 						expand: true,
 						flatten: true,
 						src: [
-							SOURCE_DIR + 'wp-includes/formatting.php'
+							SOURCE_DIR + 'wp-includes/emoji-arrays.php'
 						],
 						dest: SOURCE_DIR + 'wp-includes/'
 					}
@@ -1937,6 +1950,24 @@ module.exports = function(grunt) {
 			args: [ 'tools/build/generate-autoload-classmap.php', SOURCE_DIR ],
 			opts: { stdio: 'inherit' }
 		}, function( error ) {
+			if ( ! error ) {
+				const file    = `${ SOURCE_DIR }wp-includes/autoload-classmap.php`;
+				const entries = fs.readFileSync( file, {
+					encoding: 'utf8',
+				} ).match( /^\t'[^']+' => '[^']+',$/gm );
+
+				/*
+				 * An entry less map would switch the core autoloader off while still
+				 * looking like a legitimate build result, and copy:files would then ship
+				 * it. Fail the task instead of accepting it.
+				 */
+				if ( null === entries ) {
+					grunt.log.error( `No core classes were found; refusing to accept an empty autoload class map at ${ file }.` );
+					done( false );
+					return;
+				}
+			}
+
 			done( ! error );
 		} );
 	} );
