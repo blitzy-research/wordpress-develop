@@ -1923,6 +1923,24 @@ module.exports = function(grunt) {
 		'copy:certificates'
 	] );
 
+	grunt.registerTask( 'build:autoload-classmap', 'Regenerates the core autoloader class map from the source tree.', function() {
+		var done = this.async();
+
+		/*
+		 * The generator inspects every candidate file with PHP's own tokenizer, so it
+		 * is written in PHP and spawned here. It rewrites SOURCE_DIR in place and is
+		 * therefore sequenced ahead of build:files, which copies that result into
+		 * BUILD_DIR.
+		 */
+		grunt.util.spawn( {
+			cmd: 'php',
+			args: [ 'tools/build/generate-autoload-classmap.php', SOURCE_DIR ],
+			opts: { stdio: 'inherit' }
+		}, function( error ) {
+			done( ! error );
+		} );
+	} );
+
 	grunt.registerTask( 'build:files', [
 		'clean:files',
 		'copy:files',
@@ -2064,6 +2082,7 @@ module.exports = function(grunt) {
 		if ( grunt.option( 'dev' ) ) {
 			grunt.task.run( [
 				'gutenberg:verify',
+				'build:autoload-classmap',
 				'build:js',
 				'build:css',
 				'build:codemirror',
@@ -2074,6 +2093,7 @@ module.exports = function(grunt) {
 		} else {
 			grunt.task.run( [
 				'gutenberg:verify',
+				'build:autoload-classmap',
 				'build:certificates',
 				'build:files',
 				'build:js',

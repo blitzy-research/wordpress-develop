@@ -214,9 +214,10 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 	/**
 	 * Tests that the class map contains no stale or out of scope path.
 	 *
-	 * The generator only maps files below wp-includes, and every mapped value
-	 * has to name a file that still exists. A path left behind by a moved or
-	 * removed file, or one that resolves to a directory, would make the
+	 * The generator maps files below wp-includes and, for the handful of classes
+	 * the bootstrap used to load on every request, below wp-admin/includes. Every
+	 * mapped value has to name a file that still exists: a path left behind by a
+	 * moved or removed file, or one that resolves to a directory, would make the
 	 * autoloader silently stop resolving the name it is mapped for.
 	 */
 	public function test_class_map_contains_no_stale_paths() {
@@ -225,12 +226,24 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 		$this->assertIsArray( $class_map, 'The generated class map must return an array.' );
 		$this->assertNotEmpty( $class_map, 'The generated class map must not be empty.' );
 
-		$outside_wp_includes = array();
-		$not_a_file          = array();
+		$allowed_prefixes = array( 'wp-includes/', 'wp-admin/includes/' );
+		$outside_scope    = array();
+		$not_a_file       = array();
 
 		foreach ( $class_map as $class_name => $path ) {
-			if ( ! is_string( $path ) || 0 !== strpos( $path, 'wp-includes/' ) ) {
-				$outside_wp_includes[] = $class_name;
+			$in_scope = false;
+
+			if ( is_string( $path ) ) {
+				foreach ( $allowed_prefixes as $prefix ) {
+					if ( 0 === strpos( $path, $prefix ) ) {
+						$in_scope = true;
+						break;
+					}
+				}
+			}
+
+			if ( ! $in_scope ) {
+				$outside_scope[] = $class_name;
 				continue;
 			}
 
@@ -241,14 +254,318 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 
 		$this->assertSame(
 			array(),
-			$outside_wp_includes,
-			'Every class map path must be relative to ABSPATH and begin with wp-includes/.'
+			$outside_scope,
+			'Every class map path must be relative to ABSPATH and begin with wp-includes/ or wp-admin/includes/.'
 		);
 
 		$this->assertSame(
 			array(),
 			$not_a_file,
 			'Every class map path must name a file that exists.'
+		);
+	}
+
+	/**
+	 * Tests that every class map name is lower cased.
+	 *
+	 * wp_autoload_class() lower cases the name it is given before looking it up,
+	 * because PHP resolves class names case insensitively and hands the
+	 * autoloader whatever casing the reference site used. A key that is not lower
+	 * cased is therefore unreachable, no matter how the class is referenced.
+	 */
+	public function test_class_map_names_are_lower_cased() {
+		$class_map = self::get_class_map();
+
+		$this->assertNotEmpty( $class_map, 'The generated class map must not be empty.' );
+
+		$not_lower_cased = array();
+
+		foreach ( array_keys( $class_map ) as $class_name ) {
+			if ( ! is_string( $class_name ) || strtolower( $class_name ) !== $class_name ) {
+				$not_lower_cased[] = var_export( $class_name, true );
+			}
+		}
+
+		$this->assertSame(
+			array(),
+			$not_lower_cased,
+			'Every class map name must be lower cased so that any casing of a reference reaches it.'
+		);
+	}
+
+	/**
+	 * Tests that a mapped name resolves however its reference is spelled.
+	 *
+	 * PHP passes the autoloader the name exactly as the reference site wrote it,
+	 * minus the one leading separator a fully qualified reference carries. A
+	 * lookup that only matched one casing would leave `new wp_query()` and
+	 * `new \WP_Query()` silently unresolved while `new WP_Query()` worked.
+	 *
+	 * Each spelling is exercised against a different name that is not declared
+	 * yet, so every case genuinely runs the handler rather than finding a class
+	 * an earlier case already loaded.
+	 */
+	public function test_mapped_name_resolves_whatever_casing_is_used() {
+		$class_map = self::get_class_map();
+		$spellings = array(
+			'as mapped'         => 'strval',
+			'upper cased'       => 'strtoupper',
+			'mixed cased'       => array( __CLASS__, 'alternate_case' ),
+			'leading separator' => array( __CLASS__, 'prefix_separator' ),
+		);
+
+		$names = self::get_loadable_class_map_names( $class_map, count( $spellings ) );
+
+		$this->assertCount(
+			count( $spellings ),
+			$names,
+			'The class map must offer enough undeclared names to exercise every spelling.'
+		);
+
+		$unresolved = array();
+
+		foreach ( array_values( $spellings ) as $index => $transform ) {
+			$spelled = call_user_func( $transform, $names[ $index ] );
+
+			wp_autoload_class( $spelled );
+
+			if ( ! self::is_symbol_declared( $names[ $index ] ) ) {
+				$unresolved[] = $spelled;
+			}
+		}
+
+		$this->assertSame(
+			array(),
+			$unresolved,
+			'Every spelling of a mapped name must reach the file it is mapped to.'
+		);
+	}
+
+	/**
+	 * Tests that a name PHP cannot resolve is left alone.
+	 *
+	 * PHP removes the one leading separator a fully qualified reference is
+	 * written with before calling an autoloader, so a name that still starts with
+	 * a separator when the handler sees it came from a direct spl_autoload_call()
+	 * and names nothing PHP can match. Stripping a run of separators would make
+	 * the handler load a file for a name that stays unresolvable, and then load
+	 * it a second time when the caller fell through from class_exists() to
+	 * interface_exists().
+	 */
+	public function test_lookup_ignores_a_name_with_a_doubled_leading_separator() {
+		$class_map = self::get_class_map();
+		$names     = self::get_loadable_class_map_names( $class_map, 1 );
+
+		$this->assertCount( 1, $names, 'The class map must offer an undeclared name to test with.' );
+
+		$files_before = count( get_included_files() );
+
+		wp_autoload_class( '\\\\' . $names[0] );
+
+		$this->assertSame(
+			$files_before,
+			count( get_included_files() ),
+			'A name with a doubled leading separator must not load a file.'
+		);
+
+		$this->assertFalse(
+			self::is_symbol_declared( $names[0] ),
+			'A name with a doubled leading separator must not declare the underlying class.'
+		);
+
+		/*
+		 * Repeat the call the way a caller falling through from class_exists() to
+		 * interface_exists() would. Nothing may be loaded, and in particular the
+		 * second pass may not raise a redeclaration error.
+		 */
+		wp_autoload_class( '\\\\' . $names[0] );
+
+		$this->assertSame(
+			$files_before,
+			count( get_included_files() ),
+			'Repeating the call must stay a no-op.'
+		);
+
+		// The same name written the way PHP writes it must still resolve.
+		$this->assertTrue(
+			self::symbol_resolves( $names[0] ),
+			'Ignoring an unresolvable spelling must not stop the resolvable one from working.'
+		);
+	}
+
+	/**
+	 * Tests that no mapped file runs anything at its own file scope.
+	 *
+	 * This is the property that makes a mapped file safe to load from an
+	 * autoloader. A file that requires its own subclasses at file scope recurses
+	 * through the autoloader while its parent is still being declared, which
+	 * exhausts the stack rather than raising an error; a file that reports a
+	 * deprecation emits output in the middle of an unrelated request; and a file
+	 * that calls a function assumes a bootstrap state the autoloader cannot
+	 * promise, because it runs at the first reference rather than at a fixed
+	 * point in the load order.
+	 */
+	public function test_class_map_entries_have_no_file_scope_side_effects() {
+		$class_map = self::get_class_map();
+
+		$this->assertNotEmpty( $class_map, 'The generated class map must not be empty.' );
+
+		$side_effects = array();
+
+		foreach ( $class_map as $class_name => $path ) {
+			if ( ! is_string( $path ) || ! is_readable( ABSPATH . $path ) ) {
+				// Reported by test_class_map_entry_points_to_a_readable_file().
+				continue;
+			}
+
+			$side_effect = self::get_file_scope_side_effect( ABSPATH . $path );
+
+			if ( null !== $side_effect ) {
+				$side_effects[] = $class_name . ' => ' . $path . ': ' . $side_effect;
+			}
+		}
+
+		$this->assertSame(
+			array(),
+			$side_effects,
+			'No mapped file may run anything at its own file scope.'
+		);
+	}
+
+	/**
+	 * Tests that the committed class map is what the generator produces.
+	 *
+	 * The map is a build artifact, so a hand edit or a source change made without
+	 * rebuilding would leave it describing a tree that no longer exists. Because
+	 * the generator is what enforces every eligibility rule, agreeing with it is
+	 * also what keeps an ineligible file from being mapped by hand.
+	 */
+	public function test_class_map_matches_the_generator() {
+		$generator = dirname( untrailingslashit( ABSPATH ) ) . '/tools/build/generate-autoload-classmap.php';
+
+		$this->assertTrue(
+			is_readable( $generator ),
+			'The class map generator must be present at tools/build/generate-autoload-classmap.php.'
+		);
+
+		require_once $generator;
+
+		$generated = wp_autoload_classmap_build( ABSPATH );
+
+		$this->assertSame(
+			$generated['map'],
+			self::get_class_map(),
+			'The committed class map must match the output of build:autoload-classmap. Run `grunt build:autoload-classmap`.'
+		);
+	}
+
+	/**
+	 * Tests that registering the handler again changes nothing.
+	 *
+	 * wp-includes/autoload.php is required with `require_once` from the bootstrap
+	 * and again from this test file, and a plugin may require it as well. PHP
+	 * ignores a repeated registration of the same named function, so the handler
+	 * has to appear on the autoload stack exactly once however often it is
+	 * registered, and resolution has to keep working afterwards.
+	 */
+	public function test_repeated_registration_is_harmless() {
+		$occurrences = static function () {
+			$found = 0;
+
+			foreach ( (array) spl_autoload_functions() as $callable ) {
+				if ( 'wp_autoload_class' === $callable ) {
+					++$found;
+				}
+			}
+
+			return $found;
+		};
+
+		$this->assertSame( 1, $occurrences(), 'The handler must be registered exactly once.' );
+
+		spl_autoload_register( 'wp_autoload_class' );
+
+		$this->assertSame( 1, $occurrences(), 'Registering the handler again must not add a second entry.' );
+
+		$names = self::get_loadable_class_map_names( self::get_class_map(), 1 );
+
+		$this->assertCount( 1, $names, 'The class map must offer an undeclared name to test with.' );
+
+		$this->assertTrue(
+			self::symbol_resolves( $names[0] ),
+			'A mapped name must still resolve after a repeated registration.'
+		);
+	}
+
+	/**
+	 * Tests that an absent or unusable class map degrades to doing nothing.
+	 *
+	 * The map is read from a hard-coded path behind a file_exists() guard and its
+	 * return value is only trusted when it is an array, so a tree without the
+	 * generated map, or with a map that returns something else, has to resolve no
+	 * name rather than raise an error. The map is memoized in the handler for the
+	 * life of the request, so each case runs in its own process.
+	 *
+	 * @dataProvider data_unusable_class_maps
+	 *
+	 * @param string|null $contents Contents to write as the class map, or null to write no map at all.
+	 */
+	public function test_unusable_class_map_is_tolerated( $contents ) {
+		$root = get_temp_dir() . 'wp-autoload-' . md5( __METHOD__ . serialize( $contents ) ) . '/';
+
+		$this->assertTrue(
+			wp_mkdir_p( $root . 'wp-includes' ),
+			'The temporary tree for the test must be creatable.'
+		);
+
+		copy( ABSPATH . WPINC . '/autoload.php', $root . 'wp-includes/autoload.php' );
+
+		if ( null !== $contents ) {
+			file_put_contents( $root . 'wp-includes/autoload-classmap.php', $contents );
+		}
+
+		$script = sprintf(
+			'define( "ABSPATH", %s ); define( "WPINC", "wp-includes" );'
+				. ' require ABSPATH . WPINC . "/autoload.php";'
+				. ' $found = class_exists( "WP_Query" ) || interface_exists( "WP_Query" );'
+				. ' echo $found ? "resolved" : "unresolved";',
+			var_export( $root, true )
+		);
+
+		$output    = array();
+		$exit_code = 0;
+
+		exec( escapeshellarg( PHP_BINARY ) . ' -d error_reporting=E_ALL -d display_errors=1 -r ' . escapeshellarg( $script ) . ' 2>&1', $output, $exit_code );
+
+		// rmdir() only removes an empty directory, so the files have to go first.
+		$this->rmdir( untrailingslashit( $root ) );
+		$this->delete_folders( untrailingslashit( $root ) );
+
+		$this->assertSame(
+			0,
+			$exit_code,
+			'An unusable class map must not make the autoloader fail: ' . implode( "\n", $output )
+		);
+
+		$this->assertSame(
+			array( 'unresolved' ),
+			$output,
+			'An unusable class map must resolve no name, silently.'
+		);
+	}
+
+	/**
+	 * Data provider for the unusable class map cases.
+	 *
+	 * @return array[] Array of test cases, each holding the contents to write, or null for no file.
+	 */
+	public function data_unusable_class_maps() {
+		return array(
+			'no class map at all'         => array( null ),
+			'a map that returns nothing'  => array( "<?php\n" ),
+			'a map that returns a string' => array( "<?php\nreturn 'not a map';\n" ),
+			'a map that returns null'     => array( "<?php\nreturn null;\n" ),
+			'an empty map'                => array( "<?php\nreturn array();\n" ),
 		);
 	}
 
@@ -336,7 +653,30 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 	 *                     mapped name is already declared or has to be skipped.
 	 */
 	private static function get_loadable_class_map_name( $class_map ) {
+		$names = self::get_loadable_class_map_names( $class_map, 1 );
+
+		return $names ? $names[0] : null;
+	}
+
+	/**
+	 * Returns up to a given number of mapped names that are not declared yet.
+	 *
+	 * Used by the tests that have to prove the handler actually ran: a name that
+	 * is already declared would report success without the autoloader being
+	 * consulted at all.
+	 *
+	 * @param array $class_map The generated class map.
+	 * @param int   $count     How many names to return.
+	 * @return string[] Mapped names that can be loaded, at most $count of them.
+	 */
+	private static function get_loadable_class_map_names( $class_map, $count ) {
+		$names = array();
+
 		foreach ( $class_map as $class_name => $path ) {
+			if ( count( $names ) >= $count ) {
+				break;
+			}
+
 			if ( ! is_string( $class_name ) || ! is_string( $path ) ) {
 				continue;
 			}
@@ -349,10 +689,213 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 				continue;
 			}
 
-			return $class_name;
+			$names[] = $class_name;
+		}
+
+		return $names;
+	}
+
+	/**
+	 * Returns a name with the case of every other letter flipped.
+	 *
+	 * @param string $name Name to respell.
+	 * @return string The respelled name.
+	 */
+	private static function alternate_case( $name ) {
+		$respelled = '';
+
+		for ( $index = 0, $length = strlen( $name ); $index < $length; $index++ ) {
+			$respelled .= 0 === $index % 2 ? strtoupper( $name[ $index ] ) : strtolower( $name[ $index ] );
+		}
+
+		return $respelled;
+	}
+
+	/**
+	 * Returns a name written with one leading namespace separator.
+	 *
+	 * @param string $name Name to qualify.
+	 * @return string The qualified name.
+	 */
+	private static function prefix_separator( $name ) {
+		return '\\' . $name;
+	}
+
+	/**
+	 * Returns a description of the first statement a file runs at its own file scope.
+	 *
+	 * The file is tokenized rather than loaded, so inspecting it cannot trigger
+	 * the very side effect being looked for. Only a declaration, a namespace, an
+	 * import, a `declare` and an attribute are inert at the top level; anything
+	 * else, from a `require` through an `if` to a bare function call, executes.
+	 *
+	 * Written independently of the generator on purpose: two implementations that
+	 * agree is a stronger guarantee than one implementation checking itself.
+	 *
+	 * @param string $file Absolute path of the file to inspect.
+	 * @return string|null A description of the first executing statement, or null when there is none.
+	 */
+	private static function get_file_scope_side_effect( $file ) {
+		$source = file_get_contents( $file );
+
+		if ( ! is_string( $source ) ) {
+			return 'the file could not be read';
+		}
+
+		$tokens = token_get_all( $source );
+
+		$total     = count( $tokens );
+		$ignorable = array( T_WHITESPACE, T_COMMENT, T_DOC_COMMENT, T_OPEN_TAG, T_CLOSE_TAG );
+		$inert     = array( T_NAMESPACE, T_USE, T_DECLARE );
+		$modifiers = array( T_ABSTRACT, T_FINAL );
+		$declaring = array( T_CLASS, T_INTERFACE, T_TRAIT );
+
+		if ( defined( 'T_ENUM' ) ) {
+			$declaring[] = T_ENUM;
+		}
+
+		if ( defined( 'T_READONLY' ) ) {
+			$modifiers[] = T_READONLY;
+		}
+
+		for ( $index = 0; $index < $total; $index++ ) {
+			$token = $tokens[ $index ];
+
+			if ( is_string( $token ) ) {
+				if ( ';' === $token ) {
+					continue;
+				}
+
+				return sprintf( '%s at the top level', $token );
+			}
+
+			if ( in_array( $token[0], $ignorable, true ) || in_array( $token[0], $modifiers, true ) ) {
+				continue;
+			}
+
+			// An attribute annotates the declaration that follows it and runs nothing.
+			if ( defined( 'T_ATTRIBUTE' ) && T_ATTRIBUTE === $token[0] ) {
+				$index = self::skip_attribute( $tokens, $index ) - 1;
+				continue;
+			}
+
+			// A namespace, an import and a `declare` end at their semicolon.
+			if ( in_array( $token[0], $inert, true ) ) {
+				for ( ++$index; $index < $total; $index++ ) {
+					if ( is_string( $tokens[ $index ] ) && ';' === $tokens[ $index ] ) {
+						break;
+					}
+
+					if ( is_string( $tokens[ $index ] ) && '{' === $tokens[ $index ] ) {
+						return sprintf( '%s with a body at the top level', token_name( $token[0] ) );
+					}
+				}
+
+				continue;
+			}
+
+			if ( in_array( $token[0], $declaring, true ) ) {
+				$body = self::skip_declaration( $tokens, $index );
+
+				if ( null === $body ) {
+					return sprintf( 'an anonymous or malformed %s', strtolower( token_name( $token[0] ) ) );
+				}
+
+				$index = $body - 1;
+				continue;
+			}
+
+			return sprintf( '%s on line %d', token_name( $token[0] ), $token[2] );
 		}
 
 		return null;
+	}
+
+	/**
+	 * Returns the index of the first token after an attribute.
+	 *
+	 * @param array $tokens Token list from token_get_all().
+	 * @param int   $index  Index of the T_ATTRIBUTE token.
+	 * @return int Index of the first token after the attribute.
+	 */
+	private static function skip_attribute( $tokens, $index ) {
+		$total = count( $tokens );
+		$depth = 0;
+
+		for ( ; $index < $total; $index++ ) {
+			if ( is_array( $tokens[ $index ] ) ) {
+				if ( defined( 'T_ATTRIBUTE' ) && T_ATTRIBUTE === $tokens[ $index ][0] ) {
+					++$depth;
+				}
+
+				continue;
+			}
+
+			if ( '[' === $tokens[ $index ] ) {
+				++$depth;
+				continue;
+			}
+
+			if ( ']' === $tokens[ $index ] ) {
+				--$depth;
+
+				if ( 0 === $depth ) {
+					return $index + 1;
+				}
+			}
+		}
+
+		return $total;
+	}
+
+	/**
+	 * Returns the index of the first token after a declaration body.
+	 *
+	 * @param array $tokens Token list from token_get_all().
+	 * @param int   $index  Index of the declaring keyword.
+	 * @return int|null Index of the first token after the body, or null when the declaration is anonymous.
+	 */
+	private static function skip_declaration( $tokens, $index ) {
+		$total     = count( $tokens );
+		$ignorable = array( T_WHITESPACE, T_COMMENT, T_DOC_COMMENT );
+		$cursor    = $index + 1;
+
+		while ( $cursor < $total && is_array( $tokens[ $cursor ] ) && in_array( $tokens[ $cursor ][0], $ignorable, true ) ) {
+			++$cursor;
+		}
+
+		if ( $cursor >= $total || ! is_array( $tokens[ $cursor ] ) || T_STRING !== $tokens[ $cursor ][0] ) {
+			return null;
+		}
+
+		$depth = 0;
+
+		for ( ; $cursor < $total; $cursor++ ) {
+			if ( is_array( $tokens[ $cursor ] ) ) {
+				if ( T_CURLY_OPEN === $tokens[ $cursor ][0]
+					|| ( defined( 'T_DOLLAR_OPEN_CURLY_BRACES' ) && T_DOLLAR_OPEN_CURLY_BRACES === $tokens[ $cursor ][0] )
+				) {
+					++$depth;
+				}
+
+				continue;
+			}
+
+			if ( '{' === $tokens[ $cursor ] ) {
+				++$depth;
+				continue;
+			}
+
+			if ( '}' === $tokens[ $cursor ] ) {
+				--$depth;
+
+				if ( 0 === $depth ) {
+					return $cursor + 1;
+				}
+			}
+		}
+
+		return $total;
 	}
 
 	/**
