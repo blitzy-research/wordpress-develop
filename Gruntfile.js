@@ -2154,38 +2154,106 @@ module.exports = function(grunt) {
 	] );
 
 	grunt.registerTask( 'build:autoload-classmap', 'Regenerates the core autoloader class map from the source tree.', function() {
-		var done = this.async();
+		var done   = this.async(),
+			crypto = require( 'crypto' ),
+			file   = `${ SOURCE_DIR }wp-includes/autoload-classmap.php`;
 
 		/*
 		 * The generator inspects every candidate file with PHP's own tokenizer, so it
 		 * is written in PHP and spawned here. It rewrites SOURCE_DIR in place and is
 		 * therefore sequenced ahead of build:files, which copies that result into
 		 * BUILD_DIR.
+		 *
+		 * Its output is captured rather than inherited, because the last line it
+		 * prints is a digest of the map it rendered. That digest is what lets this
+		 * task accept the file on disk only when the file *is* that map: a nonzero
+		 * exit, a run that stopped before publishing, a partially written file or a
+		 * stale map left by an earlier interrupted run all have to fail the build
+		 * rather than be copied into BUILD_DIR and shipped.
 		 */
 		grunt.util.spawn( {
 			cmd: 'php',
-			args: [ 'tools/build/generate-autoload-classmap.php', SOURCE_DIR ],
-			opts: { stdio: 'inherit' }
-		}, function( error ) {
-			if ( ! error ) {
-				const file    = `${ SOURCE_DIR }wp-includes/autoload-classmap.php`;
-				const entries = fs.readFileSync( file, {
-					encoding: 'utf8',
-				} ).match( /^\t'[^']+' => '[^']+',$/gm );
+			args: [ 'tools/build/generate-autoload-classmap.php', SOURCE_DIR ]
+		}, function( error, result ) {
+			var digest, published, entries, lint;
 
-				/*
-				 * An entry less map would switch the core autoloader off while still
-				 * looking like a legitimate build result, and copy:files would then ship
-				 * it. Fail the task instead of accepting it.
-				 */
-				if ( null === entries ) {
-					grunt.log.error( `No core classes were found; refusing to accept an empty autoload class map at ${ file }.` );
-					done( false );
-					return;
-				}
+			if ( result && result.stdout ) {
+				grunt.log.writeln( result.stdout );
 			}
 
-			done( ! error );
+			if ( result && result.stderr ) {
+				grunt.log.error( result.stderr );
+			}
+
+			if ( error ) {
+				grunt.log.error( `The autoload class map generator failed; refusing to accept the class map at ${ file }.` );
+				done( false );
+				return;
+			}
+
+			digest = /^AUTOLOAD_CLASSMAP_DIGEST entries=(\d+) bytes=(\d+) sha256=([0-9a-f]{64})$/m.exec(
+				result && result.stdout ? String( result.stdout ) : ''
+			);
+
+			/*
+			 * The generator prints the digest last, once it has published the map and
+			 * read it back, so its absence means the map was never published.
+			 */
+			if ( null === digest ) {
+				grunt.log.error( `The autoload class map generator reported no digest; refusing to accept the class map at ${ file }.` );
+				done( false );
+				return;
+			}
+
+			/*
+			 * An entry less map would switch the core autoloader off while still
+			 * looking like a legitimate build result, and copy:files would then ship
+			 * it. Fail the task instead of accepting it.
+			 */
+			if ( 0 === parseInt( digest[ 1 ], 10 ) ) {
+				grunt.log.error( `No core classes were found; refusing to accept an empty autoload class map at ${ file }.` );
+				done( false );
+				return;
+			}
+
+			try {
+				published = fs.readFileSync( file );
+			} catch ( readError ) {
+				grunt.log.error( `The autoload class map at ${ file } could not be read back: ${ readError.message }` );
+				done( false );
+				return;
+			}
+
+			// Byte for byte, so that nothing but the generated map can pass from here.
+			if ( published.length !== parseInt( digest[ 2 ], 10 ) ||
+				crypto.createHash( 'sha256' ).update( published ).digest( 'hex' ) !== digest[ 3 ]
+			) {
+				grunt.log.error( `The autoload class map at ${ file } is not the map that was generated; refusing to accept it.` );
+				done( false );
+				return;
+			}
+
+			// Checked independently of the digest, because the entry count is the one thing the autoloader needs the file to hold.
+			entries = published.toString( 'utf8' ).match( /^\t'[^']+' => '[^']+',$/gm );
+
+			if ( null === entries || entries.length !== parseInt( digest[ 1 ], 10 ) ) {
+				grunt.log.error( `The autoload class map at ${ file } holds ${ null === entries ? 0 : entries.length } entries where the generator rendered ${ digest[ 1 ] }; refusing to accept it.` );
+				done( false );
+				return;
+			}
+
+			// A map the PHP parser rejects would turn the first autoload attempt into a fatal error.
+			lint = spawn( 'php', [ '-l', file ], { encoding: 'utf8' } );
+
+			if ( 0 !== lint.status ) {
+				grunt.log.error( `${ lint.stdout || '' }${ lint.stderr || '' }` );
+				grunt.log.error( `The autoload class map at ${ file } is not valid PHP; refusing to accept it.` );
+				done( false );
+				return;
+			}
+
+			grunt.log.writeln( `Verified ${ entries.length } autoload class map entries in ${ file }.` );
+			done( true );
 		} );
 	} );
 

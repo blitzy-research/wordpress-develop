@@ -56,6 +56,18 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 			"The path mapped for {$class_name} must not traverse above the WordPress root."
 		);
 
+		/*
+		 * Asserted as one canonical form rather than only as the sum of the checks
+		 * above, because the autoloader refuses anything else outright: a value it
+		 * does not recognise as canonical is a miss, so a mapped path that is merely
+		 * plausible would be unreachable at runtime.
+		 */
+		$this->assertMatchesRegularExpression(
+			self::get_class_map_path_pattern(),
+			$path,
+			"The path mapped for {$class_name} must be a canonical .php path below wp-includes/ or wp-admin/includes/, with non-empty segments that do not begin with a dot."
+		);
+
 		$this->assertTrue(
 			is_readable( ABSPATH . $path ),
 			"The file mapped for {$class_name} is not readable: {$path}."
@@ -219,6 +231,10 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 	 * mapped value has to name a file that still exists: a path left behind by a
 	 * moved or removed file, or one that resolves to a directory, would make the
 	 * autoloader silently stop resolving the name it is mapped for.
+	 *
+	 * Scope is decided by the canonical form the autoloader requires rather than by
+	 * the prefix alone, because a prefix test on its own accepts a value that starts
+	 * inside the tree and then leaves it again, such as `wp-includes/../wp-config.php`.
 	 */
 	public function test_class_map_contains_no_stale_paths() {
 		$class_map = self::get_class_map();
@@ -226,23 +242,11 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 		$this->assertIsArray( $class_map, 'The generated class map must return an array.' );
 		$this->assertNotEmpty( $class_map, 'The generated class map must not be empty.' );
 
-		$allowed_prefixes = array( 'wp-includes/', 'wp-admin/includes/' );
-		$outside_scope    = array();
-		$not_a_file       = array();
+		$outside_scope = array();
+		$not_a_file    = array();
 
 		foreach ( $class_map as $class_name => $path ) {
-			$in_scope = false;
-
-			if ( is_string( $path ) ) {
-				foreach ( $allowed_prefixes as $prefix ) {
-					if ( 0 === strpos( $path, $prefix ) ) {
-						$in_scope = true;
-						break;
-					}
-				}
-			}
-
-			if ( ! $in_scope ) {
+			if ( ! is_string( $path ) || ! preg_match( self::get_class_map_path_pattern(), $path ) ) {
 				$outside_scope[] = $class_name;
 				continue;
 			}
@@ -255,7 +259,7 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 		$this->assertSame(
 			array(),
 			$outside_scope,
-			'Every class map path must be relative to ABSPATH and begin with wp-includes/ or wp-admin/includes/.'
+			'Every class map path must be a canonical .php path relative to ABSPATH, below wp-includes/ or wp-admin/includes/, with non-empty segments that do not begin with a dot.'
 		);
 
 		$this->assertSame(
@@ -441,14 +445,7 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 	 * also what keeps an ineligible file from being mapped by hand.
 	 */
 	public function test_class_map_matches_the_generator() {
-		$generator = dirname( untrailingslashit( ABSPATH ) ) . '/tools/build/generate-autoload-classmap.php';
-
-		$this->assertTrue(
-			is_readable( $generator ),
-			'The class map generator must be present at tools/build/generate-autoload-classmap.php.'
-		);
-
-		require_once $generator;
+		$this->require_generator();
 
 		$generated = wp_autoload_classmap_build( ABSPATH );
 
@@ -456,6 +453,274 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 			$generated['map'],
 			self::get_class_map(),
 			'The committed class map must match the output of build:autoload-classmap. Run `grunt build:autoload-classmap`.'
+		);
+	}
+
+	/**
+	 * Tests that the generator emits only paths the autoloader will act on.
+	 *
+	 * The generator refuses to write a value that is not canonical and the
+	 * autoloader refuses to load one, and neither consults the other, so the two
+	 * rules have to be the same rule. They are compared as source here: the pattern
+	 * the autoloader applies at runtime has to be character for character the
+	 * pattern the generator applies when it renders an entry, because a value one
+	 * side accepts and the other rejects would either be unloadable or unwritable.
+	 */
+	public function test_generator_and_autoloader_require_the_same_path_form() {
+		$this->require_generator();
+
+		$autoloader_patterns = self::get_class_map_path_patterns( ABSPATH . WPINC . '/autoload.php' );
+		$generator_patterns  = self::get_class_map_path_patterns( self::get_generator_path() );
+
+		$this->assertCount(
+			1,
+			$autoloader_patterns,
+			'wp-includes/autoload.php must hold exactly one class map path pattern.'
+		);
+
+		$this->assertCount(
+			1,
+			$generator_patterns,
+			'The class map generator must hold exactly one class map path pattern.'
+		);
+
+		$this->assertSame(
+			$autoloader_patterns[0],
+			$generator_patterns[0],
+			'The autoloader and the generator must require the same form of a mapped path.'
+		);
+
+		$this->assertSame(
+			self::get_class_map_path_pattern(),
+			$autoloader_patterns[0],
+			'This test class must assert the same form of a mapped path as the autoloader.'
+		);
+
+		foreach ( self::get_class_map() as $class_name => $path ) {
+			$this->assertTrue(
+				wp_autoload_classmap_is_loadable_path( $path ),
+				"The generator must consider the path mapped for {$class_name} loadable: {$path}."
+			);
+		}
+	}
+
+	/**
+	 * Tests that the generator reads a PHP 7.4 token stream the way it reads a PHP 8 one.
+	 *
+	 * PHP 8.0 reports `Foo\Bar` as one token, while PHP 7.4 - the floor
+	 * composer.json declares - reports the same name as a run of T_STRING and
+	 * T_NS_SEPARATOR tokens. The generator normalizes both shapes before reading
+	 * them, and this is what proves it: the stream a PHP 7.4 tokenizer would have
+	 * produced is reconstructed from the running tokenizer's output, and the two are
+	 * required to normalize identically. The floor is therefore covered on whatever
+	 * version the suite runs on, without a PHP 7.4 interpreter being present.
+	 *
+	 * @dataProvider data_qualified_name_sources
+	 *
+	 * @param string   $code  Source to tokenize.
+	 * @param string[] $names The qualified names the source writes, in the order they appear.
+	 */
+	public function test_generator_reads_a_php_74_token_stream_alike( $code, $names ) {
+		$this->require_generator();
+
+		$native     = token_get_all( $code );
+		$downgraded = self::downgrade_qualified_name_tokens( $native );
+
+		$this->assertSame(
+			array(),
+			array_values(
+				array_filter(
+					$downgraded,
+					static function ( $token ) {
+						return is_array( $token )
+							&& in_array( $token[0], wp_autoload_classmap_qualified_name_tokens(), true );
+					}
+				)
+			),
+			'The reconstructed PHP 7.4 stream must hold no token that only PHP 8 reports.'
+		);
+
+		$normalized = wp_autoload_classmap_normalize_tokens( $downgraded );
+
+		$this->assertSame(
+			wp_autoload_classmap_normalize_tokens( $native ),
+			$normalized,
+			'Both tokenizer shapes must normalize to the same token list.'
+		);
+
+		$found = array();
+
+		foreach ( $normalized as $token ) {
+			if ( is_array( $token ) && wp_autoload_classmap_name_token() === $token[0] ) {
+				$found[] = $token[1];
+			}
+		}
+
+		$this->assertSame(
+			$names,
+			$found,
+			'Normalizing must report each qualified name once, whole, and as it was written.'
+		);
+	}
+
+	/**
+	 * Data provider for the qualified name sources.
+	 *
+	 * @return array[] Array of test cases, each holding source and the qualified names it writes.
+	 */
+	public function data_qualified_name_sources() {
+		return array(
+			'a fully qualified parent'      => array(
+				"<?php\nclass A extends \\Foo\\Bar {}\n",
+				array( '\\Foo\\Bar' ),
+			),
+			'a fully qualified single name' => array(
+				"<?php\nclass A extends \\Bar {}\n",
+				array( '\\Bar' ),
+			),
+			'a qualified interface'         => array(
+				"<?php\nclass A implements Foo\\Baz {}\n",
+				array( 'Foo\\Baz' ),
+			),
+			'a namespace declaration'       => array(
+				"<?php\nnamespace Foo\\Bar;\nclass A {}\n",
+				array( 'Foo\\Bar' ),
+			),
+			'an import and its alias'       => array(
+				"<?php\nnamespace Foo;\nuse Other\\Thing as T;\nclass A extends T {}\n",
+				array( 'Other\\Thing' ),
+			),
+			'a namespace relative name'     => array(
+				"<?php\nnamespace Foo;\nclass A extends namespace\\Base {}\n",
+				array( 'namespace\\Base' ),
+			),
+			'a trait used in a body'        => array(
+				"<?php\nclass A {\n\tuse \\Foo\\TraitA;\n}\n",
+				array( '\\Foo\\TraitA' ),
+			),
+			'a static call is not a name'   => array(
+				"<?php\nnamespace Foo;\nclass A {\n\tpublic function b() {\n\t\treturn \\Foo\\Bar::baz();\n\t}\n}\n",
+				array( '\\Foo\\Bar' ),
+			),
+		);
+	}
+
+	/**
+	 * Tests that the generator produces the committed class map on a PHP 7.4 token stream.
+	 *
+	 * The case above covers the shapes one at a time; this covers the whole tree at
+	 * once, which is what the build actually does. A copy of the generator is run in
+	 * a separate process with its tokenizer downgraded to the PHP 7.4 shape and with
+	 * the PHP 8 token ids taken away from it, and the map it renders has to be the
+	 * committed map, byte for byte. Before the shapes were normalized this produced
+	 * a map that silently lost every class whose parent or interface is namespaced.
+	 */
+	public function test_class_map_is_unchanged_on_a_php_74_token_stream() {
+		$generator = self::get_generator_path();
+
+		$this->assertTrue(
+			is_readable( $generator ),
+			'The class map generator must be present at tools/build/generate-autoload-classmap.php.'
+		);
+
+		$directory = get_temp_dir() . 'wp-autoload-php74-' . md5( __METHOD__ . ABSPATH ) . '/';
+
+		$this->assertTrue( wp_mkdir_p( $directory ), 'The temporary tree for the test must be creatable.' );
+
+		$renamed   = 0;
+		$tokenized = 0;
+		$blinded   = 0;
+		$source    = file_get_contents( $generator );
+
+		// Renamed wholesale, so that the copy cannot collide with the generator itself.
+		$source = str_replace( 'wp_autoload_classmap_', 'wp_autoload_classmap_php74_', $source, $renamed );
+		$source = str_replace( 'token_get_all(', 'wp_autoload_classmap_php74_tokenizer(', $source, $tokenized );
+		$source = str_replace(
+			"array( 'T_NAME_QUALIFIED', 'T_NAME_FULLY_QUALIFIED', 'T_NAME_RELATIVE' )",
+			'array()',
+			$source,
+			$blinded
+		);
+
+		/*
+		 * Asserted rather than assumed: a rewrite that stopped matching would leave
+		 * the copy identical to the generator, and the comparison below would then
+		 * pass without having tested anything.
+		 */
+		$this->assertGreaterThan( 20, $renamed, 'The copy of the generator must have its functions renamed.' );
+		$this->assertGreaterThan( 1, $tokenized, 'The copy of the generator must have every tokenizer call redirected.' );
+		$this->assertSame( 1, $blinded, 'The copy of the generator must have the PHP 8 token ids taken away from it.' );
+
+		$copy = $directory . 'generator.php';
+		$this->assertNotFalse( file_put_contents( $copy, $source ), 'The copy of the generator must be writable.' );
+
+		$probe = $directory . 'probe.php';
+		$this->assertNotFalse(
+			file_put_contents( $probe, self::get_php_74_generator_probe_source() ),
+			'The PHP 7.4 probe must be writable.'
+		);
+
+		$output = shell_exec(
+			sprintf(
+				'%s %s %s %s 2>&1',
+				escapeshellarg( PHP_BINARY ),
+				escapeshellarg( $probe ),
+				escapeshellarg( $copy ),
+				escapeshellarg( ABSPATH )
+			)
+		);
+
+		$this->rmdir( untrailingslashit( $directory ) );
+		$this->delete_folders( untrailingslashit( $directory ) );
+
+		$this->assertIsString(
+			$output,
+			'The PHP 7.4 probe must run in a separate PHP process. Process spawning is required by the test bootstrap itself.'
+		);
+
+		$this->assertSame(
+			1,
+			preg_match( '/--WP-AUTOLOAD-PHP74--(.*)--WP-AUTOLOAD-PHP74--/s', $output, $matches ),
+			"The PHP 7.4 probe must report between its sentinels. It emitted:\n" . $output
+		);
+
+		$this->assertSame(
+			file_get_contents( ABSPATH . WPINC . '/autoload-classmap.php' ),
+			$matches[1],
+			'A PHP 7.4 token stream must render the committed class map, byte for byte.'
+		);
+	}
+
+	/**
+	 * Tests that the generator never names a tokenizer constant PHP 7.4 lacks.
+	 *
+	 * T_NAME_QUALIFIED, T_NAME_FULLY_QUALIFIED and T_NAME_RELATIVE arrived in PHP
+	 * 8.0. Naming one directly raises "Use of undefined constant" on the declared
+	 * PHP 7.4 floor and evaluates to the constant's own name, which quietly stops
+	 * matching any token instead of failing, so the ids are read through constant()
+	 * behind defined() in one place. This keeps that the only place.
+	 */
+	public function test_generator_names_no_php_8_only_tokenizer_constant() {
+		$generator = self::get_generator_path();
+
+		$this->assertTrue(
+			is_readable( $generator ),
+			'The class map generator must be present at tools/build/generate-autoload-classmap.php.'
+		);
+
+		$php_8_only = array( 'T_NAME_QUALIFIED', 'T_NAME_FULLY_QUALIFIED', 'T_NAME_RELATIVE' );
+		$named      = array();
+
+		foreach ( token_get_all( file_get_contents( $generator ) ) as $token ) {
+			if ( is_array( $token ) && T_STRING === $token[0] && in_array( $token[1], $php_8_only, true ) ) {
+				$named[] = $token[1] . ' on line ' . $token[2];
+			}
+		}
+
+		$this->assertSame(
+			array(),
+			$named,
+			'The class map generator must reach a PHP 8 only tokenizer constant through constant(), never by naming it.'
 		);
 	}
 
@@ -566,6 +831,154 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 			'a map that returns a string' => array( "<?php\nreturn 'not a map';\n" ),
 			'a map that returns null'     => array( "<?php\nreturn null;\n" ),
 			'an empty map'                => array( "<?php\nreturn array();\n" ),
+		);
+	}
+
+	/**
+	 * Tests that a malformed mapped value loads nothing and reports nothing.
+	 *
+	 * The map is a generated artifact, so the autoloader is not defending itself
+	 * against a request: it is refusing to act on a value that a partial write, an
+	 * interrupted build, a hand edit or a tampered tree could leave behind. A value
+	 * that is not a canonical path below wp-includes/ or wp-admin/includes/ has to
+	 * behave exactly like an unmapped name - resolve nothing, load nothing, say
+	 * nothing - so that it can neither reach a file outside those trees nor turn
+	 * into a warning or a fatal error on an unrelated request.
+	 *
+	 * Each case plants the file the malformed value would resolve to, so that the
+	 * name would resolve if the value were acted on, and each runs in its own
+	 * process because the handler memoizes the map for the life of a request.
+	 *
+	 * @dataProvider data_malformed_class_map_values
+	 *
+	 * @param string      $value The value to map, written as the PHP expression the map will hold.
+	 * @param string|null $decoy Path, relative to the fabricated ABSPATH, of the file the value
+	 *                           resolves to, or null when the value cannot name a file at all.
+	 */
+	public function test_malformed_class_map_value_is_a_silent_miss( $value, $decoy ) {
+		$root = get_temp_dir() . 'wp-autoload-malformed-' . md5( __METHOD__ . $value . (string) $decoy ) . '/';
+
+		/*
+		 * ABSPATH sits one level below the directory the test cleans up, so that a
+		 * case whose value climbs above ABSPATH still writes inside the temporary
+		 * tree rather than beside it.
+		 */
+		$abspath = $root . 'wp/';
+
+		$this->assertTrue(
+			wp_mkdir_p( $abspath . 'wp-includes' ),
+			'The temporary tree for the test must be creatable.'
+		);
+
+		copy( ABSPATH . WPINC . '/autoload.php', $abspath . 'wp-includes/autoload.php' );
+
+		file_put_contents(
+			$abspath . 'wp-includes/autoload-classmap.php',
+			"<?php\nreturn array(\n\t'wp_autoload_malformed_probe' => " . $value . ",\n);\n"
+		);
+
+		if ( null !== $decoy ) {
+			$decoy_file = $abspath . $decoy;
+
+			$this->assertTrue(
+				wp_mkdir_p( dirname( $decoy_file ) ),
+				'The directory holding the file the malformed value resolves to must be creatable.'
+			);
+
+			file_put_contents( $decoy_file, "<?php\nclass WP_Autoload_Malformed_Probe {}\n" );
+		}
+
+		$script = sprintf(
+			'define( "ABSPATH", %s ); define( "WPINC", "wp-includes" );'
+				. ' require ABSPATH . WPINC . "/autoload.php";'
+				. ' echo class_exists( "WP_Autoload_Malformed_Probe" ) ? "resolved" : "unresolved";',
+			var_export( $abspath, true )
+		);
+
+		$output    = array();
+		$exit_code = 0;
+
+		exec( escapeshellarg( PHP_BINARY ) . ' -d error_reporting=E_ALL -d display_errors=1 -r ' . escapeshellarg( $script ) . ' 2>&1', $output, $exit_code );
+
+		// rmdir() only removes an empty directory, so the files have to go first.
+		$this->rmdir( untrailingslashit( $root ) );
+		$this->delete_folders( untrailingslashit( $root ) );
+
+		$this->assertSame(
+			0,
+			$exit_code,
+			'A malformed mapped value must not make the autoloader fail: ' . implode( "\n", $output )
+		);
+
+		$this->assertSame(
+			array( 'unresolved' ),
+			$output,
+			'A malformed mapped value must resolve no name and load no file, silently.'
+		);
+	}
+
+	/**
+	 * Data provider for the malformed mapped value cases.
+	 *
+	 * Every case is a value the generator refuses to emit, paired with the file it
+	 * would resolve to once concatenated onto ABSPATH.
+	 *
+	 * @return array[] Array of test cases, each holding the mapped value as a PHP expression
+	 *                 and the path it resolves to, relative to ABSPATH.
+	 */
+	public function data_malformed_class_map_values() {
+		$probe = 'class-wp-autoload-malformed-probe.php';
+
+		return array(
+			'a parent directory segment'          => array(
+				"'wp-includes/../{$probe}'",
+				$probe,
+			),
+			'a segment that climbs above ABSPATH' => array(
+				"'wp-includes/../../{$probe}'",
+				"../{$probe}",
+			),
+			'a current directory segment'         => array(
+				"'wp-includes/./{$probe}'",
+				"wp-includes/{$probe}",
+			),
+			'a doubled separator'                 => array(
+				"'wp-includes//{$probe}'",
+				"wp-includes/{$probe}",
+			),
+			'a leading separator'                 => array(
+				"'/wp-includes/{$probe}'",
+				"wp-includes/{$probe}",
+			),
+			'a backslash separator'               => array(
+				"'wp-includes\\\\{$probe}'",
+				"wp-includes\\{$probe}",
+			),
+			'the wider wp-admin root'             => array(
+				"'wp-admin/{$probe}'",
+				"wp-admin/{$probe}",
+			),
+			'climbing out of wp-admin/includes'   => array(
+				"'wp-admin/includes/../../{$probe}'",
+				$probe,
+			),
+			'a root the map never covers'         => array(
+				"'wp-content/{$probe}'",
+				"wp-content/{$probe}",
+			),
+			'a file that is not PHP'              => array(
+				"'wp-includes/class-wp-autoload-malformed-probe.txt'",
+				'wp-includes/class-wp-autoload-malformed-probe.txt',
+			),
+			'a directory rather than a file'      => array(
+				"'wp-includes/'",
+				null,
+			),
+			'an integer'                          => array( '123', null ),
+			'a float'                             => array( '1.5', null ),
+			'a boolean'                           => array( 'true', null ),
+			'an array'                            => array( "array( 'wp-includes/{$probe}' )", null ),
+			'an object'                           => array( 'new stdClass()', null ),
 		);
 	}
 
@@ -1089,6 +1502,173 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 			$problems,
 			'An entry point exempted from the redeclaration check must bootstrap itself and never reach wp-includes/autoload.php.'
 		);
+	}
+
+	/**
+	 * Returns the path of the class map generator.
+	 *
+	 * Derived from ABSPATH rather than from __DIR__, so that it is found whether the
+	 * suite runs against the development tree or a built one.
+	 *
+	 * @return string Absolute path of tools/build/generate-autoload-classmap.php.
+	 */
+	private static function get_generator_path() {
+		return dirname( untrailingslashit( ABSPATH ) ) . '/tools/build/generate-autoload-classmap.php';
+	}
+
+	/**
+	 * Loads the class map generator, so that its functions can be called directly.
+	 *
+	 * @return void
+	 */
+	private function require_generator() {
+		$generator = self::get_generator_path();
+
+		$this->assertTrue(
+			is_readable( $generator ),
+			'The class map generator must be present at tools/build/generate-autoload-classmap.php.'
+		);
+
+		require_once $generator;
+	}
+
+	/**
+	 * Returns the form a class map path has to take.
+	 *
+	 * Stated here rather than read out of the autoloader, so that a change to the
+	 * pattern the autoloader applies has to be made deliberately in both places.
+	 * test_generator_and_autoloader_require_the_same_path_form() is what holds the
+	 * three copies together.
+	 *
+	 * @return string Pattern for preg_match().
+	 */
+	private static function get_class_map_path_pattern() {
+		return '#^(?:wp-includes|wp-admin/includes)/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.php$#';
+	}
+
+	/**
+	 * Returns the class map path patterns a file holds.
+	 *
+	 * Collected from the file's own tokens rather than by matching its text, so that
+	 * a pattern inside a comment or a message cannot be mistaken for the one the
+	 * file applies.
+	 *
+	 * @param string $file Absolute path of the file to read.
+	 * @return string[] Every single quoted pattern in the file that anchors on the mapped roots.
+	 */
+	private static function get_class_map_path_patterns( $file ) {
+		$patterns = array();
+
+		foreach ( token_get_all( (string) file_get_contents( $file ) ) as $token ) {
+			if ( ! is_array( $token ) || T_CONSTANT_ENCAPSED_STRING !== $token[0] ) {
+				continue;
+			}
+
+			$literal = substr( $token[1], 1, -1 );
+
+			if ( 0 === strpos( $literal, '#^(?:wp-includes' ) ) {
+				$patterns[] = str_replace( "\\'", "'", $literal );
+			}
+		}
+
+		return $patterns;
+	}
+
+	/**
+	 * Rewrites PHP 8 qualified name tokens as the run PHP 7.4 reports.
+	 *
+	 * PHP 7.4 has no single token for a name written with a namespace separator: it
+	 * reports the segments as T_STRING, the separators as T_NS_SEPARATOR and the
+	 * `namespace` keyword of a relative name as T_NAMESPACE. Splitting the tokens the
+	 * running PHP produced back into that run is what lets the floor be tested
+	 * without a PHP 7.4 interpreter.
+	 *
+	 * @param array $tokens Token list from token_get_all().
+	 * @return array The same list, with every qualified name token split into its PHP 7.4 run.
+	 */
+	private static function downgrade_qualified_name_tokens( $tokens ) {
+		$qualified  = wp_autoload_classmap_qualified_name_tokens();
+		$downgraded = array();
+
+		foreach ( $tokens as $token ) {
+			if ( ! is_array( $token ) || ! in_array( $token[0], $qualified, true ) ) {
+				$downgraded[] = $token;
+				continue;
+			}
+
+			$line = isset( $token[2] ) ? $token[2] : 0;
+
+			foreach ( preg_split( '#(\\\\)#', $token[1], -1, PREG_SPLIT_DELIM_CAPTURE | PREG_SPLIT_NO_EMPTY ) as $piece ) {
+				if ( '\\' === $piece ) {
+					$downgraded[] = array( T_NS_SEPARATOR, '\\', $line );
+				} elseif ( 'namespace' === strtolower( $piece ) ) {
+					$downgraded[] = array( T_NAMESPACE, $piece, $line );
+				} else {
+					$downgraded[] = array( T_STRING, $piece, $line );
+				}
+			}
+		}
+
+		return $downgraded;
+	}
+
+	/**
+	 * Returns the source of the PHP 7.4 generator probe.
+	 *
+	 * Runs a copy of the generator whose tokenizer calls have been redirected here,
+	 * so that every file it inspects arrives in the shape PHP 7.4 would have
+	 * reported, and prints the map that copy renders between sentinels.
+	 *
+	 * @return string The probe source.
+	 */
+	private static function get_php_74_generator_probe_source() {
+		return <<<'PROBE'
+<?php
+/**
+ * Reports the class map a PHP 7.4 tokenizer would have produced.
+ *
+ * @param string $source Source to tokenize.
+ * @return array Tokens, with every qualified name split into the run PHP 7.4 reports.
+ */
+function wp_autoload_classmap_php74_tokenizer( $source ) {
+	$tokens     = token_get_all( $source );
+	$downgraded = array();
+	$qualified  = array();
+
+	foreach ( array( 'T_NAME_QUALIFIED', 'T_NAME_FULLY_QUALIFIED', 'T_NAME_RELATIVE' ) as $constant ) {
+		if ( defined( $constant ) ) {
+			$qualified[] = constant( $constant );
+		}
+	}
+
+	foreach ( $tokens as $token ) {
+		if ( ! is_array( $token ) || ! in_array( $token[0], $qualified, true ) ) {
+			$downgraded[] = $token;
+			continue;
+		}
+
+		$line = isset( $token[2] ) ? $token[2] : 0;
+
+		foreach ( preg_split( '#(\\\\)#', $token[1], -1, PREG_SPLIT_DELIM_CAPTURE | PREG_SPLIT_NO_EMPTY ) as $piece ) {
+			if ( '\\' === $piece ) {
+				$downgraded[] = array( T_NS_SEPARATOR, '\\', $line );
+			} elseif ( 'namespace' === strtolower( $piece ) ) {
+				$downgraded[] = array( T_NAMESPACE, $piece, $line );
+			} else {
+				$downgraded[] = array( T_STRING, $piece, $line );
+			}
+		}
+	}
+
+	return $downgraded;
+}
+
+require $argv[1];
+
+$built = wp_autoload_classmap_php74_build( $argv[2] );
+
+echo '--WP-AUTOLOAD-PHP74--' . wp_autoload_classmap_php74_render( $built['map'] ) . '--WP-AUTOLOAD-PHP74--';
+PROBE;
 	}
 
 	/**

@@ -43,9 +43,9 @@ require ABSPATH . WPINC . '/load.php';
  * required eagerly below. Registration does not load the class map: the map is
  * read on the first autoload attempt for a name that could belong to core.
  *
- * Because of that, none of the require statements below name a file that the
- * generated class map covers. A file is still required explicitly when any of
- * the following is true, since in those cases the autoloader cannot stand in
+ * Because of that, no unconditional require statement below names a file that
+ * the generated class map covers. A file is still required explicitly when any
+ * of the following is true, since in those cases the autoloader cannot stand in
  * for the require:
  *
  * - It declares functions, which an autoloader is never asked to resolve.
@@ -55,6 +55,12 @@ require ABSPATH . WPINC . '/load.php';
  *   the generator rejected the file as ineligible.
  * - Code deliberately probes for the name with autoloading disabled, so the
  *   name has to be present before that probe runs.
+ *
+ * One conditional require is a deliberate exception: the WP_Site_Health branch
+ * near the end of this file does name a mapped file, because the class lives
+ * under wp-admin and the map is what keeps it reachable from here. That require
+ * sits behind class_exists( 'WP_Site_Health' ), which autoloading answers first,
+ * so it is reached only in a tree that carries no usable generated map.
  */
 require ABSPATH . WPINC . '/autoload.php';
 
@@ -128,11 +134,13 @@ require ABSPATH . WPINC . '/formatting.php';
 require ABSPATH . WPINC . '/meta.php';
 require ABSPATH . WPINC . '/functions.php';
 /*
- * WP_Error is in the class map, but wpdb::bail() checks for it with
- * class_exists( 'WP_Error', false ) and assigns a plain string to the public
- * wpdb::$error property when the check fails. Autoloading it on demand would
- * therefore change the type of that property for anyone reading it, so the name
- * is made available here, before a database connection can fail.
+ * WP_Error is deliberately eager, and is therefore absent from the generated
+ * class map rather than resolved on first reference: wpdb::bail() probes for the
+ * name with class_exists( 'WP_Error', false ), which disables autoloading, and
+ * assigns a plain string to the public wpdb::$error property when that probe
+ * fails. Deferring the name would change the type of that property for anyone
+ * reading it, so it is made available here, before a database connection can
+ * fail.
  */
 require ABSPATH . WPINC . '/class-wp-error.php';
 require ABSPATH . WPINC . '/pomo/mo.php';

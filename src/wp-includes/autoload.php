@@ -25,6 +25,12 @@
  *
  *       'wp_rest_posts_controller' => 'wp-includes/rest-api/endpoints/class-wp-rest-posts-controller.php',
  *
+ * - That path is canonical: it is rooted at `wp-includes/` or at
+ *   `wp-admin/includes/`, every segment is non-empty and starts with something
+ *   other than a dot, and it ends in `.php`. Anything else - a `..` or `.`
+ *   segment, a doubled slash, a leading slash, a backslash, another root - is not
+ *   a path this autoloader owns, and is treated as a miss rather than resolved.
+ *
  * - A value is therefore resolved as `ABSPATH . $path`, and never as
  *   `ABSPATH . WPINC . '/' . $path`. Keeping the directory prefix inside the
  *   value is what lets one map work unchanged in both the development tree and
@@ -41,9 +47,10 @@
  * tested against the short list of prefixes every mapped name shares, so a name
  * that cannot belong to core returns before the map is read at all; a name that
  * can reads the map once and then reuses it for the rest of the request. When
- * the map is absent, does not return an array, or does not contain the requested
- * name, and when a mapped file has gone away, the autoloader silently does
- * nothing so that every other registered autoloader still gets its turn.
+ * the map is absent, does not return an array, does not contain the requested
+ * name or maps it to something other than a canonical core path, and when a
+ * mapped file has gone away, the autoloader silently does nothing so that every
+ * other registered autoloader still gets its turn.
  *
  * @package WordPress
  * @since 7.0.0
@@ -140,6 +147,31 @@ function wp_autoload_class( $class_name ) {
 	}
 
 	if ( ! isset( $classmap[ $name ] ) ) {
+		return;
+	}
+
+	/*
+	 * The value is resolved against ABSPATH and then loaded, so it is checked
+	 * before it is used rather than trusted for having come from a generated file.
+	 * A build that was interrupted, a partially written map, a hand edit or a
+	 * tampered tree can all leave a value that is not a path this autoloader owns,
+	 * and the only safe response to one is the same as to an unmapped name: do
+	 * nothing, and leave the name to the other registered autoloaders.
+	 *
+	 * The form required is canonical rather than merely plausible. It is rooted at
+	 * wp-includes/ or at wp-admin/includes/, every segment is non-empty and begins
+	 * with something other than a dot - which is what makes `..`, `.` and the empty
+	 * segment of a doubled slash unrepresentable - and it ends in .php with no
+	 * backslash and no leading separator anywhere. The generator enforces the same
+	 * form when it emits an entry, so neither side depends on the other having got
+	 * it right.
+	 */
+	if ( ! is_string( $classmap[ $name ] )
+		|| ! preg_match(
+			'#^(?:wp-includes|wp-admin/includes)/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.php$#',
+			$classmap[ $name ]
+		)
+	) {
 		return;
 	}
 

@@ -161,6 +161,169 @@ function wp_autoload_classmap_reserved_type_names() {
 }
 
 /**
+ * Returns the token id this generator uses for a name written with a namespace separator.
+ *
+ * Deliberately not one of PHP's own ids. PHP 8.0 reports `Foo\Bar` as a single
+ * T_NAME_QUALIFIED token, while PHP 7.4 - the floor `composer.json` declares -
+ * reports it as a run of T_STRING and T_NS_SEPARATOR tokens. Both shapes are
+ * folded onto this id by wp_autoload_classmap_normalize_tokens() so that the rest
+ * of the generator recognises one shape rather than two, and the id is negative
+ * so it can never collide with a real token id, which `token_get_all()` always
+ * reports as a positive integer.
+ *
+ * @return int Token id for a namespace qualified name.
+ */
+function wp_autoload_classmap_name_token() {
+	return -1;
+}
+
+/**
+ * Returns the ids PHP 8.0 and later report a namespace qualified name with.
+ *
+ * Each constant is read through `constant()` after `defined()` rather than being
+ * named directly, because none of them exists on PHP 7.4: naming one there would
+ * raise "Use of undefined constant" and evaluate to its own name, which would
+ * silently stop matching any token, and naming one on PHP 8 in a file that also
+ * has to run on 7.4 is exactly the coupling this indirection removes. An empty
+ * result therefore means the interpreter predates them and only the 7.4 shape can
+ * appear in its token stream.
+ *
+ * @return int[] Token ids, for those the running PHP declares.
+ */
+function wp_autoload_classmap_qualified_name_tokens() {
+	static $tokens = null;
+
+	if ( null !== $tokens ) {
+		return $tokens;
+	}
+
+	$tokens = array();
+
+	foreach ( array( 'T_NAME_QUALIFIED', 'T_NAME_FULLY_QUALIFIED', 'T_NAME_RELATIVE' ) as $constant ) {
+		if ( defined( $constant ) ) {
+			$tokens[] = constant( $constant );
+		}
+	}
+
+	return $tokens;
+}
+
+/**
+ * Returns the token ids that carry a class, interface or trait name.
+ *
+ * A name of one segment stays a plain T_STRING on every version, and anything
+ * written with a namespace separator arrives normalized onto the generator's own
+ * id, so these two are the whole set.
+ *
+ * @return int[] Token ids that hold a name.
+ */
+function wp_autoload_classmap_name_tokens() {
+	return array( T_STRING, wp_autoload_classmap_name_token() );
+}
+
+/**
+ * Determines whether a name was written fully qualified.
+ *
+ * Read from the text rather than from the token id, because the text is the one
+ * thing both tokenizer shapes agree on: PHP 8 keeps the leading separator in the
+ * token it reports, and the normalizer keeps it when it folds the 7.4 run.
+ *
+ * @param string $name Name as it appears in the source.
+ * @return bool Whether the name begins with a namespace separator.
+ */
+function wp_autoload_classmap_is_absolute_name( $name ) {
+	return '' !== $name && '\\' === $name[0];
+}
+
+/**
+ * Folds a namespace qualified name into one token, whatever version tokenized it.
+ *
+ * PHP 8.0 reports `Foo\Bar`, `\Foo\Bar` and `namespace\Bar` as one token each.
+ * PHP 7.4 reports the same names as a contiguous run of T_STRING, T_NS_SEPARATOR
+ * and, for the relative form, T_NAMESPACE tokens, with nothing between the pieces
+ * because a namespace separator may not be surrounded by whitespace. This walks a
+ * token list once and emits the PHP 8 shape on both: one token, carrying the whole
+ * name as its text and the line the name started on.
+ *
+ * Applied to every token list the generator inspects, so that the map produced on
+ * the declared PHP 7.4 floor is the same map produced on PHP 8.
+ *
+ * @param array $tokens Token list from token_get_all().
+ * @return array Token list in which every qualified name is a single token.
+ */
+function wp_autoload_classmap_normalize_tokens( $tokens ) {
+	$qualified  = wp_autoload_classmap_qualified_name_tokens();
+	$name_token = wp_autoload_classmap_name_token();
+	$total      = count( $tokens );
+	$normalized = array();
+
+	for ( $index = 0; $index < $total; $index++ ) {
+		$token = $tokens[ $index ];
+
+		if ( ! is_array( $token ) ) {
+			$normalized[] = $token;
+			continue;
+		}
+
+		// Already one token: only its id has to change.
+		if ( in_array( $token[0], $qualified, true ) ) {
+			$normalized[] = array( $name_token, $token[1], isset( $token[2] ) ? $token[2] : 0 );
+			continue;
+		}
+
+		if ( T_STRING !== $token[0] && T_NS_SEPARATOR !== $token[0] && T_NAMESPACE !== $token[0] ) {
+			$normalized[] = $token;
+			continue;
+		}
+
+		/*
+		 * `namespace` is a name segment only in the relative form, where a separator
+		 * follows it immediately. Everywhere else it opens a namespace statement,
+		 * which the caller has to keep seeing as T_NAMESPACE.
+		 */
+		if ( T_NAMESPACE === $token[0]
+			&& ( ! isset( $tokens[ $index + 1 ] )
+				|| ! is_array( $tokens[ $index + 1 ] )
+				|| T_NS_SEPARATOR !== $tokens[ $index + 1 ][0] )
+		) {
+			$normalized[] = $token;
+			continue;
+		}
+
+		/*
+		 * A name alternates between a segment and a separator, so the run continues
+		 * only while that alternation holds. Stopping at the first token that breaks
+		 * it is what keeps `Foo::bar` and `Foo bar` from being read as one name.
+		 */
+		$name     = $token[1];
+		$line     = isset( $token[2] ) ? $token[2] : 0;
+		$expects  = T_NS_SEPARATOR === $token[0] ? T_STRING : T_NS_SEPARATOR;
+		$consumed = $index;
+
+		for ( $next = $index + 1; $next < $total; $next++ ) {
+			if ( ! is_array( $tokens[ $next ] ) || $expects !== $tokens[ $next ][0] ) {
+				break;
+			}
+
+			$name    .= $tokens[ $next ][1];
+			$expects  = T_NS_SEPARATOR === $expects ? T_STRING : T_NS_SEPARATOR;
+			$consumed = $next;
+		}
+
+		// A single segment with no separator is the plain name token it already was.
+		if ( false === strpos( $name, '\\' ) ) {
+			$normalized[] = $token;
+			continue;
+		}
+
+		$normalized[] = array( $name_token, $name, $line );
+		$index        = $consumed;
+	}
+
+	return $normalized;
+}
+
+/**
  * Reports a condition that makes the class map unsafe to generate.
  *
  * Raised rather than reported and skipped. The map is a tracked build artifact that
@@ -292,6 +455,8 @@ function wp_autoload_classmap_inspect_file( $file ) {
 		return $result;
 	}
 
+	// Read one tokenizer shape rather than one per supported PHP version.
+	$tokens    = wp_autoload_classmap_normalize_tokens( $tokens );
 	$total     = count( $tokens );
 	$namespace = '';
 	$imports   = array();
@@ -438,7 +603,7 @@ function wp_autoload_classmap_inspect_file( $file ) {
  * @return array Lower cased alias to fully qualified name.
  */
 function wp_autoload_classmap_read_imports( $tokens ) {
-	$naming  = array( T_STRING, T_NAME_QUALIFIED, T_NAME_FULLY_QUALIFIED );
+	$naming  = wp_autoload_classmap_name_tokens();
 	$imports = array();
 	$name    = '';
 	$alias   = '';
@@ -526,6 +691,18 @@ function wp_autoload_classmap_resolve_name( $name, $is_qualified, $namespace, $i
 	$segments = explode( '\\', $name );
 	$first    = strtolower( $segments[0] );
 
+	/*
+	 * `namespace\Foo` names the current namespace explicitly. `namespace` is a
+	 * reserved word, so it can never be an import alias or a real first segment,
+	 * which is what makes stripping it here unambiguous.
+	 */
+	if ( 'namespace' === $first ) {
+		array_shift( $segments );
+		$name = implode( '\\', $segments );
+
+		return '' !== $namespace ? $namespace . '\\' . $name : $name;
+	}
+
 	if ( isset( $imports[ $first ] ) ) {
 		$segments[0] = $imports[ $first ];
 
@@ -602,7 +779,7 @@ function wp_autoload_classmap_skip_attribute( $tokens, $index ) {
 function wp_autoload_classmap_read_declaration( $tokens, $index, $namespace, $imports = array() ) {
 	$total     = count( $tokens );
 	$ignorable = array( T_WHITESPACE, T_COMMENT, T_DOC_COMMENT );
-	$naming    = array( T_STRING, T_NAME_QUALIFIED, T_NAME_FULLY_QUALIFIED );
+	$naming    = wp_autoload_classmap_name_tokens();
 	$reserved  = wp_autoload_classmap_reserved_type_names();
 
 	// `Foo::class` reads a name, it does not declare one.
@@ -645,7 +822,7 @@ function wp_autoload_classmap_read_declaration( $tokens, $index, $namespace, $im
 		) {
 			$relatives[] = wp_autoload_classmap_resolve_name(
 				$tokens[ $cursor ][1],
-				T_NAME_FULLY_QUALIFIED === $tokens[ $cursor ][0],
+				wp_autoload_classmap_is_absolute_name( $tokens[ $cursor ][1] ),
 				$namespace,
 				$imports
 			);
@@ -681,7 +858,7 @@ function wp_autoload_classmap_read_declaration( $tokens, $index, $namespace, $im
  */
 function wp_autoload_classmap_read_body( $tokens, $index, $namespace = '', $imports = array() ) {
 	$total  = count( $tokens );
-	$naming = array( T_STRING, T_NAME_QUALIFIED, T_NAME_FULLY_QUALIFIED );
+	$naming = wp_autoload_classmap_name_tokens();
 	$traits = array();
 	$depth  = 0;
 
@@ -730,7 +907,7 @@ function wp_autoload_classmap_read_body( $tokens, $index, $namespace = '', $impo
 			if ( in_array( $tokens[ $index ][0], $naming, true ) ) {
 				$traits[] = wp_autoload_classmap_resolve_name(
 					$tokens[ $index ][1],
-					T_NAME_FULLY_QUALIFIED === $tokens[ $index ][0],
+					wp_autoload_classmap_is_absolute_name( $tokens[ $index ][1] ),
 					$namespace,
 					$imports
 				);
@@ -771,6 +948,8 @@ function wp_autoload_classmap_required_paths( $file, $src_dir ) {
 		return array();
 	}
 
+	// Read one tokenizer shape rather than one per supported PHP version.
+	$tokens    = wp_autoload_classmap_normalize_tokens( $tokens );
 	$total     = count( $tokens );
 	$requiring = array( T_REQUIRE, T_REQUIRE_ONCE, T_INCLUDE, T_INCLUDE_ONCE );
 	$directory = rtrim( str_replace( '\\', '/', dirname( $file ) ), '/' ) . '/';
@@ -872,12 +1051,19 @@ function wp_autoload_classmap_required_paths( $file, $src_dir ) {
  * result is what makes a name "always available": a symbol declared by one of
  * these files is present on every request even when it is not mapped.
  *
- * @param string $src_dir Absolute path of the `src` directory, with a trailing slash.
+ * The root is normalized here rather than trusted, because every path below is
+ * built by concatenating a relative path onto it: a root without a trailing slash
+ * would make `wp-settings.php` unreadable, and the walk would then report an empty
+ * closure instead of failing, which would in turn let every bootstrap loaded file
+ * look mappable.
+ *
+ * @param string $src_dir Absolute path of the `src` directory.
  * @return string[] Paths relative to the WordPress root.
  */
 function wp_autoload_classmap_bootstrap_closure( $src_dir ) {
-	$seen  = array();
-	$queue = array( 'wp-settings.php' );
+	$src_dir = rtrim( str_replace( '\\', '/', $src_dir ), '/' ) . '/';
+	$seen    = array();
+	$queue   = array( 'wp-settings.php' );
 
 	while ( $queue ) {
 		$relative = array_shift( $queue );
@@ -1161,6 +1347,39 @@ function wp_autoload_classmap_build( $src_dir ) {
 }
 
 /**
+ * Determines whether a path may be emitted as a class map value.
+ *
+ * `wp_autoload_class()` resolves a value as `ABSPATH . $path` and loads the
+ * result, so a value is only admissible when it can name nothing but a PHP file
+ * inside the two trees the map covers. The form required here is therefore
+ * canonical rather than merely plausible:
+ *
+ * - It is rooted at `wp-includes/` or at `wp-admin/includes/`. The wider
+ *   `wp-admin/` is not accepted, because the map only ever reaches the two admin
+ *   includes that wp_autoload_classmap_additional_files() opts in.
+ * - Every segment is non-empty and starts with a character other than a dot, which
+ *   is what makes `..`, `.` and an empty segment from a doubled separator all
+ *   unrepresentable, whatever produced them.
+ * - It ends in `.php`, and it carries no backslash, no leading separator and no
+ *   character outside the identifier set core file names are built from.
+ *
+ * The same form is enforced independently by the autoloader in
+ * `wp-includes/autoload.php`, which treats anything else as a miss: the generator
+ * refuses to write such a value, and the runtime refuses to act on one, so neither
+ * relies on the other having got it right.
+ *
+ * @param mixed $path Candidate value, as it would be emitted.
+ * @return bool Whether the value is a canonical core path the autoloader may load.
+ */
+function wp_autoload_classmap_is_loadable_path( $path ) {
+	return is_string( $path )
+		&& 1 === preg_match(
+			'#^(?:wp-includes|wp-admin/includes)/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.php$#',
+			$path
+		);
+}
+
+/**
  * Renders the generated class map file.
  *
  * @param array $map Lower cased name to path relative to the WordPress root.
@@ -1202,10 +1421,10 @@ function wp_autoload_classmap_render( $map ) {
 			);
 		}
 
-		if ( ! preg_match( '#^(?:wp-includes|wp-admin)/[A-Za-z0-9_./-]+\.php$#', $path ) ) {
+		if ( ! wp_autoload_classmap_is_loadable_path( $path ) ) {
 			wp_autoload_classmap_fail(
 				sprintf(
-					'Refusing to emit the class map path %1$s for %2$s: every mapped path must be a forward slashed path below wp-includes/ or wp-admin/.',
+					'Refusing to emit the class map path %1$s for %2$s: every mapped path must be a forward slashed .php path whose segments are all non-empty and dot free, below wp-includes/ or wp-admin/includes/.',
 					var_export( $path, true ),
 					$name
 				)
@@ -1222,6 +1441,80 @@ function wp_autoload_classmap_render( $map ) {
 }
 
 /**
+ * Publishes new contents for a file, or fails.
+ *
+ * The class map is a tracked artifact that the build copies into `build/` and that
+ * 15 workflows compare with `git diff --exit-code`, so a partially written map is
+ * worse than no map at all: it looks like a legitimate result while resolving only
+ * the names that made it to disk. The write is therefore never trusted for having
+ * been attempted.
+ *
+ * New contents go to a temporary file beside the target, so that the target is
+ * only ever replaced by a `rename()`, which is atomic within one filesystem: a
+ * reader sees either the whole previous file or the whole new one, never a prefix
+ * of the new one. Every step is checked - the byte count `file_put_contents()`
+ * reports, the bytes that can be read back, and the rename itself - and the
+ * temporary file is removed on every failing path so a failed generation leaves
+ * nothing behind in the source tree.
+ *
+ * @param string $file     Absolute path of the file to replace.
+ * @param string $contents Contents to publish.
+ * @return void
+ *
+ * @throws RuntimeException When the contents cannot be published in full.
+ */
+function wp_autoload_classmap_replace_file( $file, $contents ) {
+	$directory = dirname( $file );
+
+	if ( ! is_dir( $directory ) || ! is_writable( $directory ) ) {
+		wp_autoload_classmap_fail(
+			sprintf( 'Cannot write the autoload class map: %s is not a writable directory.', $directory )
+		);
+	}
+
+	// Beside the target, so that the rename below stays within one filesystem.
+	$temporary = $file . '.tmp' . getmypid();
+	$written   = @file_put_contents( $temporary, $contents );
+
+	if ( false === $written || strlen( $contents ) !== $written ) {
+		@unlink( $temporary );
+		wp_autoload_classmap_fail(
+			sprintf(
+				'Cannot write the autoload class map: %1$s took %2$s of %3$d bytes.',
+				$temporary,
+				false === $written ? 'none' : $written,
+				strlen( $contents )
+			)
+		);
+	}
+
+	if ( @file_get_contents( $temporary ) !== $contents ) {
+		@unlink( $temporary );
+		wp_autoload_classmap_fail(
+			sprintf( 'Cannot write the autoload class map: %s did not read back as it was written.', $temporary )
+		);
+	}
+
+	/*
+	 * A new file takes its mode from the umask, so the mode the published file
+	 * already carries is restored rather than replaced by whatever this process
+	 * happens to run under.
+	 */
+	$permissions = @fileperms( $file );
+
+	if ( false !== $permissions ) {
+		@chmod( $temporary, $permissions & 0777 );
+	}
+
+	if ( ! @rename( $temporary, $file ) ) {
+		@unlink( $temporary );
+		wp_autoload_classmap_fail(
+			sprintf( 'Cannot publish the autoload class map: %1$s could not replace %2$s.', $temporary, $file )
+		);
+	}
+}
+
+/**
  * Writes the generated class map to disk.
  *
  * @param string $src_dir Absolute path of the `src` directory.
@@ -1231,7 +1524,11 @@ function wp_autoload_classmap_render( $map ) {
  *     @type string $file    Absolute path of the file that was written.
  *     @type int    $entries Number of mapped names.
  *     @type bool   $changed Whether the file contents changed.
+ *     @type int    $bytes   Length of the published contents.
+ *     @type string $sha256  Digest of the published contents.
  * }
+ *
+ * @throws RuntimeException When the map on disk is not the map that was rendered.
  */
 function wp_autoload_classmap_write( $src_dir ) {
 	$src_dir  = rtrim( str_replace( '\\', '/', $src_dir ), '/' ) . '/';
@@ -1241,25 +1538,64 @@ function wp_autoload_classmap_write( $src_dir ) {
 	$existing = is_readable( $file ) ? file_get_contents( $file ) : null;
 
 	if ( $contents !== $existing ) {
-		file_put_contents( $file, $contents );
+		wp_autoload_classmap_replace_file( $file, $contents );
+	}
+
+	/*
+	 * Read back rather than assumed, on the unchanged path as well as the rewritten
+	 * one: what the build copies and what the workflows compare is the file on disk,
+	 * so that is what has to be proved to hold the rendered map. This is also what
+	 * catches a map left stale by an earlier interrupted run.
+	 */
+	$published = is_readable( $file ) ? file_get_contents( $file ) : false;
+
+	if ( $published !== $contents ) {
+		wp_autoload_classmap_fail(
+			sprintf( 'The autoload class map at %s does not hold the map that was generated.', $file )
+		);
 	}
 
 	return array(
 		'file'    => $file,
 		'entries' => count( $built['map'] ),
 		'changed' => $contents !== $existing,
+		'bytes'   => strlen( $contents ),
+		'sha256'  => hash( 'sha256', $contents ),
 	);
 }
 
 // Running this file directly regenerates the map. Requiring it only defines the functions above.
 if ( 'cli' === PHP_SAPI && isset( $argv[0] ) && realpath( $argv[0] ) === realpath( __FILE__ ) ) {
-	$written = wp_autoload_classmap_write( isset( $argv[1] ) ? $argv[1] : dirname( __DIR__, 2 ) . '/src' );
+	try {
+		$written = wp_autoload_classmap_write( isset( $argv[1] ) ? $argv[1] : dirname( __DIR__, 2 ) . '/src' );
+	} catch ( Exception $exception ) {
+		/*
+		 * Reported on standard error and with a nonzero status, so that
+		 * build:autoload-classmap fails the build instead of shipping whatever
+		 * happens to be on disk.
+		 */
+		fwrite( STDERR, 'Autoload class map generation failed: ' . $exception->getMessage() . PHP_EOL );
+		exit( 1 );
+	}
 
 	printf(
 		"%s %d entries in %s%s",
 		$written['changed'] ? 'Wrote' : 'Verified',
 		$written['entries'],
 		$written['file'],
+		PHP_EOL
+	);
+
+	/*
+	 * The same facts again in one machine readable line, which
+	 * build:autoload-classmap checks the published file against so that the task
+	 * cannot report success for a map that the file on disk does not hold.
+	 */
+	printf(
+		'AUTOLOAD_CLASSMAP_DIGEST entries=%d bytes=%d sha256=%s%s',
+		$written['entries'],
+		$written['bytes'],
+		$written['sha256'],
 		PHP_EOL
 	);
 }
