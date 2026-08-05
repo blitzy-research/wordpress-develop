@@ -258,7 +258,7 @@ class Tests_Dependencies_CommandPalette extends WP_UnitTestCase {
 	public function test_handles_stay_registered_but_are_not_enqueued_on_an_unsupported_screen() {
 		set_current_screen( 'edit.php' );
 
-		wp_enqueue_command_palette_assets();
+		do_action( 'admin_enqueue_scripts', 'edit.php' );
 
 		$this->assert_palette_assets_are_registered();
 		$this->assert_palette_assets_are_not_enqueued();
@@ -276,7 +276,7 @@ class Tests_Dependencies_CommandPalette extends WP_UnitTestCase {
 		set_current_screen( 'post-new.php' );
 		add_filter( 'should_load_command_palette_assets', '__return_false' );
 
-		wp_enqueue_command_palette_assets();
+		do_action( 'admin_enqueue_scripts', 'post-new.php' );
 
 		$this->assert_palette_assets_are_registered();
 		$this->assert_palette_assets_are_not_enqueued();
@@ -347,7 +347,7 @@ class Tests_Dependencies_CommandPalette extends WP_UnitTestCase {
 			}
 		);
 
-		wp_enqueue_command_palette_assets();
+		do_action( 'admin_enqueue_scripts', 'edit.php' );
 
 		if ( $expected ) {
 			$this->assertTrue( wp_script_is( 'wp-commands', 'enqueued' ) );
@@ -419,6 +419,99 @@ class Tests_Dependencies_CommandPalette extends WP_UnitTestCase {
 			$this->assertTrue( wp_script_is( $handle, 'enqueued' ), "Script `{$handle}` should be enqueued." );
 		}
 		$this->assertTrue( wp_style_is( self::STYLE_HANDLE, 'enqueued' ), 'Style `' . self::STYLE_HANDLE . '` should be enqueued.' );
+	}
+
+	/**
+	 * Admin pages that render their own document never fire `admin_enqueue_scripts`, so they
+	 * call `wp_enqueue_command_palette_assets()` directly. The screens they run on are not
+	 * block editor screens, so screening a direct call would take the Command Palette away
+	 * from them entirely.
+	 */
+	public function test_a_direct_call_is_not_screened_by_the_current_screen() {
+		set_current_screen( 'index.php' );
+
+		$this->assertFalse(
+			wp_should_load_command_palette_assets(),
+			'This test is only meaningful on a screen the gate would close.'
+		);
+
+		wp_enqueue_command_palette_assets();
+
+		foreach ( self::SCRIPT_HANDLES as $handle ) {
+			$this->assertTrue( wp_script_is( $handle, 'enqueued' ), "Script `{$handle}` should be enqueued by a direct call." );
+		}
+		$this->assertTrue(
+			wp_style_is( self::STYLE_HANDLE, 'enqueued' ),
+			'Style `' . self::STYLE_HANDLE . '` should be enqueued by a direct call.'
+		);
+	}
+
+	/**
+	 * The filter screens the hooked delivery. A page that asks for the Command Palette by
+	 * name still receives it.
+	 */
+	public function test_a_direct_call_is_not_screened_by_the_filter() {
+		set_current_screen( 'index.php' );
+		add_filter( 'should_load_command_palette_assets', '__return_false' );
+
+		wp_enqueue_command_palette_assets();
+
+		foreach ( self::SCRIPT_HANDLES as $handle ) {
+			$this->assertTrue( wp_script_is( $handle, 'enqueued' ), "Script `{$handle}` should be enqueued by a direct call." );
+		}
+	}
+
+	/**
+	 * The contrast that defines the split, on one and the same screen: the hooked delivery is
+	 * screened, and a direct call on that very screen is honored.
+	 */
+	public function test_the_hooked_delivery_is_screened_where_a_direct_call_is_honored() {
+		set_current_screen( 'index.php' );
+
+		do_action( 'admin_enqueue_scripts', 'index.php' );
+
+		$this->assert_palette_assets_are_not_enqueued();
+
+		wp_enqueue_command_palette_assets();
+
+		foreach ( self::SCRIPT_HANDLES as $handle ) {
+			$this->assertTrue( wp_script_is( $handle, 'enqueued' ), "Script `{$handle}` should be enqueued by a direct call." );
+		}
+	}
+
+	/**
+	 * A call made from another `admin_enqueue_scripts` callback is part of the hooked delivery
+	 * and is screened with it, so wrapping the call is not a way around the gate. The
+	 * documented way to open it is the `should_load_command_palette_assets` filter.
+	 */
+	public function test_a_call_nested_in_the_hook_is_screened_as_a_hooked_delivery() {
+		set_current_screen( 'index.php' );
+
+		add_action(
+			'admin_enqueue_scripts',
+			static function () {
+				wp_enqueue_command_palette_assets();
+			}
+		);
+
+		do_action( 'admin_enqueue_scripts', 'index.php' );
+
+		$this->assert_palette_assets_are_registered();
+		$this->assert_palette_assets_are_not_enqueued();
+	}
+
+	/**
+	 * The admin guard is not filterable, so not even a direct call with the filter forced open
+	 * delivers the Command Palette on a front end request.
+	 */
+	public function test_a_direct_call_outside_the_admin_is_not_filterable() {
+		$this->assertFalse( is_admin(), 'The test should start on a front end request.' );
+
+		add_filter( 'should_load_command_palette_assets', '__return_true' );
+
+		wp_enqueue_command_palette_assets();
+
+		$this->assert_palette_assets_are_not_enqueued();
 	}
 
 	/**

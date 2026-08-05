@@ -23,14 +23,27 @@
  * This function does not check whether the user has the required capabilities,
  * it just returns what the required capabilities are.
  *
- * Since 7.0.0 the mapping for a capability that is checked against a specific object is
- * memoized for the duration of the request, unless a `map_meta_cap` callback is
- * registered. Repeating an identical call therefore returns the same capabilities
- * without recomputing them. A call that passes no object at all is never memoized, so
- * the `_doing_it_wrong()` notice it earns is still emitted on every call; a call that
- * passes an object of an unregistered post type or taxonomy is memoized, so that notice
- * is emitted the first time the question is asked and again after any state change that
- * discards the memo, rather than once per call.
+ * Since 7.0.0 the mapping for a capability that is checked against a specific object may
+ * be memoized for the duration of the request, so that repeating an identical call
+ * returns the same capabilities without recomputing them. Memoizing is deliberately
+ * conservative, because a mapping that outlived a change in what it was derived from
+ * would report an authorization decision that is no longer true:
+ *
+ *  - A mapping is only memoized while nothing is registered on any filter it reads. That
+ *    covers `map_meta_cap` itself and the option, post meta, post status and comment
+ *    reads the mappings make, none of which announces a callback being added or removed.
+ *  - A mapping that reads state no list of filter names can describe is never memoized
+ *    at all. That covers the capabilities derived from the ones the user themselves
+ *    holds, those that consult `wp_is_file_mod_allowed()`, and the term capabilities,
+ *    whose filters and options are named after a taxonomy registered at runtime.
+ *  - Whatever is memoized is discarded on every action that announces a change to the
+ *    post, comment, term, user, role, option or registry state a mapping reads.
+ *
+ * A call that passes no object at all is never memoized, so the `_doing_it_wrong()`
+ * notice it earns is still emitted on every call. A memoized call that passes an object
+ * of an unregistered post type or taxonomy emits that notice the first time the question
+ * is asked and again after any state change that discards the memo, rather than once per
+ * call.
  *
  * @since 2.0.0
  * @since 4.9.6 Added the `export_others_personal_data`, `erase_others_personal_data`,
@@ -43,7 +56,12 @@
  *              `edit_app_password`, `delete_app_passwords`, `delete_app_password`,
  *              and `update_https` capabilities.
  * @since 6.7.0 Added the `edit_block_binding` capability.
- * @since 7.0.0 Eligible unfiltered mappings may be memoized for the duration of the request.
+ * @since 7.0.0 A mapping whose inputs are fully described by the capability, the user and
+ *              the object may be memoized for the duration of the request. No mapping is
+ *              memoized while a callback is registered on any filter that mapping reads,
+ *              and mappings that read state no list of filters can name - the user's own
+ *              capabilities, file modification permission, or a dynamically named
+ *              taxonomy filter or option - are never memoized at all.
  *
  * @global array $post_type_meta_caps Used to get post type meta capabilities.
  *
@@ -917,8 +935,15 @@ function map_meta_cap( $cap, $user_id, ...$args ) {
 	 * filter produced. Nothing is stored when the key is empty, and nothing is stored
 	 * on the custom post type path above, which returns before reaching this point and
 	 * leaves the recursive call it delegates to to memoize under its own key.
+	 *
+	 * The watch list is consulted a second time here, because the key was built before
+	 * the mapping ran. Everything the mapping calls into is able to register a callback
+	 * on one of those filters - the arms read options, post meta, a post status and a
+	 * comment, each of which fires filters of its own, and the 'map_meta_cap' callbacks
+	 * above run in between - so an answer computed under one policy must not be stored
+	 * once another is in force.
 	 */
-	if ( '' !== $memo_key ) {
+	if ( '' !== $memo_key && ! _wp_map_meta_cap_policy_filter_registered() ) {
 		_wp_map_meta_cap_memo( $memo_key, $caps );
 	}
 
@@ -953,21 +978,27 @@ function map_meta_cap( $cap, $user_id, ...$args ) {
  *    `register_meta()` installs, and through `is_protected_meta()` and
  *    `get_object_subtype_{$object_type}`, none of which fire an action to invalidate
  *    against, so their answer can change part way through a request.
- *  - A `map_meta_cap` callback is registered. A callback may legitimately answer
- *    differently for identical arguments, and core relies on that itself:
- *    `WP_Customize_Manager` adds one for the duration of a single operation and
- *    removes it again afterwards.
- *  - `$cap` is `remove_user`. That is the only mapping whose answer is derived from
- *    the capabilities a single user holds, through `is_super_admin()`, which resolves
- *    outside of multisite to `WP_User::has_cap( 'delete_users' )`. Those capabilities
- *    are read back through the `user_has_cap` filter and are written by
- *    `WP_User::add_cap()`, `WP_User::remove_cap()` and `WP_User::remove_all_caps()`,
- *    so neither a key component nor an invalidation action can describe the answer
- *    reliably, and a mapping that outlived a revocation would name a capability the
- *    user still holds. Every other `is_super_admin()` read in the mapping is either
- *    reached only under multisite, where the answer comes from the network
- *    `site_admins` option that `update_site_option` invalidates against, or is
- *    short-circuited before the call outside of it.
+ *  - `_wp_map_meta_cap_is_memoizable_cap()` declines `$cap`, because the mapping for it
+ *    reads the capabilities the user themselves holds, a file modification policy, or
+ *    dynamically named taxonomy filters, options and capabilities. None of those can be
+ *    described by a key component, watched by hook name, or invalidated against
+ *    reliably.
+ *  - `_wp_map_meta_cap_policy_filter_registered()` reports a callback on one of the
+ *    filters through which the remaining mappings read their post, post status, post
+ *    meta, comment and option state. Any of those callbacks may answer differently for
+ *    identical arguments, and core relies on that itself: `WP_Customize_Manager` adds a
+ *    `map_meta_cap` callback for the duration of a single operation and removes it again
+ *    afterwards.
+ *
+ * The last two conditions are what make the memo sound rather than merely fast. A
+ * mapping is a policy decision, and the policy is not described by the capability, the
+ * user and the object alone: it is also described by every callback that can influence
+ * what the mapping reads. Because none of those callbacks fires an action when it is
+ * registered or removed, the memo cannot be discarded in response to one appearing, so
+ * the only safe course is to decline to memoize while one is present. The watch list is
+ * therefore consulted again in `map_meta_cap()` before an answer is stored, since the
+ * key is built before the mapping runs and the mapping itself can cause a callback to be
+ * registered.
  *
  * One report the mapping makes is not preserved on every call. A capability checked
  * against an object whose post type or taxonomy is not registered is reported through
@@ -1029,13 +1060,17 @@ function map_meta_cap( $cap, $user_id, ...$args ) {
 function _wp_map_meta_cap_memo_key( $cap, $user_id, $args ) {
 	global $wp_post_types, $wp_post_statuses, $wp_taxonomies, $super_admins;
 
+	/*
+	 * Ordered cheapest first, and with the scan of the watch list last, so that a call
+	 * declined for any other reason never pays for it.
+	 */
 	if ( empty( $args )
 		|| ! isset( $args[0] )
 		|| ! is_string( $cap )
 		|| ! is_scalar( $user_id )
-		|| 'remove_user' === $cap
 		|| str_ends_with( $cap, '_meta' )
-		|| has_filter( 'map_meta_cap' )
+		|| ! _wp_map_meta_cap_is_memoizable_cap( $cap )
+		|| _wp_map_meta_cap_policy_filter_registered()
 	) {
 		return '';
 	}
@@ -1085,6 +1120,204 @@ function _wp_map_meta_cap_memo_key( $cap, $user_id, $args ) {
 	}
 
 	return $key;
+}
+
+/**
+ * Determines whether a capability's mapping may be memoized at all.
+ *
+ * The mapping in `map_meta_cap()` reads a different set of inputs for every capability
+ * it handles, and the memo is only sound for a capability whose complete set of inputs
+ * either cannot change without firing an action the memo is discarded on, or is named
+ * by `_wp_map_meta_cap_policy_filter_registered()`. This function names the
+ * capabilities for which neither is true, so they are never memoized.
+ *
+ * Every capability listed below reads at least one input that no static list of hook
+ * names can describe:
+ *
+ *  - Most of them are derived from the capabilities the user themselves holds, through
+ *    `is_super_admin()` or `user_can()`. Those are read back through the
+ *    `user_has_cap` filter, which core registers three callbacks on unconditionally in
+ *    `default-filters.php`, so the presence of a callback on it says nothing about
+ *    whether a third party is influencing the answer. `WP_User::add_cap()`,
+ *    `WP_User::remove_cap()` and `WP_User::remove_all_caps()` write those capabilities
+ *    to user metadata, and a mapping that outlived a revocation would name a
+ *    capability the user no longer holds.
+ *  - The file modification capabilities additionally read `wp_is_file_mod_allowed()`,
+ *    whose `file_mod_allowed` filter is documented for exactly the kind of
+ *    context-dependent answer a memo must not keep.
+ *  - The term capabilities read the taxonomy through `get_taxonomy()` and the term
+ *    through `get_term()`, which applies the dynamically named `get_{$taxonomy}`
+ *    filter, and they read the `default_{$taxonomy}` and `default_term_{$taxonomy}`
+ *    options. Those names are only known once a taxonomy is registered, so no static
+ *    list can watch them, and they then delegate to the taxonomy's own capability
+ *    names, which are equally dynamic.
+ *  - The application password capabilities delegate straight to `edit_user`, so they
+ *    inherit its inputs exactly.
+ *
+ * Capabilities that are not listed are memoizable: they either read nothing beyond the
+ * registries the key already describes, or read only the post, post status, post meta,
+ * comment and option state whose filters the watch list names and whose changes fire
+ * an action the memo is discarded on.
+ *
+ * @since 7.0.0
+ *
+ * @ignore
+ * @access private
+ *
+ * @param string $cap Capability being checked.
+ * @return bool Whether the capability's mapping may be memoized.
+ */
+function _wp_map_meta_cap_is_memoizable_cap( $cap ) {
+	static $unmemoizable = array(
+		// Read the user's own capabilities through is_super_admin() or user_can().
+		'remove_user'          => true,
+		'edit_user'            => true,
+		'edit_users'           => true,
+		'delete_user'          => true,
+		'delete_users'         => true,
+		'create_users'         => true,
+		'unfiltered_upload'    => true,
+		'edit_css'             => true,
+		'unfiltered_html'      => true,
+		'update_php'           => true,
+		'update_https'         => true,
+		'activate_plugins'     => true,
+		'deactivate_plugins'   => true,
+		'activate_plugin'      => true,
+		'deactivate_plugin'    => true,
+
+		// Also read wp_is_file_mod_allowed(), and so the 'file_mod_allowed' filter.
+		'edit_files'           => true,
+		'edit_plugins'         => true,
+		'edit_themes'          => true,
+		'update_plugins'       => true,
+		'delete_plugins'       => true,
+		'install_plugins'      => true,
+		'upload_plugins'       => true,
+		'update_themes'        => true,
+		'delete_themes'        => true,
+		'install_themes'       => true,
+		'upload_themes'        => true,
+		'update_core'          => true,
+		'install_languages'    => true,
+		'update_languages'     => true,
+
+		// Read dynamically named taxonomy filters, options and capabilities.
+		'edit_term'            => true,
+		'delete_term'          => true,
+		'assign_term'          => true,
+
+		/*
+		 * Reads the 'link_manager_enabled' option, whose default core itself supplies
+		 * through a 'default_option_link_manager_enabled' callback registered
+		 * unconditionally in default-filters.php. A hook core always occupies cannot
+		 * signal third party involvement, so watching it would decline every mapping on
+		 * every request. Declining this one capability instead costs nothing measurable:
+		 * it is asked without an object to check against, which skips the memo already.
+		 */
+		'manage_links'         => true,
+
+		// Delegate to 'edit_user', and so inherit its inputs.
+		'create_app_password'  => true,
+		'list_app_passwords'   => true,
+		'read_app_password'    => true,
+		'edit_app_password'    => true,
+		'delete_app_passwords' => true,
+		'delete_app_password'  => true,
+	);
+
+	return ! isset( $unmemoizable[ $cap ] );
+}
+
+/**
+ * Determines whether a filter that can change a memoizable capability mapping is set.
+ *
+ * The mappings that `_wp_map_meta_cap_is_memoizable_cap()` allows to be memoized read
+ * post, post status, post meta, comment and option state. Every one of those reads
+ * passes through a filter, and a callback on any of them may answer differently for
+ * identical arguments, or answer differently the next time it is asked. None of them
+ * fires an action when it is registered or removed, so the memo cannot be discarded in
+ * response to one being added: instead, no mapping is memoized for as long as one is
+ * registered, and every mapping is computed afresh.
+ *
+ * This is checked both before a memoized answer is returned and again before an answer
+ * is stored. Checking twice is what keeps a callback registered part way through a
+ * mapping - by another callback, or by the code the mapping itself calls into - from
+ * leaving behind an answer that was computed under a policy that is now in force but
+ * was not when the key was built.
+ *
+ * The hooks are tested with `isset()` against `$wp_filter` rather than through
+ * `has_filter()`. `remove_filter()` unsets the entry once the last callback on a hook
+ * is gone, so this is a conservative test: it can report a hook that is registered but
+ * has no callbacks left, which only costs a recomputation, and it cannot miss one that
+ * does. Reading the array directly also keeps the whole scan at roughly a quarter of a
+ * microsecond, against the 1.8 microseconds a memo hit saves.
+ *
+ * Filters read only by the capabilities that are never memoized are deliberately absent
+ * from this list. `file_mod_allowed`, `site_admins`, `add_new_users` and the
+ * `menu_items` network option are all reached exclusively from those mappings, so
+ * watching them here would decline mappings that no callback on them can affect.
+ *
+ * @since 7.0.0
+ *
+ * @ignore
+ * @access private
+ *
+ * @global array $wp_filter All of the filters and actions.
+ *
+ * @return bool Whether a filter that can change a memoizable mapping is registered.
+ */
+function _wp_map_meta_cap_policy_filter_registered() {
+	global $wp_filter;
+
+	static $policy_filters = array(
+		// The mapping's own filter. Core adds one for a single operation and removes it.
+		'map_meta_cap',
+
+		/*
+		 * The option layer's generic filters, which see every option, and the three
+		 * filters that see each of the specific options the memoizable mappings read:
+		 * 'page_for_posts' and 'page_on_front' in the page mappings, and
+		 * 'wp_page_for_privacy_policy' in the post and page mappings.
+		 *
+		 * 'link_manager_enabled' is deliberately absent. It is read only by
+		 * 'manage_links', which is declined by name instead, because core occupies
+		 * 'default_option_link_manager_enabled' on every request and a hook core always
+		 * occupies cannot signal that a third party is involved.
+		 */
+		'pre_option',
+		'alloptions',
+		'pre_wp_load_alloptions',
+		'pre_cache_alloptions',
+		'pre_option_page_for_posts',
+		'default_option_page_for_posts',
+		'option_page_for_posts',
+		'pre_option_page_on_front',
+		'default_option_page_on_front',
+		'option_page_on_front',
+		'pre_option_wp_page_for_privacy_policy',
+		'default_option_wp_page_for_privacy_policy',
+		'option_wp_page_for_privacy_policy',
+
+		// Post meta, read by the post and page mappings.
+		'get_post_metadata',
+		'default_post_metadata',
+		'update_post_metadata_cache',
+
+		// The post's status, read by the read mappings.
+		'get_post_status',
+
+		// The comment, read by the comment mapping.
+		'get_comment',
+	);
+
+	foreach ( $policy_filters as $policy_filter ) {
+		if ( isset( $wp_filter[ $policy_filter ] ) ) {
+			return true;
+		}
+	}
+
+	return false;
 }
 
 /**

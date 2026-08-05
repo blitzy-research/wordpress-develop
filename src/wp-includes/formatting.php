@@ -5894,19 +5894,14 @@ function wp_enqueue_emoji_styles() {
 }
 
 /**
- * Checks whether the inline Emoji detection script should be printed.
+ * Checks whether the inline emoji detection script should be printed.
  *
  * The detection script is a client-side polyfill. It tests whether the browser is able to
  * render the emoji that WordPress recognises and, when it is not, loads the emoji
- * replacement script so that those characters are swapped for images. Browsers in current
- * use render the emoji natively, so on a typical request the script is pure overhead: an
- * inline settings object, plus the whole emoji loader read from disk with
- * file_get_contents() and inlined into the document on every single page view.
+ * replacement script so that those characters are swapped for images.
  *
- * Core already opts individual screens out of the script for the same reason - see the
- * remove_action() call in wp-admin/edit-form-blocks.php - and this function generalises
- * that opt-out. The script is skipped by default and can be printed again, either globally
- * or for a single request, through the {@see 'should_load_emoji_detection_script'} filter.
+ * The script is skipped by default and can be printed again, either globally or for a
+ * single request, through the {@see 'should_load_emoji_detection_script'} filter.
  *
  * Server-side emoji handling is not affected. Feeds and email are still processed by
  * wp_staticize_emoji() and wp_staticize_emoji_for_email(), and the emoji styles are still
@@ -5914,15 +5909,15 @@ function wp_enqueue_emoji_styles() {
  *
  * @since 7.0.0
  *
- * @return bool Whether the Emoji detection script should be printed.
+ * @return bool Whether the emoji detection script should be printed.
  */
 function wp_should_load_emoji_detection_script() {
 	/**
-	 * Filters whether the inline Emoji detection script is printed.
+	 * Filters whether the inline emoji detection script is printed.
 	 *
 	 * Returning true prints the emoji settings object and inlines the emoji loader on the
-	 * current request, which restores the behavior from before WordPress 7.0.0. Returning
-	 * false skips both, leaving emoji to the font support of the browser.
+	 * current request. Returning false skips both, leaving emoji to the font support of
+	 * the browser.
 	 *
 	 * @since 7.0.0
 	 *
@@ -6228,9 +6223,8 @@ function wp_staticize_emoji_for_email( $mail ) {
  * These arrays are automatically built from the regex in twemoji.js - if they need to be updated,
  * you should update the regex there, then run the `npm run grunt precommit:emoji` job.
  *
- * The data lives in wp-includes/emoji-arrays.php rather than inline in this file, so that PHP
- * only tokenizes it on the feed and email paths that consume it. It is loaded once per request,
- * the first time this function is called.
+ * The data lives in wp-includes/emoji-arrays.php rather than inline in this file. That file is
+ * loaded once per request, the first time this function is called.
  *
  * @since 4.9.0
  * @since 7.0.0 The data is loaded on demand from wp-includes/emoji-arrays.php.
@@ -6254,7 +6248,6 @@ function _wp_emoji_list( $type = 'entities' ) {
 			'partials' => array(),
 		);
 
-		// The path is fixed. It is never derived from input, from a filter, or from the request.
 		$emoji_arrays_file = ABSPATH . WPINC . '/emoji-arrays.php';
 
 		if ( file_exists( $emoji_arrays_file ) ) {

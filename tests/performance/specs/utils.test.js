@@ -12,6 +12,7 @@ import {
 	accumulateValues,
 	camelCaseDashes,
 	formatValue,
+	getJavaScriptResponseByteSizes,
 	median,
 } from '../utils';
 
@@ -27,6 +28,22 @@ const producerSource = readFileSync(
 	join( __dirname, '..', 'wp-content', 'mu-plugins', 'server-timing.php' ),
 	'utf8'
 );
+
+/**
+ * Sources of the specs that attach measured results to the run.
+ *
+ * Cardinality cannot be observed from inside a spec: Playwright gives every
+ * test.afterAll() hook its own TestInfo, so a hook cannot see an attachment made
+ * by a sibling hook, and the reporter records only the first 'results' attachment
+ * it finds on a test result. A duplicate hook is therefore silent until a test in
+ * the same repetition fails, at which point the reset snapshot reaches the artifact
+ * and compare-results.js suppresses the whole scenario. Reading the sources is what
+ * makes a second attachment hook fail immediately instead.
+ */
+const attachingSpecs = [ 'admin', 'home', 'single-post' ].map( ( name ) => [
+	`${ name }.test.js`,
+	readFileSync( join( __dirname, `${ name }.test.js` ), 'utf8' ),
+] );
 
 /**
  * How every reported metric is expected to appear in the results table.
@@ -47,6 +64,14 @@ const reportedAs = {
 	wpCacheHits: 'count',
 	wpCacheMisses: 'count',
 	wpBootstrap: 'ms',
+	wpBootstrapValid: 'count',
+	wpOpcacheEnabled: 'flag',
+	wpOpcacheJit: 'flag',
+	wpPhpVersionId: 'version',
+	wpProcessId: 'process',
+	wpProcessRequests: 'count',
+	wpOpcacheCachedScripts: 'count',
+	wpOpcacheHitRate: 'percent',
 };
 
 /**
@@ -88,7 +113,7 @@ function reportKeyForSlug( slug ) {
  * Classifies how a metric is rendered, without restating the formatting itself.
  *
  * @param {string} metric Report key.
- * @return {string} One of 'count', 'flag', 'MB', 'ms', or the unexpected output.
+ * @return {string} Expected unit name, or the unexpected formatted output.
  */
 function reportedUnit( metric ) {
 	const formatted = formatValue( metric, 1 );
@@ -109,6 +134,18 @@ function reportedUnit( metric ) {
 		return 'ms';
 	}
 
+	if ( formatted.endsWith( ' %' ) ) {
+		return 'percent';
+	}
+
+	if ( formatted.startsWith( 'PHP ' ) ) {
+		return 'version';
+	}
+
+	if ( formatted.startsWith( 'PID ' ) ) {
+		return 'process';
+	}
+
 	return formatted;
 }
 
@@ -127,6 +164,14 @@ test.describe( 'Performance report utilities', () => {
 				[ 'wp-cache-hits', 'wpCacheHits' ],
 				[ 'wp-cache-misses', 'wpCacheMisses' ],
 				[ 'wp-bootstrap', 'wpBootstrap' ],
+				[ 'wp-opcache-enabled', 'wpOpcacheEnabled' ],
+				[ 'wp-opcache-jit', 'wpOpcacheJit' ],
+				[ 'wp-php-version-id', 'wpPhpVersionId' ],
+				[ 'wp-process-id', 'wpProcessId' ],
+				[ 'wp-process-requests', 'wpProcessRequests' ],
+				[ 'wp-opcache-cached-scripts', 'wpOpcacheCachedScripts' ],
+				[ 'wp-opcache-hit-rate', 'wpOpcacheHitRate' ],
+				[ 'wp-bootstrap-valid', 'wpBootstrapValid' ],
 			];
 
 			for ( const [ headerName, reportKey ] of headerNames ) {
@@ -158,6 +203,19 @@ test.describe( 'Performance report utilities', () => {
 				[ 'wpCacheHits', 2035, 2035 ],
 				[ 'wpCacheMisses', 185, 185 ],
 				[ 'wpBootstrap', 23.897, '23.90 ms' ],
+				[ 'wpOpcacheEnabled', 1, 'yes' ],
+				[ 'wpOpcacheEnabled', 0, 'no' ],
+				[ 'wpOpcacheJit', 1, 'yes' ],
+				[ 'wpOpcacheJit', 0, 'no' ],
+				[ 'wpPhpVersionId', 80509, 'PHP 8.5.9' ],
+				[ 'wpProcessId', 1234, 'PID 1234' ],
+				[ 'wpProcessRequests', 17, 17 ],
+				[ 'wpOpcacheCachedScripts', 321, 321 ],
+				[ 'wpOpcacheHitRate', 98.7654, '98.77 %' ],
+				[ 'adminJsRaw', 124500, '124.50 kB' ],
+				[ 'adminJsGzipped', 30250, '30.25 kB' ],
+				[ 'wpBootstrapValid', 1, 1 ],
+				[ 'wpBootstrapValid', 0, 0 ],
 				[ 'wpTotal', 39.75, '39.75 ms' ],
 				[ 'wpBeforeTemplate', 29.14, '29.14 ms' ],
 				[ 'wpTemplate', 32.876, '32.88 ms' ],
@@ -192,6 +250,34 @@ test.describe( 'Performance report utilities', () => {
 			expect( formatValue( 'wpFilesLoaded', null ) ).toBe( 'N/A' );
 			expect( formatValue( 'wpExtObjCache', null ) ).toBe( 'N/A' );
 			expect( formatValue( 'wpBootstrap', null ) ).toBe( 'N/A' );
+			expect( formatValue( 'wpOpcacheEnabled', null ) ).toBe( 'N/A' );
+			expect( formatValue( 'wpPhpVersionId', null ) ).toBe( 'N/A' );
+			expect( formatValue( 'adminJsGzipped', null ) ).toBe( 'N/A' );
+		} );
+	} );
+
+	test.describe( 'getJavaScriptResponseByteSizes()', () => {
+		test( 'sums raw bytes and gzip level 9 bytes per response', async () => {
+			const responses = [
+				{ body: async () => Buffer.from( 'hello' ) },
+				{ body: async () => Buffer.from( 'hello' ) },
+			];
+
+			await expect(
+				getJavaScriptResponseByteSizes( responses )
+			).resolves.toEqual( {
+				raw: 10,
+				gzipped: 50,
+			} );
+		} );
+
+		test( 'reports zero bytes when no JavaScript responses were loaded', async () => {
+			await expect(
+				getJavaScriptResponseByteSizes( [] )
+			).resolves.toEqual( {
+				raw: 0,
+				gzipped: 0,
+			} );
 		} );
 	} );
 
@@ -219,6 +305,53 @@ test.describe( 'Performance report utilities', () => {
 							metric
 						)
 				)
+			);
+		} );
+	} );
+
+	test.describe( 'result cardinality', () => {
+		test( 'every measured scenario attaches exactly one result object', () => {
+			for ( const [ name, source ] of attachingSpecs ) {
+				expect(
+					[ ...source.matchAll( /attach\(\s*'results'/g ) ].length,
+					`${ name } should attach results once per describe block`
+				).toBe( 1 );
+
+				expect(
+					[ ...source.matchAll( /test\.afterAll\(/g ) ].length,
+					`${ name } should register one result attachment hook`
+				).toBe( 1 );
+			}
+		} );
+
+		test( 'every attached snapshot is validated against the iteration count', () => {
+			for ( const [ name, source ] of attachingSpecs ) {
+				expect(
+					source,
+					`${ name } should assert one sample per iteration before reporting`
+				).toContain( 'should hold one sample per iteration' );
+
+				expect(
+					source,
+					`${ name } should compare the sample count to the iteration count`
+				).toContain( '.toBe( iterations )' );
+			}
+		} );
+
+		test( 'the admin spec validates the snapshot before attaching it', () => {
+			/*
+			 * The duplicate hook was found in the admin spec, so that is the spec
+			 * whose hook is ordered to validate first: a duplicate of it would then
+			 * fail on the reset arrays rather than attach them. The other two specs
+			 * rely on the count above instead, which is what the finding asked for
+			 * and leaves their passing hooks untouched.
+			 */
+			const source = attachingSpecs.find(
+				( [ name ] ) => 'admin.test.js' === name
+			)[ 1 ];
+
+			expect( source.indexOf( '.toBe( iterations )' ) ).toBeLessThan(
+				source.indexOf( "attach( 'results'" )
 			);
 		} );
 	} );

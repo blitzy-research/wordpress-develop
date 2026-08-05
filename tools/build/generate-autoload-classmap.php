@@ -161,6 +161,105 @@ function wp_autoload_classmap_reserved_type_names() {
 }
 
 /**
+ * Reports a condition that makes the class map unsafe to generate.
+ *
+ * Raised rather than reported and skipped. The map is a tracked build artifact that
+ * the workflows compare with `git diff --exit-code`, so a map that has silently lost
+ * a name, or that cannot represent one faithfully, has to stop generation rather than
+ * be written and complained about afterwards.
+ *
+ * @param string $message Reason the class map cannot be generated.
+ *
+ * @throws RuntimeException Always.
+ */
+function wp_autoload_classmap_fail( $message ) {
+	throw new RuntimeException( $message );
+}
+
+/**
+ * Returns names a drop-in may declare instead of core.
+ *
+ * `wp_start_object_cache()` deliberately skips core's `cache.php` when an
+ * `object-cache.php` drop-in is present, because the drop-in owns the class the
+ * rest of core talks to. Mapping core's own declaration would let an early
+ * `class_exists( 'WP_Object_Cache' )` load core's version behind the drop-in's
+ * back, suppressing or colliding with the replacement's initialization.
+ *
+ * A name listed here is never mapped, so a probe for it behaves exactly as it did
+ * when the bootstrap loaded core's class eagerly or not at all.
+ *
+ * @return string[] Names that must not be mapped.
+ */
+function wp_autoload_classmap_replacement_owned_names() {
+	return array(
+		'WP_Object_Cache',
+	);
+}
+
+/**
+ * Returns the prefixes the core autoloader prefilters requested names on.
+ *
+ * `wp_autoload_class()` returns before reading the map for any name that matches
+ * none of them, so a mapped name outside the list would be unreachable at runtime.
+ * The list is read out of the autoloader itself rather than repeated here, which
+ * is what keeps the generated map and that prefilter from drifting apart.
+ *
+ * @param string $src_dir Absolute path of the `src` directory, with a trailing slash.
+ * @return string[] Lower cased prefixes. Empty when the declaration cannot be read.
+ */
+function wp_autoload_classmap_core_prefixes( $src_dir ) {
+	static $prefixes = null;
+
+	if ( null !== $prefixes ) {
+		return $prefixes;
+	}
+
+	$prefixes = array();
+	$source   = @file_get_contents( $src_dir . 'wp-includes/autoload.php' );
+
+	if ( false === $source ) {
+		return $prefixes;
+	}
+
+	$tokens = token_get_all( $source );
+	$total  = count( $tokens );
+
+	for ( $index = 0; $index < $total; $index++ ) {
+		if ( ! is_array( $tokens[ $index ] )
+			|| T_VARIABLE !== $tokens[ $index ][0]
+			|| '$core_prefixes' !== $tokens[ $index ][1]
+		) {
+			continue;
+		}
+
+		$collected = array();
+
+		for ( $next = $index + 1; $next < $total; $next++ ) {
+			$token = $tokens[ $next ];
+
+			if ( is_array( $token ) ) {
+				if ( T_CONSTANT_ENCAPSED_STRING === $token[0] ) {
+					$collected[] = strtolower( trim( $token[1], '"\'' ) );
+				}
+
+				continue;
+			}
+
+			if ( ';' === $token ) {
+				break;
+			}
+		}
+
+		if ( array() !== $collected ) {
+			$prefixes = $collected;
+			break;
+		}
+	}
+
+	return $prefixes;
+}
+
+/**
  * Inspects a PHP file without loading it.
  *
  * The file is tokenized, and its top level is walked with an allow list: a
@@ -903,6 +1002,15 @@ function wp_autoload_classmap_build( $src_dir ) {
 	$src_dir = rtrim( str_replace( '\\', '/', $src_dir ), '/' ) . '/';
 	$closure = array_fill_keys( wp_autoload_classmap_bootstrap_closure( $src_dir ), true );
 
+	/*
+	 * The two admin files the map reaches for are opted in by name, and every
+	 * include of them in the tree is a require_once, so they stay mappable even
+	 * though a conditional branch of the bootstrap names them.
+	 */
+	$opted_in = array_fill_keys( wp_autoload_classmap_additional_files(), true );
+	$replaced = array_fill_keys( array_map( 'strtolower', wp_autoload_classmap_replacement_owned_names() ), true );
+	$prefixes = wp_autoload_classmap_core_prefixes( $src_dir );
+
 	$candidates = array();
 	$always     = array();
 	$rejected   = array();
@@ -912,6 +1020,17 @@ function wp_autoload_classmap_build( $src_dir ) {
 		$facts     = wp_autoload_classmap_inspect_file( $src_dir . $relative );
 		$eligible  = 1 === count( $facts['symbols'] ) && ! $facts['has_side_effects'];
 		$bootstrap = isset( $closure[ $relative ] );
+
+		/*
+		 * A file the bootstrap includes anyway has nothing to gain from being mapped,
+		 * and mapping it is unsafe: an early reference would autoload it and the plain
+		 * `require` that follows would then fatally redeclare its symbol. Its names are
+		 * still recorded below, because they satisfy the compile time needs of files
+		 * that are mapped.
+		 */
+		if ( $bootstrap && ! isset( $opted_in[ $relative ] ) ) {
+			$eligible = false;
+		}
 
 		/*
 		 * A file whose first top level statement already runs code has no trusted
@@ -934,8 +1053,59 @@ function wp_autoload_classmap_build( $src_dir ) {
 			}
 
 			if ( ! $eligible ) {
-				$rejected[ $key ] = $facts['has_side_effects'] ? 'file scope side effects' : 'file declares ' . count( $facts['symbols'] ) . ' symbols';
+				if ( $bootstrap && ! isset( $opted_in[ $relative ] ) ) {
+					$rejected[ $key ] = 'always loaded by the bootstrap';
+				} else {
+					$rejected[ $key ] = $facts['has_side_effects'] ? 'file scope side effects' : 'file declares ' . count( $facts['symbols'] ) . ' symbols';
+				}
+
 				continue;
+			}
+
+			// A drop-in owns the declaration, so core's own must stay unmapped.
+			if ( isset( $replaced[ $key ] ) ) {
+				$rejected[ $key ] = 'owned by a drop-in replacement';
+				continue;
+			}
+
+			/*
+			 * The autoloader never reads the map for a name outside these prefixes, so
+			 * mapping one would produce an entry that can never be reached.
+			 */
+			if ( $prefixes ) {
+				$prefixed = false;
+
+				foreach ( $prefixes as $prefix ) {
+					if ( 0 === strncmp( $key, $prefix, strlen( $prefix ) ) ) {
+						$prefixed = true;
+						break;
+					}
+				}
+
+				if ( ! $prefixed ) {
+					$rejected[ $key ] = 'outside the autoloader prefix list';
+					continue;
+				}
+			}
+
+			/*
+			 * A name may be claimed once. Keys are lower cased because PHP resolves a
+			 * class, interface or trait name case insensitively, so two declarations
+			 * whose names differ only by case collapse onto the same key: keeping
+			 * whichever was inspected last would leave the other silently unmapped and
+			 * therefore unloadable, and loading both would raise "Cannot redeclare" in
+			 * any case. Either kind of clash means the source tree is what has to
+			 * change, so generation stops and names both files.
+			 */
+			if ( isset( $paths[ $key ] ) ) {
+				wp_autoload_classmap_fail(
+					sprintf(
+						'Duplicate class map name %1$s, declared in both %2$s and %3$s. A name may be declared by only one mapped file.',
+						$symbol,
+						$paths[ $key ],
+						$relative
+					)
+				);
 			}
 
 			$candidates[ $key ] = $facts['relatives'];
@@ -1007,7 +1177,41 @@ function wp_autoload_classmap_render( $map ) {
 		'return array(',
 	);
 
+	/*
+	 * An entry less map would switch the autoloader off while still looking like a
+	 * legitimate build result, and copy:files would then ship it.
+	 */
+	if ( ! $map ) {
+		wp_autoload_classmap_fail( 'No core names were found; refusing to render an empty autoload class map.' );
+	}
+
 	foreach ( $map as $name => $path ) {
+		/*
+		 * Both halves of an entry are emitted as single quoted PHP, so neither may
+		 * carry a quote or a backslash. The eligibility rules already make anything
+		 * else impossible, so this is a second and independent guard that keeps the
+		 * generator from writing PHP source if those rules, or the shape of the tree,
+		 * ever change.
+		 */
+		if ( ! preg_match( '/^[a-z_\x80-\xff][a-z0-9_\x80-\xff]*$/', $name ) ) {
+			wp_autoload_classmap_fail(
+				sprintf(
+					'Refusing to emit the class map name %s: not a lower cased PHP identifier.',
+					var_export( $name, true )
+				)
+			);
+		}
+
+		if ( ! preg_match( '#^(?:wp-includes|wp-admin)/[A-Za-z0-9_./-]+\.php$#', $path ) ) {
+			wp_autoload_classmap_fail(
+				sprintf(
+					'Refusing to emit the class map path %1$s for %2$s: every mapped path must be a forward slashed path below wp-includes/ or wp-admin/.',
+					var_export( $path, true ),
+					$name
+				)
+			);
+		}
+
 		$lines[] = sprintf( "\t'%s' => '%s',", $name, $path );
 	}
 

@@ -8,17 +8,6 @@ import { expect, test } from '@wordpress/e2e-test-utils-playwright';
  */
 import { camelCaseDashes, themes, locales } from '../utils';
 
-const results = {
-	timeToFirstByte: [],
-	largestContentfulPaint: [],
-	lcpMinusTtfb: [],
-	wpMemoryPeak: [],
-	wpFilesLoaded: [],
-	wpCacheHits: [],
-	wpCacheMisses: [],
-	wpBootstrap: [],
-};
-
 /**
  * Server-Timing entries every front-end iteration must report.
  *
@@ -39,18 +28,50 @@ const requiredServerTimingMetrics = [
 	'wp-cache-hits',
 	'wp-cache-misses',
 	'wp-bootstrap',
+	'wp-bootstrap-valid',
+	'wp-opcache-enabled',
+	'wp-opcache-jit',
+	'wp-php-version-id',
+	'wp-process-id',
+	'wp-process-requests',
+	'wp-opcache-cached-scripts',
+	'wp-opcache-hit-rate',
 ];
 
 /**
- * Metrics that belong to a single theme and locale and are reset after it.
+ * Samples belonging to the theme and locale currently under measurement.
  *
- * Read from the initializer above, so every declared metric is also the subject of
- * the sample-count check below: a declaration that loses its reset would start
- * accumulating across the theme and locale matrix and fail there. The Server-Timing
- * metrics that are not declared above are created on the fly by the ingestion loop
- * and keep accumulating, which is pre-existing behavior this harness leaves alone.
+ * Every required Server-Timing metric is declared here, derived from the list above
+ * so the two cannot drift, because being declared is what gets a metric reset
+ * between buckets. A metric that only the ingestion loop creates keeps its samples
+ * for the whole theme and locale matrix, and that accumulation has been measured
+ * rather than assumed: in one admin run the de_DE bucket held twelve 'wpMemoryUsage'
+ * samples for six iterations, the first three of each repetition byte-identical to
+ * the en_US ones, and its reported median came out 4.0% below the locale's own
+ * measurements. 'wpDbQueries' was one of the undeclared metrics, so the figure this
+ * suite reports its database-query target from was a median mixed across every
+ * theme and locale that had run before it.
+ *
+ * The reset in `afterAll` reads these keys live rather than from a snapshot taken
+ * here, so a metric that only starts arriving later is still reset and counted.
  */
-const perDescribeMetrics = Object.keys( results );
+const results = {
+	timeToFirstByte: [],
+	largestContentfulPaint: [],
+	lcpMinusTtfb: [],
+	...Object.fromEntries(
+		requiredServerTimingMetrics.map( ( metric ) => [
+			camelCaseDashes( metric ),
+			[],
+		] )
+	),
+};
+
+const immutableRuntimeMetrics = [
+	'wpOpcacheEnabled',
+	'wpOpcacheJit',
+	'wpPhpVersionId',
+];
 
 /**
  * Highest iteration count this spec will generate measured tests for.
@@ -122,20 +143,28 @@ test.describe( 'Homepage', () => {
 						language: '',
 					} );
 
-					// Read before the resets below so the check runs after cleanup.
-					const sampleCounts = perDescribeMetrics.map( ( metric ) => [
+					/*
+					 * Read before the resets below so the check runs after cleanup, and read
+					 * from the live keys so a metric the ingestion loop created on the fly is
+					 * reset and counted alongside the declared ones. Nothing may survive into
+					 * the next theme or locale: a series that carries samples over hands the
+					 * later bucket a median of measurements it never took.
+					 */
+					const sampleCounts = Object.keys( results ).map( ( metric ) => [
 						metric,
 						results[ metric ].length,
 					] );
 
-					results.largestContentfulPaint = [];
-					results.timeToFirstByte = [];
-					results.lcpMinusTtfb = [];
-					results.wpMemoryPeak = [];
-					results.wpFilesLoaded = [];
-					results.wpCacheHits = [];
-					results.wpCacheMisses = [];
-					results.wpBootstrap = [];
+					for ( const metric of immutableRuntimeMetrics ) {
+						expect(
+							new Set( results[ metric ] ).size,
+							`${ metric } must stay immutable within one measured theme and locale`
+						).toBe( 1 );
+					}
+
+					for ( const metric of Object.keys( results ) ) {
+						results[ metric ] = [];
+					}
 
 					for ( const [ metric, samples ] of sampleCounts ) {
 						expect(
@@ -150,10 +179,23 @@ test.describe( 'Homepage', () => {
 						page,
 						metrics,
 					} ) => {
-						// Unmeasured pre-navigation request, not the page under test. Caches and
-						// OPcache are cleared only where the clear-cache.php mu-plugin is installed,
-						// so the cache regime must be measured rather than assumed.
-						await page.goto( '/?clear_cache' );
+						/*
+						 * Unmeasured pre-navigation request, not the page under test.
+						 *
+						 * The clear-cache.php mu-plugin answers it with 202 and dies after
+						 * resetting OPcache, APCu, the object cache and expired transients. Any
+						 * other status means the mu-plugin is not installed and the request fell
+						 * through to an ordinary page load, which resets nothing: the measured
+						 * navigation below would then run against warm caches and a warm opcode
+						 * cache while still being reported as uncached. Asserting the status is
+						 * what makes the cache regime measured rather than assumed.
+						 */
+						const cacheReset = await page.goto( '/?clear_cache' );
+
+						expect(
+							cacheReset?.status(),
+							'/?clear_cache should be answered by the clear-cache.php mu-plugin with HTTP 202, so the measured request is genuinely uncached'
+						).toBe( 202 );
 
 						// This is the actual page to test.
 						await page.goto( '/' );
@@ -170,6 +212,35 @@ test.describe( 'Homepage', () => {
 								) }`
 							).toBe( true );
 						}
+
+						/*
+						 * 'wp-bootstrap' has a single boundary, from $timestart to 'wp_loaded'.
+						 * A 0 flag means that boundary was never reached, so the accompanying
+						 * duration is a placeholder rather than a measurement and must not be
+						 * aggregated with the samples that are.
+						 */
+						expect(
+							serverTiming[ 'wp-bootstrap-valid' ],
+							'wp-bootstrap should be measured to its own wp_loaded boundary, so wp-bootstrap-valid should be 1'
+						).toBe( 1 );
+						expect( [ 0, 1 ] ).toContain(
+							serverTiming[ 'wp-opcache-enabled' ]
+						);
+						expect( [ 0, 1 ] ).toContain(
+							serverTiming[ 'wp-opcache-jit' ]
+						);
+						expect(
+							serverTiming[ 'wp-php-version-id' ]
+						).toBeGreaterThan( 0 );
+						expect(
+							serverTiming[ 'wp-process-id' ]
+						).toBeGreaterThan( 0 );
+						expect(
+							serverTiming[ 'wp-process-requests' ]
+						).toBeGreaterThan( 0 );
+						expect(
+							serverTiming[ 'wp-opcache-hit-rate' ]
+						).toBeLessThanOrEqual( 100 );
 
 						for ( const [ key, value ] of Object.entries(
 							serverTiming

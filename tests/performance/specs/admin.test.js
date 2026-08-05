@@ -6,17 +6,11 @@ import { expect, test } from '@wordpress/e2e-test-utils-playwright';
 /**
  * Internal dependencies
  */
-import { camelCaseDashes, locales } from '../utils';
-
-const results = {
-	timeToFirstByte: [],
-	domContentLoaded: [],
-	wpMemoryPeak: [],
-	wpFilesLoaded: [],
-	wpCacheHits: [],
-	wpCacheMisses: [],
-	wpBootstrap: [],
-};
+import {
+	camelCaseDashes,
+	getJavaScriptResponseByteSizes,
+	locales,
+} from '../utils';
 
 /**
  * Server-Timing entries every admin iteration must report.
@@ -38,33 +32,67 @@ const requiredServerTimingMetrics = [
 	'wp-cache-hits',
 	'wp-cache-misses',
 	'wp-bootstrap',
+	'wp-bootstrap-valid',
+	'wp-opcache-enabled',
+	'wp-opcache-jit',
+	'wp-php-version-id',
+	'wp-process-id',
+	'wp-process-requests',
+	'wp-opcache-cached-scripts',
+	'wp-opcache-hit-rate',
 ];
 
 /**
- * Metrics that belong to a single locale and are reset after it.
+ * Samples belonging to the locale currently under measurement.
  *
- * Read from the initializer above, so every declared metric is also the subject of
- * the sample-count check below: a declaration that loses its reset would start
- * accumulating across the locales and fail there. The Server-Timing metrics that are
- * not declared above are created on the fly by the ingestion loop and keep
- * accumulating, which is pre-existing behavior this harness leaves alone.
+ * Every required Server-Timing metric is declared here, derived from the list above
+ * so the two cannot drift, because being declared is what gets a metric reset
+ * between locales. A metric that only the ingestion loop creates keeps its samples
+ * across both locales, and that accumulation has been measured rather than assumed:
+ * in one admin run the de_DE bucket held twelve 'wpMemoryUsage' samples for six
+ * iterations, and the first three of each repetition were byte-identical to the
+ * en_US ones, 6,745,720 and 6,746,360 against the locale's own 7,333,616. Its
+ * reported median came out at 7,039,988, understating de_DE by 293,628 bytes, or
+ * 4.0%. 'wpDbQueries' was undeclared too, so the figure this suite reports its
+ * database-query target from was a median mixed across locales.
  *
- * Five server metrics are declared here beyond the two this spec measures itself,
- * because the mixing they prevent has been measured rather than assumed. In the same
- * admin run, the metrics that only the ingestion loop creates show it happening: the
- * de_DE bucket held twelve 'wpMemoryUsage' samples for six iterations, and the first
- * three of each repetition were byte-identical to the en_US ones, 6,745,720 and
- * 6,746,360 against the locale's own 7,333,616. Its reported median came out at
- * 7,039,988, understating de_DE by 293,628 bytes, or 4.0%. Every declared metric held
- * exactly six.
+ * The original five explicitly declared server metrics proved that the mixing they
+ * prevent is real rather than hypothetical. In the same admin run, the metrics that
+ * only the ingestion loop created showed it happening: the de_DE bucket held twelve
+ * 'wpMemoryUsage' samples for six iterations, and the first three of each repetition
+ * were byte-identical to the en_US ones, 6,745,720 and 6,746,360 against the locale's
+ * own 7,333,616. Its reported median came out at 7,039,988, understating de_DE by
+ * 293,628 bytes, or 4.0%. Every declared metric held exactly six. The runtime-regime
+ * metadata and deterministic JavaScript byte totals follow the same reset contract.
  *
- * How wrong a mixed median can be is bounded by how far the locales really are apart,
- * and they are not close: 'wpMemoryPeak', which is declared and reset, measured a
- * median of 7,305,568 bytes for en_US against 7,793,872 for de_DE, a difference of
- * 6.7%. Declaring and resetting is therefore the smallest change that keeps each
- * locale's median its own, and it adds nothing to what this spec reports.
+ * How wrong a mixed median can be is bounded by how far the locales really are
+ * apart, and they are not close: 'wpMemoryPeak', which was already declared and
+ * reset, measured a median of 7,305,568 bytes for en_US against 7,793,872 for
+ * de_DE, a difference of 6.7%.
+ *
+ * The reset in `afterAll` reads these keys live rather than from a snapshot taken
+ * here, so a metric that only starts arriving later is still reset and counted.
  */
-const perDescribeMetrics = Object.keys( results );
+const results = {
+	timeToFirstByte: [],
+	domContentLoaded: [],
+	...Object.fromEntries(
+		requiredServerTimingMetrics.map( ( metric ) => [
+			camelCaseDashes( metric ),
+			[],
+		] )
+	),
+	adminJsRaw: [],
+	adminJsGzipped: [],
+};
+
+const immutableMeasurementMetrics = [
+	'wpOpcacheEnabled',
+	'wpOpcacheJit',
+	'wpPhpVersionId',
+	'adminJsRaw',
+	'adminJsGzipped',
+];
 
 /**
  * Highest iteration count this spec will generate measured tests for.
@@ -122,40 +150,56 @@ test.describe( 'Admin', () => {
 			} );
 
 			test.afterAll( async ( { requestUtils }, testInfo ) => {
-				await testInfo.attach( 'results', {
-					body: JSON.stringify( results, null, 2 ),
-					contentType: 'application/json',
-				} );
+				/*
+				 * Snapshot the payload and its sample counts before the resets below can
+				 * empty them, so what gets validated is byte for byte what gets attached.
+				 * The counts are read from the live keys, so a metric the ingestion loop
+				 * created on the fly is reset and counted alongside the declared ones.
+				 * Nothing may survive into the next locale: a series that carries samples
+				 * over hands the later bucket a median of measurements it never took.
+				 */
+				const body = JSON.stringify( results, null, 2 );
+				const sampleCounts = Object.keys( results ).map( ( metric ) => [
+					metric,
+					results[ metric ].length,
+				] );
+
+				for ( const metric of immutableMeasurementMetrics ) {
+					expect(
+						new Set( results[ metric ] ).size,
+						`${ metric } must stay immutable within one measured locale`
+					).toBe( 1 );
+				}
+
+				for ( const metric of Object.keys( results ) ) {
+					results[ metric ] = [];
+				}
 
 				await requestUtils.updateSiteSettings( {
 					language: '',
 				} );
 
-				// Read before the resets below so the check runs after cleanup.
-				const sampleCounts = perDescribeMetrics.map( ( metric ) => [
-					metric,
-					results[ metric ].length,
-				] );
-
-				results.timeToFirstByte = [];
-				results.domContentLoaded = [];
-				results.wpMemoryPeak = [];
-				results.wpFilesLoaded = [];
-				results.wpCacheHits = [];
-				results.wpCacheMisses = [];
-				results.wpBootstrap = [];
-
+				/*
+				 * Validated before it is attached, so the artifact can only ever
+				 * receive a fully populated snapshot. A duplicate of this hook -
+				 * the defect this ordering exists to catch - would run once the
+				 * arrays above are already reset and would fail here instead of
+				 * appending a zero-sample result object. Such an object is not
+				 * inert: compare-results.js only pairs a scenario when the before
+				 * and after result counts match, so one extra entry makes it
+				 * suppress every paired value for this locale as N/A. Cardinality
+				 * itself is covered in specs/utils.test.js, which is the only end
+				 * that can see more than one attachment hook at a time.
+				 */
 				for ( const [ metric, samples ] of sampleCounts ) {
 					expect(
 						samples,
 						`${ metric } should hold one sample per iteration for this locale`
 					).toBe( iterations );
 				}
-			} );
 
-			test.afterAll( async ( {}, testInfo ) => {
 				await testInfo.attach( 'results', {
-					body: JSON.stringify( results, null, 2 ),
+					body,
 					contentType: 'application/json',
 				} );
 			} );
@@ -166,13 +210,41 @@ test.describe( 'Admin', () => {
 					admin,
 					metrics,
 				} ) => {
-					// Unmeasured pre-navigation request, not the page under test. Caches and
-					// OPcache are cleared only where the clear-cache.php mu-plugin is installed,
-					// so the cache regime must be measured rather than assumed.
-					await page.goto( '/?clear_cache' );
+					/*
+					 * Unmeasured pre-navigation request, not the page under test.
+					 *
+					 * The clear-cache.php mu-plugin answers it with 202 and dies after
+					 * resetting OPcache, APCu, the object cache and expired transients. Any
+					 * other status means the mu-plugin is not installed and the request fell
+					 * through to an ordinary page load, which resets nothing: the measured
+					 * navigation below would then run against warm caches and a warm opcode
+					 * cache while still being reported as uncached. Asserting the status is
+					 * what makes the cache regime measured rather than assumed.
+					 */
+					const cacheReset = await page.goto( '/?clear_cache' );
+
+					expect(
+						cacheReset?.status(),
+						'/?clear_cache should be answered by the clear-cache.php mu-plugin with HTTP 202, so the measured request is genuinely uncached'
+					).toBe( 202 );
 
 					// This is the actual page to test.
-					await admin.visitAdminPage( '/' );
+					const javaScriptResponses = [];
+					const collectJavaScriptResponse = ( response ) => {
+						const url = new URL( response.url() );
+
+						if ( url.pathname.endsWith( '.js' ) ) {
+							javaScriptResponses.push( response );
+						}
+					};
+
+					page.on( 'response', collectJavaScriptResponse );
+					try {
+						await admin.visitAdminPage( '/' );
+						await page.waitForLoadState( 'networkidle' );
+					} finally {
+						page.off( 'response', collectJavaScriptResponse );
+					}
 
 					const serverTiming = await metrics.getServerTiming();
 
@@ -187,6 +259,35 @@ test.describe( 'Admin', () => {
 						).toBe( true );
 					}
 
+					/*
+					 * 'wp-bootstrap' has a single boundary, from $timestart to 'wp_loaded'.
+					 * A 0 flag means that boundary was never reached, so the accompanying
+					 * duration is a placeholder rather than a measurement and must not be
+					 * aggregated with the samples that are.
+					 */
+					expect(
+						serverTiming[ 'wp-bootstrap-valid' ],
+						'wp-bootstrap should be measured to its own wp_loaded boundary, so wp-bootstrap-valid should be 1'
+					).toBe( 1 );
+					expect( [ 0, 1 ] ).toContain(
+						serverTiming[ 'wp-opcache-enabled' ]
+					);
+					expect( [ 0, 1 ] ).toContain(
+						serverTiming[ 'wp-opcache-jit' ]
+					);
+					expect(
+						serverTiming[ 'wp-php-version-id' ]
+					).toBeGreaterThan( 0 );
+					expect( serverTiming[ 'wp-process-id' ] ).toBeGreaterThan(
+						0
+					);
+					expect(
+						serverTiming[ 'wp-process-requests' ]
+					).toBeGreaterThan( 0 );
+					expect(
+						serverTiming[ 'wp-opcache-hit-rate' ]
+					).toBeLessThanOrEqual( 100 );
+
 					for ( const [ key, value ] of Object.entries(
 						serverTiming
 					) ) {
@@ -197,9 +298,31 @@ test.describe( 'Admin', () => {
 					const ttfb = await metrics.getTimeToFirstByte();
 					results.timeToFirstByte.push( ttfb );
 
-					// Measured from the end of the response, so it excludes server time.
-					const { domContentLoaded } =
-						await metrics.getLoadingDurations();
+					/*
+					 * Measured from the end of the response, so it excludes server time -
+					 * the same definition metrics.getLoadingDurations() uses, read straight
+					 * from the Navigation Timing API rather than through that helper. The
+					 * helper also dereferences the 'first-paint' and 'first-contentful-paint'
+					 * entries unconditionally, and an admin screen that has not painted by
+					 * the time the load event fires records neither, so it throws
+					 * "Cannot read properties of undefined (reading 'startTime')" and costs
+					 * this spec a domContentLoaded sample over two paint metrics it does not
+					 * report. Reading the navigation entry alone cannot fail that way: it is
+					 * always present once navigation has completed.
+					 */
+					const domContentLoaded = await page.evaluate( () => {
+						const [ navigation ] =
+							performance.getEntriesByType( 'navigation' );
+
+						return (
+							navigation.domContentLoadedEventEnd -
+							navigation.responseEnd
+						);
+					} );
+					const javaScriptBytes =
+						await getJavaScriptResponseByteSizes(
+							javaScriptResponses
+						);
 
 					expect(
 						Number.isFinite( domContentLoaded ) &&
@@ -210,6 +333,11 @@ test.describe( 'Admin', () => {
 					).toBe( true );
 
 					results.domContentLoaded.push( domContentLoaded );
+					results.adminJsRaw.push( javaScriptBytes.raw );
+					results.adminJsGzipped.push( javaScriptBytes.gzipped );
+
+					expect( javaScriptBytes.raw ).toBeGreaterThan( 0 );
+					expect( javaScriptBytes.gzipped ).toBeGreaterThan( 0 );
 				} );
 			}
 		} );

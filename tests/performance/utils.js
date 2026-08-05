@@ -3,12 +3,39 @@
  */
 const { readFileSync, existsSync } = require( 'node:fs' );
 const { join } = require( 'node:path' );
+const { gzipSync } = require( 'node:zlib' );
 
 process.env.WP_ARTIFACTS_PATH ??= join( process.cwd(), 'artifacts' );
 
 const locales = [ 'en_US', 'de_DE' ];
 
-const themes = [ 'twentytwentyone', 'twentytwentythree', 'twentytwentyfour', 'twentytwentyfive' ];
+const themes = [
+	'twentytwentyone',
+	'twentytwentythree',
+	'twentytwentyfour',
+	'twentytwentyfive',
+];
+
+const booleanMetrics = new Set( [
+	'wpExtObjCache',
+	'wpOpcacheEnabled',
+	'wpOpcacheJit',
+] );
+
+const countMetrics = new Set( [
+	'wpDbQueries',
+	'wpFilesLoaded',
+	'wpCacheHits',
+	'wpCacheMisses',
+	'wpProcessRequests',
+	'wpOpcacheCachedScripts',
+	/*
+	 * 1 when wpBootstrap was measured to its own 'wp_loaded' boundary, 0 when it was
+	 * never reached. Passed through as a number so the comparison table shows the
+	 * count of valid samples rather than rendering the flag as a duration.
+	 */
+	'wpBootstrapValid',
+] );
 
 /**
  * Parse test files into JSON objects.
@@ -72,7 +99,7 @@ function camelCaseDashes( str ) {
  * | 777 | 999 | No  |
  *
  * @param {Array<Object>} rows Table rows.
- * @returns {string} Markdown table content.
+ * @return {string} Markdown table content.
  */
 function formatAsMarkdownTable( rows ) {
 	let result = '';
@@ -86,7 +113,7 @@ function formatAsMarkdownTable( rows ) {
 		result += `| ${ header } `;
 	}
 	result += '|\n';
-	for ( const header of headers ) {
+	for ( let i = 0; i < headers.length; i++ ) {
 		result += '| ------ ';
 	}
 	result += '|\n';
@@ -116,20 +143,63 @@ function formatValue( metric, value ) {
 		return `${ ( value / Math.pow( 10, 6 ) ).toFixed( 2 ) } MB`;
 	}
 
-	if ( 'wpExtObjCache' === metric ) {
+	if ( 'adminJsRaw' === metric || 'adminJsGzipped' === metric ) {
+		return `${ ( value / Math.pow( 10, 3 ) ).toFixed( 2 ) } kB`;
+	}
+
+	if ( booleanMetrics.has( metric ) ) {
 		return 1 === value ? 'yes' : 'no';
 	}
 
-	if (
-		'wpDbQueries' === metric ||
-		'wpFilesLoaded' === metric ||
-		'wpCacheHits' === metric ||
-		'wpCacheMisses' === metric
-	) {
+	if ( 'wpPhpVersionId' === metric ) {
+		const versionId = Math.trunc( value );
+		const major = Math.trunc( versionId / 10000 );
+		const minor = Math.trunc( versionId / 100 ) % 100;
+		const patch = versionId % 100;
+
+		return `PHP ${ major }.${ minor }.${ patch }`;
+	}
+
+	if ( 'wpProcessId' === metric ) {
+		return `PID ${ value }`;
+	}
+
+	if ( 'wpOpcacheHitRate' === metric ) {
+		return `${ value.toFixed( 2 ) } %`;
+	}
+
+	if ( countMetrics.has( metric ) ) {
 		return value;
 	}
 
 	return `${ value.toFixed( 2 ) } ms`;
+}
+
+/**
+ * Calculates deterministic raw and gzip-compressed JavaScript response sizes.
+ *
+ * HTTP servers and browsers can negotiate different transfer encodings, so the
+ * benchmark reads each decoded response body and applies the same gzip level to every
+ * sample. Each response is compressed separately, matching how JavaScript assets are
+ * transferred over HTTP rather than compressing an artificial concatenated bundle.
+ *
+ * @param {Array<{body: () => Promise<Buffer>}>} responses JavaScript responses.
+ * @return {Promise<{raw: number, gzipped: number}>} Byte totals.
+ */
+async function getJavaScriptResponseByteSizes( responses ) {
+	const bodies = await Promise.all(
+		responses.map( ( response ) => response.body() )
+	);
+
+	return bodies.reduce(
+		( sizes, body ) => {
+			sizes.raw += body.byteLength;
+			sizes.gzipped += gzipSync( body, { level: 9 } ).byteLength;
+
+			return sizes;
+		},
+		{ raw: 0, gzipped: 0 }
+	);
 }
 
 /**
@@ -139,7 +209,7 @@ function formatValue( metric, value ) {
  * into (https://github.com/wordpress/wordpress-develop/commit/36fe58a8c64dcc83fc21bddd5fcf054aef4efb27)[36fe58a].
  *
  * @param {string} sha Commit SHA.
- * @return string Link
+ * @return {string} Link.
  */
 function linkToSha( sha ) {
 	const repoName =
@@ -176,7 +246,7 @@ function medianAbsoluteDeviation( array = [] ) {
 /**
  *
  * @param {Array<Record<string, number[]>>} results
- * @returns {Record<string, number[]>}
+ * @return {Record<string, number[]>} Accumulated metric values.
  */
 function accumulateValues( results ) {
 	return results.reduce( ( acc, result ) => {
@@ -194,6 +264,7 @@ module.exports = {
 	camelCaseDashes,
 	formatAsMarkdownTable,
 	formatValue,
+	getJavaScriptResponseByteSizes,
 	linkToSha,
 	standardDeviation,
 	medianAbsoluteDeviation,

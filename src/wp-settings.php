@@ -37,11 +37,11 @@ require ABSPATH . WPINC . '/compat.php';
 require ABSPATH . WPINC . '/load.php';
 
 /*
- * Register the core class autoloader before anything else, so that every class,
- * interface and trait file listed in the generated class map can be loaded the
- * first time the name it declares is referenced rather than being required
- * eagerly below. Registration reads nothing from disk: the class map is loaded
- * lazily on the first autoload miss.
+ * Register the core class autoloader before the remaining class bootstrap, so that
+ * every class, interface and trait file listed in the generated class map can be
+ * loaded the first time the name it declares is referenced rather than being
+ * required eagerly below. Registration does not load the class map: the map is
+ * read on the first autoload attempt for a name that could belong to core.
  *
  * Because of that, none of the require statements below name a file that the
  * generated class map covers. A file is still required explicitly when any of
@@ -248,12 +248,13 @@ require ABSPATH . WPINC . '/collaboration.php';
 require ABSPATH . WPINC . '/rest-api.php';
 /*
  * The REST API infrastructure, controller, field and search handler classes are
- * resolved by the autoloader rather than required here. They are instantiated
- * only by create_initial_rest_routes(), which is hooked to the rest_api_init
- * action, and that action fires from rest_get_server() alone, so a request that
- * never dispatches a REST route never references any of them. rest-api.php
- * itself stays eager because it declares the functions that default-filters.php
- * registers by name.
+ * resolved by the autoloader rather than required here. Nothing references them
+ * before rest_get_server() runs: it constructs the server and then fires the
+ * rest_api_init action, which is where create_initial_rest_routes() registers the
+ * routes and instantiates their controllers. rest_get_server() is the only place
+ * that action fires, so a request that never dispatches a REST route never
+ * references any of these names. rest-api.php itself stays eager because it
+ * declares the functions that default-filters.php registers by name.
  */
 require ABSPATH . WPINC . '/sitemaps.php';
 require ABSPATH . WPINC . '/class-wp-block-parser.php';
@@ -429,9 +430,29 @@ require_once ABSPATH . 'wp-admin/includes/plugin.php';
 foreach ( wp_get_active_and_valid_plugins() as $plugin ) {
 	wp_register_plugin_realpath( $plugin );
 
-	$plugin_data = get_plugin_data( $plugin, false, false );
+	/*
+	 * Only the two text domain headers are read here. get_plugin_data() reads fifteen
+	 * and normalises headers this loop never looks at, and its own fall back to the
+	 * plugin slug is reproduced below so that the registered path is unchanged.
+	 */
+	$plugin_data = get_file_data(
+		$plugin,
+		array(
+			'TextDomain' => 'Text Domain',
+			'DomainPath' => 'Domain Path',
+		),
+		'plugin'
+	);
 
 	$textdomain = $plugin_data['TextDomain'];
+	if ( ! $textdomain ) {
+		$textdomain = dirname( plugin_basename( $plugin ) );
+
+		if ( '.' === $textdomain || str_contains( $textdomain, '/' ) ) {
+			$textdomain = '';
+		}
+	}
+
 	if ( $textdomain ) {
 		if ( $plugin_data['DomainPath'] ) {
 			$GLOBALS['wp_textdomain_registry']->set_custom_path( $textdomain, dirname( $plugin ) . $plugin_data['DomainPath'] );
@@ -604,24 +625,46 @@ unset( $theme, $wp_theme );
 do_action( 'after_setup_theme' );
 
 /*
- * Create an instance of WP_Site_Health so that Cron events may fire.
+ * Preserve the weekly Site Health check on requests that do not otherwise need the
+ * class, without constructing it.
  *
- * This construction cannot be made conditional. The constructor schedules the
- * weekly check and registers its own handler for it, and there is no predicate
- * available here for "this request will dispatch that event": wp-cron.php sets
- * DOING_CRON only after this file has finished, an ALTERNATE_WP_CRON site runs
- * due events inside an ordinary front-end request, and WP-CLI dispatches them
- * from a bootstrap that is neither. Skipping it on those paths leaves the event
- * firing with no handler at all, which silently retires the check.
+ * There is no predicate available here for "this request will dispatch that event":
+ * wp-cron.php sets DOING_CRON only after this file has finished, an ALTERNATE_WP_CRON
+ * site runs due events inside an ordinary front-end request, and WP-CLI dispatches
+ * them from a bootstrap that is neither. So the event is scheduled when it is
+ * missing, and a priority 0 handler constructs Site Health if the event does fire,
+ * which leaves its own priority 10 handler to run in the same dispatch.
  *
- * The class lives under wp-admin, so it is reached through the generated class
- * map rather than by requiring a wp-admin path from here. The require is kept as
- * the fallback for a tree that carries no generated map.
+ * Every other hook the constructor adds is admin only, so
+ * wp-admin/includes/class-wp-site-health.php is not parsed on a request that never
+ * reaches one of them.
  */
-if ( ! class_exists( 'WP_Site_Health' ) ) {
-	require_once ABSPATH . 'wp-admin/includes/class-wp-site-health.php';
+if ( ! is_admin() && ! wp_doing_cron() ) {
+	if ( ! wp_installing() && ! wp_next_scheduled( 'wp_site_health_scheduled_check' ) ) {
+		wp_schedule_event( time() + DAY_IN_SECONDS, 'weekly', 'wp_site_health_scheduled_check' );
+	}
+
+	add_action(
+		'wp_site_health_scheduled_check',
+		static function () {
+			WP_Site_Health::get_instance();
+		},
+		0
+	);
+} else {
+	/*
+	 * Create an instance of WP_Site_Health in the contexts that use its admin hooks
+	 * or dispatch its scheduled check directly.
+	 *
+	 * The class lives under wp-admin, so it is reached through the generated class
+	 * map rather than by requiring a wp-admin path from here. The require is kept as
+	 * the fallback for a tree that carries no generated map.
+	 */
+	if ( ! class_exists( 'WP_Site_Health' ) ) {
+		require_once ABSPATH . 'wp-admin/includes/class-wp-site-health.php';
+	}
+	WP_Site_Health::get_instance();
 }
-WP_Site_Health::get_instance();
 
 // Set up current user.
 $GLOBALS['wp']->init();

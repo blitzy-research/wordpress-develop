@@ -941,6 +941,34 @@ function wp_get_update_data() {
 	);
 
 	$plugins = current_user_can( 'update_plugins' );
+	$themes  = current_user_can( 'update_themes' );
+	$core    = current_user_can( 'update_core' );
+
+	/*
+	 * Prime the three update transients in one query.
+	 *
+	 * 'update_core', 'update_plugins' and 'update_themes' are the transients that
+	 * get_site_transient() lists as having no timeout, so it skips the priming it
+	 * performs for every other site transient and reads each option on its own.
+	 * Whenever any of the capabilities above is held, wp_get_translation_updates()
+	 * below reads all three, which made this function cost three single-option
+	 * queries on every request that renders the admin bar.
+	 *
+	 * The external object cache is excluded because get_site_transient() then reads
+	 * the 'site-transient' cache group instead of the options table and issues no
+	 * option query at all, so priming there would add a query rather than remove
+	 * two. Options already in the cache are skipped by the primer itself, as is an
+	 * installation in progress.
+	 */
+	if ( ( $core || $plugins || $themes ) && ! wp_using_ext_object_cache() ) {
+		wp_prime_site_option_caches(
+			array(
+				'_site_transient_update_core',
+				'_site_transient_update_plugins',
+				'_site_transient_update_themes',
+			)
+		);
+	}
 
 	if ( $plugins ) {
 		$update_plugins = get_site_transient( 'update_plugins' );
@@ -950,8 +978,6 @@ function wp_get_update_data() {
 		}
 	}
 
-	$themes = current_user_can( 'update_themes' );
-
 	if ( $themes ) {
 		$update_themes = get_site_transient( 'update_themes' );
 
@@ -959,8 +985,6 @@ function wp_get_update_data() {
 			$counts['themes'] = count( $update_themes->response );
 		}
 	}
-
-	$core = current_user_can( 'update_core' );
 
 	if ( $core && function_exists( 'get_core_updates' ) ) {
 		$update_wordpress = get_core_updates( array( 'dismissed' => false ) );

@@ -2,11 +2,9 @@
 /**
  * Core class autoloader.
  *
- * WordPress core has no autoloader: historically every class file reachable on
- * a request was required eagerly from wp-settings.php, so its parse cost was
- * paid even on requests that never referenced it. This file registers a single
- * autoloader so that class, interface and trait files can instead be loaded the
- * first time the name they declare is actually referenced.
+ * Registers a single autoloader so that the file declaring a core class,
+ * interface or trait is loaded the first time that name is referenced, rather
+ * than being required in advance from wp-settings.php.
  *
  * Resolution is a direct lookup in a generated class map. No path is ever
  * derived from the requested name, and no filter, option, request value or
@@ -39,13 +37,13 @@
  * either mapped, always loaded during the bootstrap, served by an autoloader
  * that is already registered, or internal to PHP. It must not be edited by hand.
  *
- * The map is not read when this file is required. It is loaded lazily on the
- * first autoload miss and then memoized for the rest of the request, so
- * registration costs nothing and requests that reference no mapped name,
- * including SHORTINIT requests, never touch the filesystem for it. When the map
- * is absent, does not return an array, or does not contain the requested name,
- * and when a mapped file has gone away, the autoloader silently does nothing so
- * that every other registered autoloader still gets its turn.
+ * The map is not read when this file is required. A requested name is first
+ * tested against the short list of prefixes every mapped name shares, so a name
+ * that cannot belong to core returns before the map is read at all; a name that
+ * can reads the map once and then reuses it for the rest of the request. When
+ * the map is absent, does not return an array, or does not contain the requested
+ * name, and when a mapped file has gone away, the autoloader silently does
+ * nothing so that every other registered autoloader still gets its turn.
  *
  * @package WordPress
  * @since 7.0.0
@@ -78,6 +76,55 @@ function wp_autoload_class( $class_name ) {
 	 */
 	static $classmap = null;
 
+	/*
+	 * Prefixes shared by every name the generator is allowed to map. A name that
+	 * matches none of them cannot be declared by a mapped file, so it returns
+	 * before the map is read; a name that does match reads the map whether or not
+	 * the map turns out to contain it. The generator reads this declaration and
+	 * omits any candidate whose name falls outside it, so the list here and the
+	 * generated map cannot drift apart, and Tests_Load_wpAutoloadClass asserts the
+	 * same invariant.
+	 */
+	static $core_prefixes = array( 'wp', '_wp', 'walker', 'pop3', 'passwordhash', 'requests' );
+
+	/*
+	 * PHP passes the name as it was written at the reference site, so `WP_Query`
+	 * and `wp_query` both arrive here even though they name one class. The map is
+	 * keyed lower cased, so normalising here is what keeps a differently cased
+	 * reference from being treated as an unknown name and silently skipped.
+	 *
+	 * PHP has already removed the one leading separator a fully qualified
+	 * reference is written with, so a name that still starts with one reached
+	 * spl_autoload_call() directly rather than through a reference. Exactly one
+	 * more separator is removed for those callers, and no more: stripping a run of
+	 * them would accept a name PHP itself cannot resolve.
+	 *
+	 * strtr() with explicit ASCII tables rather than strtolower(), which only became
+	 * locale independent in PHP 8.2: under an LC_CTYPE such as tr_TR it folds "I"
+	 * outside ASCII and would turn a valid reference into a miss on the supported
+	 * PHP 7.4 floor.
+	 */
+	$name = '' !== $class_name && '\\' === $class_name[0] ? substr( $class_name, 1 ) : $class_name;
+	$name = strtr( $name, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz' );
+
+	/*
+	 * Checked before the map is read so that the overwhelming majority of misses,
+	 * which are plugin and vendor names that no core map could ever answer, cost a
+	 * handful of string comparisons instead of parsing the map.
+	 */
+	$is_core_name = false;
+
+	foreach ( $core_prefixes as $core_prefix ) {
+		if ( 0 === strncmp( $name, $core_prefix, strlen( $core_prefix ) ) ) {
+			$is_core_name = true;
+			break;
+		}
+	}
+
+	if ( ! $is_core_name ) {
+		return;
+	}
+
 	if ( null === $classmap ) {
 		$classmap      = array();
 		$classmap_file = ABSPATH . WPINC . '/autoload-classmap.php';
@@ -91,21 +138,6 @@ function wp_autoload_class( $class_name ) {
 			}
 		}
 	}
-
-	/*
-	 * PHP passes the name as it was written at the reference site, so `WP_Query`
-	 * and `wp_query` both arrive here even though they name one class. The map is
-	 * keyed lower cased, so normalising here is what keeps a differently cased
-	 * reference from being treated as an unknown name and silently skipped.
-	 *
-	 * PHP has already removed the one leading separator a fully qualified
-	 * reference is written with, so a name that still starts with one reached
-	 * spl_autoload_call() directly rather than through a reference. Exactly one
-	 * more separator is removed for those callers, and no more: stripping a run of
-	 * them would accept a name PHP itself cannot resolve.
-	 */
-	$name = '' !== $class_name && '\\' === $class_name[0] ? substr( $class_name, 1 ) : $class_name;
-	$name = strtolower( $name );
 
 	if ( ! isset( $classmap[ $name ] ) ) {
 		return;

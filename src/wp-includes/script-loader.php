@@ -2758,16 +2758,18 @@ function wp_should_load_block_assets_on_demand() {
  * Checks whether the Command Palette assets should be enqueued on the current screen.
  *
  * The Command Palette is delivered by the `wp-commands` and `wp-core-commands` script
- * bundles, which depend on the `wp-components` package and therefore pull in the largest
- * part of the admin JavaScript payload. Those bundles are only inexpensive to add on screens
- * that already load that dependency chain, so by default they are limited to block editor
- * screens, detected the same way as in {@see wp_should_load_block_editor_scripts_and_styles()}.
- *
- * On every other admin screen the assets are skipped. A screen can opt back in through the
+ * bundles. By default they are enqueued on block editor screens, detected the same way as
+ * in {@see wp_should_load_block_editor_scripts_and_styles()}, and skipped on every other
+ * admin screen. Another screen can opt in through the
  * {@see 'should_load_command_palette_assets'} filter.
+ *
+ * This screens the automatic 'admin_enqueue_scripts' delivery. Admin pages that call
+ * {@see wp_enqueue_command_palette_assets()} directly are asking for the Command Palette
+ * by name and receive it whatever this function returns.
  *
  * @since 7.0.0
  * @see wp_should_load_block_editor_scripts_and_styles()
+ * @see wp_enqueue_command_palette_assets()
  *
  * @global WP_Screen $current_screen WordPress current screen object.
  *
@@ -2776,7 +2778,6 @@ function wp_should_load_block_assets_on_demand() {
 function wp_should_load_command_palette_assets() {
 	global $current_screen;
 
-	// The Command Palette only exists in the admin, so this guard is intentionally not filterable.
 	if ( ! is_admin() ) {
 		return false;
 	}
@@ -2790,7 +2791,9 @@ function wp_should_load_command_palette_assets() {
 	 * their dependencies. Returning false skips them, and the Command Palette is not
 	 * available on the screen.
 	 *
-	 * This filter is not applied outside the admin, where the assets are never enqueued.
+	 * This filter is not applied outside the admin, where the assets are never enqueued,
+	 * and it does not affect admin pages that call {@see wp_enqueue_command_palette_assets()}
+	 * directly rather than relying on 'admin_enqueue_scripts'.
 	 *
 	 * @since 7.0.0
 	 *
@@ -3531,7 +3534,16 @@ function wp_enqueue_classic_theme_styles() {
 /**
  * Enqueues the assets required for the Command Palette.
  *
+ * As the default 'admin_enqueue_scripts' callback, this function only enqueues the assets on
+ * the screens allowed by {@see wp_should_load_command_palette_assets()}. Calling it directly
+ * always enqueues them, because an admin page that does not fire 'admin_enqueue_scripts' has
+ * no other way to ask for the Command Palette. The assets are never enqueued outside the admin.
+ *
  * @since 6.9.0
+ * @since 7.0.0 Deliveries through 'admin_enqueue_scripts' are limited to the screens allowed
+ *              by wp_should_load_command_palette_assets(). Direct calls are unaffected.
+ *
+ * @see wp_should_load_command_palette_assets()
  *
  * @global array  $menu
  * @global array  $submenu
@@ -3539,7 +3551,18 @@ function wp_enqueue_classic_theme_styles() {
 function wp_enqueue_command_palette_assets() {
 	global $menu, $submenu;
 
-	if ( ! wp_should_load_command_palette_assets() ) {
+	// The Command Palette only exists in the admin, so this guard is intentionally not filterable.
+	if ( ! is_admin() ) {
+		return;
+	}
+
+	/*
+	 * Only the 'admin_enqueue_scripts' delivery is screened. Admin pages that render their
+	 * own document never fire that hook and call this function directly instead, which is an
+	 * explicit request for the Command Palette on a screen that is not a block editor screen.
+	 * Screening those calls would take the Command Palette away from them.
+	 */
+	if ( doing_action( 'admin_enqueue_scripts' ) && ! wp_should_load_command_palette_assets() ) {
 		return;
 	}
 

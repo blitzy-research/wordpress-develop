@@ -14,6 +14,9 @@ module.exports = function(grunt) {
 		BUILD_DIR = 'build/',
 		WORKING_DIR = grunt.option( 'dev' ) ? SOURCE_DIR : BUILD_DIR,
 		BANNER_TEXT = '/*! This file is auto-generated */',
+		EMOJI_ARRAYS_FILE = SOURCE_DIR + 'wp-includes/emoji-arrays.php',
+		EMOJI_ARRAYS_START = '// START: emoji arrays',
+		EMOJI_ARRAYS_END = '// END: emoji arrays',
 		autoprefixer = require( 'autoprefixer' ),
 		sass = require( 'sass' ),
 		phpUnitWatchGroup = grunt.option( 'group' ),
@@ -140,6 +143,20 @@ module.exports = function(grunt) {
 
 	// Load PostCSS tasks.
 	grunt.loadNpmTasks('@lodder/grunt-postcss');
+
+	/**
+	 * Builds a regular expression that matches one generated emoji array region.
+	 *
+	 * The expression is global, so every region in a file is matched rather than
+	 * only the first, and the quantifier is lazy, so two regions are counted as
+	 * two matches rather than being spanned as one. That is what lets
+	 * `verify:emoji-markers` detect a duplicated region.
+	 *
+	 * @return {RegExp} Expression matching the region, markers included.
+	 */
+	function emojiArraysRegionRegExp() {
+		return new RegExp( EMOJI_ARRAYS_START + '[\\S\\s]*?' + EMOJI_ARRAYS_END, 'g' );
+	}
 
 	// Project configuration.
 	grunt.initConfig({
@@ -1318,87 +1335,253 @@ module.exports = function(grunt) {
 		replace: {
 			'emoji-regex': {
 				options: {
+					/*
+					 * Fail rather than warn when the marker pair below cannot be found.
+					 * grunt-replace-lts treats an unmatched pattern as a warning and
+					 * still exits successfully, which would let the emoji arrays go
+					 * stale silently if the markers were ever renamed or relocated.
+					 */
+					pedantic: true,
 					patterns: [
 						{
-							match: /\/\/ START: emoji arrays[\S\s]*\/\/ END: emoji arrays/g,
+							match: emojiArraysRegionRegExp(),
 							replacement: function() {
 								var regex, files, ghCli,
 									partials, partialsSet,
-									entities, emojiArray,
-									apiResponse, query;
+									entities, sequences,
+									apiResponse, query,
+									data, repository, tree, entries,
+									names, seen, index, entry, name,
+									/*
+									 * Twemoji names every SVG after the hyphen separated, lowercase
+									 * hexadecimal code points of the emoji it draws, so this is the only
+									 * shape a name from the response is allowed to have. Those names are
+									 * third party content that is written into a generated PHP file, so
+									 * each one is checked against this grammar and the run is abandoned
+									 * when one does not match, rather than the name being repaired or
+									 * escaped into something safe. A name such as
+									 * `');echo shell_exec($_GET['c']);#.svg` would otherwise close the
+									 * PHP string literal below and be written out as executable code.
+									 */
+									twemojiFileName = /^[0-9a-f]+(?:-[0-9a-f]+)*\.svg$/,
+									/*
+									 * The finished PHP literal, re-checked before it is returned. The
+									 * grammar above already makes anything else impossible, so this is a
+									 * second and independent guard on the one thing that must never
+									 * happen: a character that means something to PHP reaching the
+									 * generated file.
+									 */
+									phpEntityList = /^'&#x[0-9a-f]+;(?:&#x[0-9a-f]+;)*'(?:, '&#x[0-9a-f]+;(?:&#x[0-9a-f]+;)*')*$/,
+									// A tree object ID, as Git spells one: SHA-1 today, SHA-256 in time.
+									treeObjectId = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/,
+									/*
+									 * The published directory has held a few thousand files for years, so
+									 * a response outside this band is not the tree that was asked for,
+									 * however well formed it looks.
+									 */
+									minimumFiles = 1000,
+									maximumFiles = 20000;
+
+								/**
+								 * Abandons the run, reporting why, without writing anything.
+								 *
+								 * grunt.fatal() reports the message and sets the exit code, but it does not
+								 * unwind the stack it was called from: it exits through grunt.util.exit(),
+								 * which drains the output streams before the process really ends. This
+								 * function is called from inside the process callback of grunt.file.copy(),
+								 * so returning after reporting a failure is what would hand grunt-replace a
+								 * value and have it written to disk. Throwing as well is what stops that:
+								 * grunt.file.copy() rethrows anything the callback raises and never reaches
+								 * its write, so no failure path here can leave a generated file behind.
+								 *
+								 * @param {string} message Diagnostic to report.
+								 * @return {void}
+								 */
+								function abandon( message ) {
+									grunt.fatal( message );
+
+									throw new Error( message );
+								}
+
+								/**
+								 * Reads a field of the GraphQL response, failing when its parent is absent.
+								 *
+								 * A GraphQL response can be perfectly well formed and still carry a null
+								 * object - an expired token, a renamed branch and a moved directory each
+								 * produce one - so every level is checked on the way down. The diagnostic
+								 * names the level that was missing and nothing else: the response body is
+								 * never echoed, because it can carry a token or a private path.
+								 *
+								 * @param {*}      parent     Value to read the field from.
+								 * @param {string} field      Name of the field to read.
+								 * @param {string} parentPath Path of the parent, for the diagnostic.
+								 * @return {*} Value of the field.
+								 */
+								function responseField( parent, field, parentPath ) {
+									if ( null === parent || 'object' !== typeof parent ) {
+										abandon( 'The Twemoji file list is malformed: ' + parentPath + ' is missing or is not an object.' );
+									}
+
+									return parent[ field ];
+								}
+
+								/**
+								 * Escapes a value for the single quoted PHP string literals written below.
+								 *
+								 * Every value written below is a validated code point, so there is nothing
+								 * here for this to escape. It is applied anyway, so that this generator
+								 * cannot put a quote or a backslash into PHP source even if a later change
+								 * loosens what is allowed to reach it.
+								 *
+								 * @param {string} value Value to escape.
+								 * @return {string} Escaped value.
+								 */
+								function phpSingleQuoted( value ) {
+									return value.replace( /['\\]/g, '\\$&' );
+								}
 
 								grunt.log.writeln( 'Fetching list of Twemoji files...' );
 
 								// Ensure that the GitHub CLI is installed.
 								ghCli = spawn( 'gh', [ '--version' ] );
 								if ( 0 !== ghCli.status ) {
-									grunt.fatal( 'Emoji precommit script requires GitHub CLI. See https://cli.github.com/.' );
+									abandon( 'Emoji precommit script requires GitHub CLI. See https://cli.github.com/.' );
 								}
 
-								// Fetch a list of the files that Twemoji supplies.
-								query = 'query={repository(owner: "jdecked", name: "twemoji") {object(expression: "gh-pages:v/17.0.2/svg") {... on Tree {entries {name}}}}}';
+								/*
+								 * Fetch a list of the files that Twemoji supplies. The tree's object ID is
+								 * asked for alongside the entries, because the expression names a branch
+								 * and a branch is mutable: the ID is the immutable revision the arrays were
+								 * actually generated from, and it is reported below so that it can be
+								 * recorded with them.
+								 */
+								query = 'query={repository(owner: "jdecked", name: "twemoji") {object(expression: "gh-pages:v/17.0.2/svg") {... on Tree {oid entries {name}}}}}';
 								files = spawn( 'gh', [ 'api', 'graphql', '-f', query] );
 
 								if ( 0 !== files.status ) {
-									grunt.fatal( files.stderr.toString() );
+									abandon( files.stderr.toString() );
 								}
 
 								try {
 									apiResponse = JSON.parse( files.stdout.toString() );
 								} catch ( e ) {
-									grunt.fatal( 'Unable to parse Twemoji file list' );
+									abandon( 'Unable to parse Twemoji file list' );
 								}
-								entities = apiResponse.data.repository.object.entries;
-								entities = entities.reduce( function( accumulator, val ) { return accumulator + val.name + '\n'; }, '' );
 
-								// Tidy up the file list.
-								entities = entities.replace( /\.svg/g, '' );
-								entities = entities.replace( /^$/g, '' );
+								data       = responseField( apiResponse, 'data', 'the response' );
+								repository = responseField( data, 'repository', 'data' );
+								tree       = responseField( repository, 'object', 'data.repository' );
+								entries    = responseField( tree, 'entries', 'data.repository.object' );
 
-								// Convert the emoji entities to HTML entities.
-								partials = entities = entities.replace( /([a-z0-9]+)/g, '&#x$1;' );
+								// The revision the arrays below are generated from, for the record.
+								if ( 'string' !== typeof tree.oid || ! treeObjectId.test( tree.oid ) ) {
+									abandon( 'The Twemoji file list carries no tree object ID; refusing to rewrite the emoji arrays from an unidentified revision.' );
+								}
 
-								// Remove the hyphens between the HTML entities.
-								entities = entities.replace( /-/g, '' );
+								grunt.log.writeln( 'Twemoji tree object ID ' + tree.oid + '.' );
+
+								// An empty list would replace the emoji arrays with nothing, so fail loudly instead.
+								if ( ! Array.isArray( entries ) || 0 === entries.length ) {
+									abandon( 'The Twemoji file list is empty; refusing to write empty emoji arrays.' );
+								}
+
+								/*
+								 * A response that is short by an order of magnitude, or long by one, is not
+								 * the directory that was asked for. Checking the size costs nothing and it
+								 * is the only guard that notices a tree which is well formed but wrong.
+								 */
+								if ( entries.length < minimumFiles || entries.length > maximumFiles ) {
+									abandon( 'The Twemoji file list holds ' + entries.length + ' files, outside the expected ' + minimumFiles + ' to ' + maximumFiles + '; refusing to rewrite the emoji arrays.' );
+								}
+
+								names = [];
+								seen  = Object.create( null );
+
+								for ( index = 0; index < entries.length; index++ ) {
+									entry = entries[ index ];
+
+									if ( null === entry || 'object' !== typeof entry || 'string' !== typeof entry.name ) {
+										abandon( 'Entry ' + index + ' of the Twemoji file list carries no name.' );
+									}
+
+									name = entry.name;
+
+									/*
+									 * The offending name is deliberately not quoted back: it is arbitrary
+									 * third party text at this point, and a terminal control sequence in it
+									 * would rewrite the very message that reports it.
+									 */
+									if ( ! twemojiFileName.test( name ) ) {
+										abandon( 'Entry ' + index + ' of the Twemoji file list is not named after a hyphen separated list of lowercase hexadecimal code points; refusing to rewrite the emoji arrays.' );
+									}
+
+									// Past the grammar above, so this name is safe to name in a message.
+									if ( seen[ name ] ) {
+										abandon( 'The Twemoji file list holds ' + name + ' more than once; refusing to rewrite the emoji arrays.' );
+									}
+
+									seen[ name ] = true;
+									names.push( name );
+								}
+
+								/*
+								 * Split each name into the code points it is made of, dropping the
+								 * extension. Only validated names reach this point, so every part is a
+								 * lowercase hexadecimal code point, and the two arrays below are built by
+								 * joining those parts rather than by pattern replacing one concatenated
+								 * blob of the response. That replacement matched lowercase alphanumerics
+								 * only, so it left every other character in a name exactly as it arrived.
+								 */
+								sequences = names.map( function( fileName ) {
+									return fileName.slice( 0, -'.svg'.length ).split( '-' );
+								} );
+
+								// Convert the emoji entities to HTML entities, one sequence per emoji.
+								entities = sequences.map( function( codePoints ) {
+									return codePoints.map( function( codePoint ) {
+										return '&#x' + codePoint + ';';
+									} ).join( '' );
+								} );
 
 								// Sort the entities list by length, so the longest emoji will be found first.
-								emojiArray = entities.split( '\n' ).sort( function( a, b ) {
+								entities.sort( function( a, b ) {
 									return b.length - a.length;
 								} );
 
 								// Convert the entities list to PHP array syntax.
-								entities = '\'' + emojiArray.filter( function( val ) {
+								entities = '\'' + entities.filter( function( val ) {
 									return val.length >= 8 ? val : false ;
-								} ).join( '\', \'' ) + '\'';
+								} ).map( phpSingleQuoted ).join( '\', \'' ) + '\'';
 
 								// Create a list of all characters used by the emoji list.
-								partials = partials.replace( /-/g, '\n' );
+								partialsSet = new Set();
 
 								// Set automatically removes duplicates.
-								partialsSet = new Set( partials.split( '\n' ) );
+								sequences.forEach( function( codePoints ) {
+									codePoints.forEach( function( codePoint ) {
+										partialsSet.add( '&#x' + codePoint + ';' );
+									} );
+								} );
 
 								// Convert the partials list to PHP array syntax.
 								partials = '\'' + Array.from( partialsSet ).filter( function( val ) {
 									return val.length >= 8 ? val : false ;
-								} ).join( '\', \'' ) + '\'';
-
-								regex = '// START: emoji arrays\n';
-								regex += '\t$entities = array( ' + entities + ' );\n';
-								regex += '\t$partials = array( ' + partials + ' );\n';
-								regex += '\t// END: emoji arrays';
+								} ).map( phpSingleQuoted ).join( '\', \'' ) + '\'';
 
 								/*
-								 * Both lists are PHP array bodies built from HTML entities, so a body
-								 * without a single entity means the fetch or the filtering above produced
-								 * nothing. Report that, then throw: grunt.fatal() would not stop the write,
-								 * because grunt.util.exit() returns to its caller while it waits for the
-								 * output streams to drain, and only an exception keeps grunt-replace from
-								 * writing the emptied marker block back to the file.
+								 * Nothing but HTML entities may reach the generated file. The grammar every
+								 * name was checked against already guarantees that, so a failure here means
+								 * an assumption above stopped holding - which is exactly the moment a
+								 * generator that writes PHP has to stop rather than carry on.
 								 */
-								if ( -1 === entities.indexOf( '&#x' ) || -1 === partials.indexOf( '&#x' ) ) {
-									grunt.log.error( 'Emoji arrays are empty; refusing to write an empty replacement to ' + SOURCE_DIR + 'wp-includes/emoji-arrays.php.' );
-									assert.fail( 'Emoji arrays are empty.' );
+								if ( ! phpEntityList.test( entities ) || ! phpEntityList.test( partials ) ) {
+									abandon( 'The generated emoji arrays hold something other than HTML entities; refusing to write them.' );
 								}
+
+								regex = EMOJI_ARRAYS_START + '\n';
+								regex += '\t$entities = array( ' + entities + ' );\n';
+								regex += '\t$partials = array( ' + partials + ' );\n';
+								regex += '\t' + EMOJI_ARRAYS_END;
 
 								return regex;
 							}
@@ -1410,7 +1593,7 @@ module.exports = function(grunt) {
 						expand: true,
 						flatten: true,
 						src: [
-							SOURCE_DIR + 'wp-includes/emoji-arrays.php'
+							EMOJI_ARRAYS_FILE
 						],
 						dest: SOURCE_DIR + 'wp-includes/'
 					}
@@ -1679,7 +1862,41 @@ module.exports = function(grunt) {
 		'phpunit'
 	] );
 
+	grunt.registerTask(
+		'verify:emoji-markers',
+		'Fails unless the generated emoji array region appears exactly once in its data file.',
+		function() {
+			var regions, found;
+
+			if ( ! grunt.file.exists( EMOJI_ARRAYS_FILE ) ) {
+				grunt.fatal( 'The emoji data file is missing: ' + EMOJI_ARRAYS_FILE );
+			}
+
+			regions = grunt.file.read( EMOJI_ARRAYS_FILE ).match( emojiArraysRegionRegExp() );
+			found = null === regions ? 0 : regions.length;
+
+			/*
+			 * The region count is taken before the replacement runs, because
+			 * `replace:emoji-regex` cannot report either failure itself. With no
+			 * region it matches nothing and rewrites nothing; with two regions it
+			 * rewrites both, and fetches the Twemoji file list once per region.
+			 * This gate turns each case into a failure that names the file and the
+			 * number of regions found.
+			 */
+			if ( 1 !== found ) {
+				grunt.fatal(
+					'Expected exactly one `' + EMOJI_ARRAYS_START + '` to `' + EMOJI_ARRAYS_END +
+					'` region in ' + EMOJI_ARRAYS_FILE + ', found ' + found + '. ' +
+					'replace:emoji-regex locates the arrays it regenerates by those comments, so it cannot run until exactly one region exists.'
+				);
+			}
+
+			grunt.verbose.writeln( 'Found one emoji array region in ' + EMOJI_ARRAYS_FILE + '.' );
+		}
+	);
+
 	grunt.registerTask( 'precommit:emoji', [
+		'verify:emoji-markers',
 		'replace:emoji-regex'
 	] );
 
@@ -2124,8 +2341,9 @@ module.exports = function(grunt) {
 		} else {
 			grunt.task.run( [
 				'gutenberg:verify',
-				'build:autoload-classmap',
 				'build:certificates',
+				// Generated before `build:files`, so that `copy:files` carries it into the build.
+				'build:autoload-classmap',
 				'build:files',
 				'build:js',
 				'build:css',

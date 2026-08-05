@@ -614,6 +614,484 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 	}
 
 	/**
+	 * Tests that every generated class map name is already ASCII lower cased.
+	 *
+	 * PHP resolves class, interface and trait names case insensitively, so the
+	 * map is keyed by the ASCII lower cased name and the autoloader lower cases
+	 * the requested name before looking it up. A key that is not lower cased is
+	 * therefore unreachable: no request can ever produce it.
+	 */
+	public function test_class_map_names_are_ascii_lower_cased() {
+		$class_map = self::get_class_map();
+
+		$this->assertNotEmpty( $class_map, 'The generated class map must not be empty.' );
+
+		$problems = array();
+
+		foreach ( array_keys( $class_map ) as $class_name ) {
+			if ( ! is_string( $class_name ) ) {
+				// Reported by test_class_map_entry_points_to_a_readable_file().
+				continue;
+			}
+
+			if ( self::normalize_name( $class_name ) !== $class_name ) {
+				$problems[] = $class_name;
+			}
+		}
+
+		$this->assertSame(
+			array(),
+			$problems,
+			'Every class map name must be ASCII lower cased, otherwise the autoloader can never look it up.'
+		);
+	}
+
+	/**
+	 * Tests that every generated class map name carries a prefix the autoloader prefilters on.
+	 *
+	 * The autoloader returns before reading the map for any name that cannot
+	 * belong to core, which it decides from a short list of prefixes. The list
+	 * is read out of the autoloader itself rather than repeated here, so that
+	 * the generated map and the prefilter cannot drift apart: a mapped name
+	 * outside the list would be silently unreachable in production.
+	 */
+	public function test_class_map_names_carry_a_prefix_the_autoloader_prefilters_on() {
+		$class_map = self::get_class_map();
+		$prefixes  = self::get_autoloader_core_prefixes();
+
+		$this->assertNotEmpty( $class_map, 'The generated class map must not be empty.' );
+		$this->assertNotEmpty(
+			$prefixes,
+			'The core prefix list must be readable from the $core_prefixes declaration in wp-includes/autoload.php.'
+		);
+
+		$problems = array();
+
+		foreach ( array_keys( $class_map ) as $class_name ) {
+			if ( ! is_string( $class_name ) ) {
+				// Reported by test_class_map_entry_points_to_a_readable_file().
+				continue;
+			}
+
+			if ( ! self::matches_a_core_prefix( $class_name, $prefixes ) ) {
+				$problems[] = $class_name;
+			}
+		}
+
+		$this->assertSame(
+			array(),
+			$problems,
+			sprintf(
+				'Every class map name must start with one of the prefixes the autoloader prefilters on (%s).',
+				implode( ', ', $prefixes )
+			)
+		);
+	}
+
+	/**
+	 * Tests that a name outside the core prefixes is ignored without error.
+	 *
+	 * A name the autoloader cannot serve has to return silently, so that the
+	 * other registered autoloaders still get their turn, and it has to return
+	 * before the class map is read, which
+	 * test_class_map_is_not_read_before_a_core_name_misses() proves in a process
+	 * where the map has not been read yet.
+	 */
+	public function test_name_outside_the_core_prefixes_is_ignored_without_error() {
+		$class_name = self::get_non_core_probe_name();
+
+		$this->assertFalse(
+			self::matches_a_core_prefix( self::normalize_name( $class_name ), self::get_autoloader_core_prefixes() ),
+			'The name used to test the prefilter must not carry a prefix the autoloader recognizes.'
+		);
+
+		$this->assertArrayNotHasKey(
+			self::normalize_name( $class_name ),
+			self::get_class_map(),
+			'The name used to test the prefilter must not be mapped.'
+		);
+
+		$files_before = count( get_included_files() );
+
+		// Call the handler directly, so the silent return is proven for the handler itself.
+		wp_autoload_class( $class_name );
+
+		$this->assertSame(
+			$files_before,
+			count( get_included_files() ),
+			'A name outside the core prefixes must not load a file.'
+		);
+
+		$this->assertFalse(
+			self::is_symbol_declared( $class_name ),
+			'A name outside the core prefixes must not be declared.'
+		);
+
+		// Repeat through the SPL stack, which is how the handler runs in production.
+		$this->assertFalse(
+			self::symbol_resolves( $class_name ),
+			'A name outside the core prefixes must stay unresolvable once every autoloader has had its turn.'
+		);
+	}
+
+	/**
+	 * Tests that a mapped symbol resolves from a reference written in any case.
+	 *
+	 * PHP matches class, interface and trait names case insensitively, so
+	 * `new wp_error()` and `new WP_Error()` are the same reference and both
+	 * reach the autoloader with the name exactly as it was written. A case
+	 * sensitive lookup would resolve only one of them and leave the other
+	 * fatal, so each fixture below is requested in a different case.
+	 *
+	 * The probe runs in a fresh process because this one has already declared
+	 * most mapped symbols during bootstrap, which would let a case sensitive
+	 * lookup pass on PHP's own symbol table instead of on the autoloader.
+	 */
+	public function test_mapped_names_resolve_from_a_reference_in_any_case() {
+		$class_map = self::get_class_map();
+		$report    = $this->get_isolated_autoloader_probe_report();
+		$fixtures  = self::get_case_probe_fixture();
+
+		/*
+		 * The handler loads a file, so it cannot treat the three symbol kinds
+		 * differently, but the fixture still has to exercise every kind the map
+		 * actually contains. The fixture kinds are compared with the kinds
+		 * present in the map, so mapping an additional kind fails here until the
+		 * fixture covers it.
+		 */
+		$covered_kinds = array();
+
+		foreach ( $fixtures as $fixture ) {
+			$covered_kinds[ $fixture['kind'] ] = true;
+		}
+
+		$covered_kinds = array_keys( $covered_kinds );
+
+		sort( $covered_kinds );
+
+		$this->assertSame(
+			array(),
+			array_values( array_diff( self::get_class_map_symbol_kinds(), $covered_kinds ) ),
+			'Every symbol kind the class map contains has to be requested in an alternate case. Add the missing kind to get_case_probe_fixture().'
+		);
+
+		foreach ( $fixtures as $fixture ) {
+			/*
+			 * Matched without regard to case, so that this precondition holds
+			 * however the map happens to be keyed and the assertions below stay
+			 * the ones that report a case sensitive lookup.
+			 */
+			$mapped = false;
+
+			foreach ( array_keys( $class_map ) as $mapped_name ) {
+				if ( is_string( $mapped_name ) && self::names_match( $fixture['canonical'], $mapped_name ) ) {
+					$mapped = true;
+					break;
+				}
+			}
+
+			$this->assertTrue(
+				$mapped,
+				sprintf(
+					'%s has to be mapped for this test to prove anything. Update get_case_probe_fixture() if the symbol was renamed or is no longer autoloaded.',
+					$fixture['canonical']
+				)
+			);
+
+			$this->assertArrayHasKey(
+				$fixture['requested'],
+				$report['probes'],
+				sprintf( 'The probe must report on the reference written as %s.', $fixture['requested'] )
+			);
+
+			$this->assertTrue(
+				$report['probes'][ $fixture['requested'] ]['resolved'],
+				sprintf(
+					'A reference written as %s must resolve %s through the autoloader.',
+					$fixture['requested'],
+					$fixture['canonical']
+				)
+			);
+
+			$this->assertTrue(
+				$report['probes'][ $fixture['requested'] ]['canonical_declared'],
+				sprintf(
+					'Resolving the reference written as %s must declare %s under its canonical name.',
+					$fixture['requested'],
+					$fixture['canonical']
+				)
+			);
+		}
+	}
+
+	/**
+	 * Tests that the class map is not read until a name that could belong to core misses.
+	 *
+	 * Requiring wp-includes/autoload.php registers the handler without reading
+	 * the map, and a name that matches none of the core prefixes returns before
+	 * the read as well. This has to be proven in a fresh process, because the map
+	 * has already been read by the time this suite runs.
+	 */
+	public function test_class_map_is_not_read_before_a_core_name_misses() {
+		$report = $this->get_isolated_autoloader_probe_report();
+
+		$this->assertTrue(
+			$report['handler_registered'],
+			'Requiring wp-includes/autoload.php must register the handler with the SPL stack.'
+		);
+
+		$this->assertFalse(
+			$report['map_read_on_require'],
+			'Requiring wp-includes/autoload.php must not read the class map.'
+		);
+
+		$this->assertFalse(
+			$report['map_read_after_non_core_miss'],
+			'A miss on a name outside the core prefixes must not read the class map.'
+		);
+
+		$this->assertTrue(
+			$report['map_read_after_core_hit'],
+			'A mapped name must read the class map, otherwise the probe cannot detect a premature read.'
+		);
+	}
+
+	/**
+	 * Tests that resolving any mapped name on its own never ends in a fatal error.
+	 *
+	 * Being named for one symbol is not the same as being loadable on demand. A
+	 * declaration can reach for a parent that nothing has declared yet, and asking
+	 * for such a name raises a fatal error instead of answering, so a name of that
+	 * shape must stay out of the map. Two shapes of the problem exist in core and
+	 * the generator withdraws both:
+	 *
+	 * - A file whose declaration inherits from a library core only loads at the
+	 *   point of use, such as SimplePie, PHPMailer, IXR or Text_Diff. Reached any
+	 *   earlier, the parent is not there to extend.
+	 * - A subclass belonging to a family whose base file requires its own
+	 *   subclasses at the foot of the file. Asking for the base is safe, because it
+	 *   is declared before those requires run, but entering at a subclass leaves
+	 *   that file mid compilation, so the require_once that would bring it back is
+	 *   skipped as already in progress and the next sibling compiles against a
+	 *   parent that does not exist yet.
+	 *
+	 * The generator decides both from the source alone, so this test is what holds
+	 * the property: it asks for every mapped name for real, which is why loosening
+	 * either rule fails here.
+	 *
+	 * Each name is resolved in a process of its own, so one name cannot be
+	 * satisfied by a file some earlier name happened to load. A name that resolves
+	 * to nothing is not a failure; only a fatal error is.
+	 */
+	public function test_no_mapped_name_ends_in_a_fatal_error_when_resolved_alone() {
+		$names = array_keys( self::get_class_map() );
+
+		$this->assertNotEmpty(
+			$names,
+			'The class map must contain names, otherwise this test proves nothing.'
+		);
+
+		/*
+		 * One process per name, rather than one process resolving all of them.
+		 * Resolving a name declares whatever its file drags in with it, and several
+		 * core families arrive together, so a name asked for after a relative has
+		 * already brought it into the process would answer from memory and never
+		 * reach the autoloader. Each name therefore gets a process that has
+		 * resolved nothing else, which is the only arrangement in which every name
+		 * is actually tested.
+		 */
+		$probe_file = $this->write_isolated_resolution_probe();
+		$failures   = array();
+
+		foreach ( $names as $name ) {
+			$output = $this->run_isolated_resolution_probe( $probe_file, $name );
+
+			if ( false === strpos( $output, '--WP-AUTOLOAD-RESOLUTION--' ) ) {
+				$failures[ $name ] = trim( $output );
+			}
+		}
+
+		unlink( $probe_file );
+
+		$reports = array();
+
+		foreach ( $failures as $name => $report ) {
+			$reports[] = $name . ":\n" . $report;
+		}
+
+		$this->assertSame(
+			array(),
+			$failures,
+			'Resolving a mapped name must not raise a fatal error. Before the class map existed these names were '
+				. "not autoloadable at all, so a reference to one answered false instead of ending the request:\n"
+				. implode( "\n\n", $reports )
+		);
+	}
+
+	/**
+	 * Tests that an unmapped name is ignored whatever case it is spelled in.
+	 *
+	 * Looking the map up by the lower cased name must widen only what resolves,
+	 * never what the autoloader is willing to load: a name that is absent from
+	 * the map has to stay a silent miss in every spelling, so that the rest of
+	 * the SPL stack still gets its turn.
+	 */
+	public function test_an_unmapped_noncanonical_name_is_ignored_without_error() {
+		$class_map = self::get_class_map();
+		$base      = 'WP_Nonexistent_Class_' . md5( __METHOD__ );
+
+		// Carries a core prefix on purpose, so the prefilter does not answer for the map.
+		$spellings  = array( strtolower( $base ), strtoupper( $base ), $base );
+		$unresolved = array();
+
+		foreach ( $spellings as $spelling ) {
+			$this->assertArrayNotHasKey(
+				self::normalize_name( $spelling ),
+				$class_map,
+				"The name used to test a class map miss must not be mapped in any case: {$spelling}."
+			);
+
+			$files_before = count( get_included_files() );
+
+			// Call the handler directly, so the silent miss is proven for the handler itself.
+			wp_autoload_class( $spelling );
+
+			$this->assertSame(
+				$files_before,
+				count( get_included_files() ),
+				"A class map miss must not load a file: {$spelling}."
+			);
+
+			if ( self::symbol_resolves( $spelling ) ) {
+				$unresolved[] = $spelling;
+			}
+		}
+
+		$this->assertSame(
+			array(),
+			$unresolved,
+			'An unmapped name must stay unresolvable in every spelling once every autoloader has had its turn.'
+		);
+	}
+
+	/**
+	 * Tests that nothing in the shipped tree can redeclare a mapped symbol.
+	 *
+	 * A mapped file is reached through the autoloader, and a plain `require` or
+	 * `include` of that same file afterwards recompiles it and ends the request
+	 * with "Cannot redeclare". The hazard is not confined to the bootstrap, which
+	 * the generator already withdraws from the map: a drop-in, a must-use plugin
+	 * or a `class_exists()` probe can resolve a mapped name before any of core's
+	 * own includes have run, so the whole shipped tree is inspected. It is
+	 * tokenized rather than loaded, so that this test reports a collision instead
+	 * of dying on the fatal error it guards against.
+	 *
+	 * Two include shapes cannot redeclare anything and are therefore allowed:
+	 *
+	 * - `require_once` and `include_once`, which are a no-op once the autoloader
+	 *   has compiled the file, and which declare the symbol themselves when it
+	 *   has not.
+	 * - A plain `require` or `include` guarded by `class_exists( 'Name', false )`,
+	 *   or the interface or trait equivalent, in its own condition. The second
+	 *   argument suppresses autoloading, so the guard is true exactly when the
+	 *   symbol is already declared and the include is skipped.
+	 *
+	 * An entry point that never loads wp-settings.php is allowed as well, because
+	 * wp-includes/autoload.php is never registered in its process. That claim is
+	 * verified rather than assumed by
+	 * test_the_exempt_entry_points_never_reach_the_autoloader().
+	 */
+	public function test_no_mapped_file_can_be_redeclared_by_the_shipped_tree() {
+		$class_map = self::get_class_map();
+
+		$this->assertNotEmpty( $class_map, 'The generated class map must not be empty.' );
+
+		$includes   = self::get_shipped_include_targets();
+		$exempt     = array_fill_keys( self::get_shipped_files_without_the_autoloader(), true );
+		$collisions = array();
+
+		foreach ( $class_map as $class_name => $path ) {
+			if ( ! is_string( $class_name ) || ! is_string( $path ) ) {
+				// Reported by test_class_map_entry_points_to_a_readable_file().
+				continue;
+			}
+
+			if ( ! isset( $includes[ $path ] ) ) {
+				continue;
+			}
+
+			foreach ( $includes[ $path ] as $include ) {
+				if ( $include['once'] || $include['guarded'] || isset( $exempt[ $include['file'] ] ) ) {
+					continue;
+				}
+
+				$collisions[] = sprintf(
+					'%1$s => %2$s, reached by an unguarded %3$s in %4$s on line %5$d',
+					$class_name,
+					$path,
+					$include['form'],
+					$include['file'],
+					$include['line']
+				);
+			}
+		}
+
+		$this->assertSame(
+			array(),
+			$collisions,
+			'A mapped file may only be included where the include cannot redeclare its symbol: '
+				. 'use require_once, or guard a plain require with class_exists( ..., false ).'
+		);
+	}
+
+	/**
+	 * Tests that the entry points exempted above really run without the autoloader.
+	 *
+	 * The exemption in test_no_mapped_file_can_be_redeclared_by_the_shipped_tree()
+	 * rests entirely on those files bootstrapping themselves rather than through
+	 * wp-settings.php. Should one of them ever load the bootstrap, or the
+	 * autoloader directly, its unguarded includes would become able to redeclare
+	 * a mapped symbol and the exemption would have to go, so the property is
+	 * asserted here rather than trusted.
+	 */
+	public function test_the_exempt_entry_points_never_reach_the_autoloader() {
+		$problems = array();
+
+		foreach ( self::get_shipped_files_without_the_autoloader() as $relative ) {
+			$file = ABSPATH . $relative;
+
+			if ( ! is_readable( $file ) ) {
+				$problems[] = $relative . ': not readable.';
+				continue;
+			}
+
+			$source = file_get_contents( $file );
+
+			if ( ! is_string( $source ) ) {
+				$problems[] = $relative . ': could not be read.';
+				continue;
+			}
+
+			// Bootstraps itself, which is what makes it an entry point rather than an include.
+			if ( false === strpos( $source, "define( 'WPINC'" ) ) {
+				$problems[] = $relative . ': does not define WPINC for itself.';
+			}
+
+			foreach ( array( 'wp-settings.php', 'wp-load.php', 'autoload.php' ) as $bootstrap ) {
+				if ( false !== strpos( $source, $bootstrap ) ) {
+					$problems[] = $relative . ': names ' . $bootstrap . ', so it may reach the autoloader.';
+				}
+			}
+		}
+
+		$this->assertSame(
+			array(),
+			$problems,
+			'An entry point exempted from the redeclaration check must bootstrap itself and never reach wp-includes/autoload.php.'
+		);
+	}
+
+	/**
 	 * Returns the generated class map that wp_autoload_class() resolves against.
 	 *
 	 * Consumes the generated manifest the way core does elsewhere: a PHP file
@@ -901,10 +1379,10 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 	/**
 	 * Determines whether loading a file may report a deprecation.
 	 *
-	 * Deliberately conservative: a file is skipped when it so much as mentions
-	 * one of the deprecation helpers, because a deprecation raised while a file
-	 * is being loaded is converted into an exception by the test configuration
-	 * and belongs to the loaded file rather than to the autoloader.
+	 * Conservatively skips files that reference a deprecation helper, because a
+	 * deprecation raised while a file is being loaded is converted into an
+	 * exception by the test configuration and belongs to the loaded file rather
+	 * than to the autoloader.
 	 *
 	 * @param string $file Absolute path of the file to inspect.
 	 * @return bool Whether the file has to be skipped.
@@ -1034,11 +1512,42 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 	 * @return string[] Declared names, in the order they appear in the file.
 	 */
 	private static function get_declared_symbol_names( $file ) {
+		$names = array();
+
+		foreach ( self::get_declared_symbols_with_kinds( $file ) as $symbol ) {
+			$names[] = $symbol['name'];
+		}
+
+		return $names;
+	}
+
+	/**
+	 * Returns the class, interface and trait declarations in a file, with their kind.
+	 *
+	 * Shares one tokenizer pass with get_declared_symbol_names(), so that both
+	 * views of a file agree on what counts as a declaration.
+	 *
+	 * @param string $file Absolute path of the file to inspect.
+	 * @return array[] {
+	 *     Declarations, in the order they appear in the file.
+	 *
+	 *     @type array ...$0 {
+	 *         @type string $kind One of 'class', 'interface' or 'trait'.
+	 *         @type string $name The declared name.
+	 *     }
+	 * }
+	 */
+	private static function get_declared_symbols_with_kinds( $file ) {
 		$tokens    = token_get_all( file_get_contents( $file ) );
 		$total     = count( $tokens );
 		$ignorable = array( T_WHITESPACE, T_COMMENT, T_DOC_COMMENT );
-		$declaring = array( T_CLASS, T_INTERFACE, T_TRAIT );
-		$names     = array();
+		$kinds     = array(
+			T_CLASS     => 'class',
+			T_INTERFACE => 'interface',
+			T_TRAIT     => 'trait',
+		);
+		$declaring = array_keys( $kinds );
+		$symbols   = array();
 
 		for ( $index = 0; $index < $total; $index++ ) {
 			if ( ! is_array( $tokens[ $index ] ) || ! in_array( $tokens[ $index ][0], $declaring, true ) ) {
@@ -1064,10 +1573,800 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 			}
 
 			if ( $next < $total && is_array( $tokens[ $next ] ) && T_STRING === $tokens[ $next ][0] ) {
-				$names[] = $tokens[ $next ][1];
+				$symbols[] = array(
+					'kind' => $kinds[ $tokens[ $index ][0] ],
+					'name' => $tokens[ $next ][1],
+				);
 			}
 		}
 
-		return $names;
+		return $symbols;
+	}
+
+	/**
+	 * Returns the symbol kinds the generated class map actually contains.
+	 *
+	 * Read from the mapped files rather than assumed from their names, so that a
+	 * trait or an interface entering the map is noticed even if it does not
+	 * follow core's `interface-` or `trait-` file naming.
+	 *
+	 * @return string[] Sorted unique kinds, drawn from 'class', 'interface' and
+	 *                  'trait'.
+	 */
+	private static function get_class_map_symbol_kinds() {
+		static $kinds = null;
+
+		if ( null !== $kinds ) {
+			return $kinds;
+		}
+
+		$kinds = array();
+
+		foreach ( self::get_class_map() as $class_name => $path ) {
+			if ( ! is_string( $class_name ) || ! is_string( $path ) || ! is_readable( ABSPATH . $path ) ) {
+				// Reported by test_class_map_entry_points_to_a_readable_file().
+				continue;
+			}
+
+			foreach ( self::get_declared_symbols_with_kinds( ABSPATH . $path ) as $symbol ) {
+				$kinds[ $symbol['kind'] ] = true;
+			}
+		}
+
+		$kinds = array_keys( $kinds );
+
+		sort( $kinds );
+
+		return $kinds;
+	}
+
+	/**
+	 * Lower cases the ASCII letters of a symbol name.
+	 *
+	 * Mirrors the normalization the autoloader performs, character for
+	 * character. strtr() is used rather than strtolower() for the same reason
+	 * the autoloader uses it: strtolower() only stopped depending on the locale
+	 * in PHP 8.2, and a Turkish locale folds `I` outside ASCII.
+	 *
+	 * @param string $name Symbol name.
+	 * @return string The name with its ASCII letters lower cased.
+	 */
+	private static function normalize_name( $name ) {
+		return strtr( $name, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz' );
+	}
+
+	/**
+	 * Determines whether a normalized name starts with one of the given prefixes.
+	 *
+	 * @param string   $name     Normalized symbol name.
+	 * @param string[] $prefixes Normalized prefixes to test against.
+	 * @return bool Whether the name starts with one of the prefixes.
+	 */
+	private static function matches_a_core_prefix( $name, $prefixes ) {
+		foreach ( $prefixes as $prefix ) {
+			if ( 0 === strncmp( $name, $prefix, strlen( $prefix ) ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Returns the prefixes the autoloader prefilters requested names on.
+	 *
+	 * Read out of the `$core_prefixes` declaration in the autoloader by
+	 * tokenizing it, so the list is never duplicated here. Duplicating it would
+	 * let the two copies drift, which is exactly the failure the tests using
+	 * this helper exist to catch.
+	 *
+	 * @return string[] The declared prefixes, or an empty array when the
+	 *                  declaration cannot be read.
+	 */
+	private static function get_autoloader_core_prefixes() {
+		static $prefixes = null;
+
+		if ( null !== $prefixes ) {
+			return $prefixes;
+		}
+
+		$prefixes = array();
+		$source   = file_get_contents( ABSPATH . WPINC . '/autoload.php' );
+
+		if ( false === $source ) {
+			return $prefixes;
+		}
+
+		$tokens    = token_get_all( $source );
+		$total     = count( $tokens );
+		$ignorable = array( T_WHITESPACE, T_COMMENT, T_DOC_COMMENT );
+
+		for ( $index = 0; $index < $total; $index++ ) {
+			if ( ! is_array( $tokens[ $index ] )
+				|| T_VARIABLE !== $tokens[ $index ][0]
+				|| '$core_prefixes' !== $tokens[ $index ][1]
+			) {
+				continue;
+			}
+
+			$assigned  = false;
+			$depth     = 0;
+			$collected = array();
+
+			for ( $next = $index + 1; $next < $total; $next++ ) {
+				$token = $tokens[ $next ];
+
+				if ( is_array( $token ) ) {
+					if ( in_array( $token[0], $ignorable, true ) ) {
+						continue;
+					}
+
+					if ( $assigned && $depth > 0 && T_CONSTANT_ENCAPSED_STRING === $token[0] ) {
+						$collected[] = trim( $token[1], '"\'' );
+					}
+
+					// T_ARRAY and anything else in the expression is skipped.
+					continue;
+				}
+
+				if ( ! $assigned ) {
+					if ( '=' === $token ) {
+						$assigned = true;
+						continue;
+					}
+
+					// Not the declaration. Try the next occurrence of the variable.
+					break;
+				}
+
+				if ( '(' === $token || '[' === $token ) {
+					++$depth;
+					continue;
+				}
+
+				if ( ')' === $token || ']' === $token ) {
+					--$depth;
+
+					if ( 0 === $depth ) {
+						break;
+					}
+
+					continue;
+				}
+
+				if ( ';' === $token ) {
+					break;
+				}
+			}
+
+			if ( array() !== $collected ) {
+				$prefixes = $collected;
+				break;
+			}
+		}
+
+		return $prefixes;
+	}
+
+	/**
+	 * Returns a name that no core file can declare and no prefix can match.
+	 *
+	 * @return string A name outside the core prefixes.
+	 */
+	private static function get_non_core_probe_name() {
+		return 'Vendor_Unmapped_Autoloader_Probe';
+	}
+
+	/**
+	 * Returns the references the case sensitivity probe resolves.
+	 *
+	 * Each fixture names a different symbol, so that each case is resolved by
+	 * the autoloader rather than by PHP's symbol table answering for a symbol an
+	 * earlier fixture already declared. Every mapped file listed here declares
+	 * its symbol without extending a parent, implementing an interface or using
+	 * a trait, so it can be compiled in a process where nothing else is loaded.
+	 *
+	 * @return array[] {
+	 *     @type array ...$0 {
+	 *         @type string $requested The reference to resolve, as written.
+	 *         @type string $canonical The name the mapped file declares.
+	 *         @type string $kind      Either 'class' or 'interface'.
+	 *     }
+	 * }
+	 */
+	private static function get_case_probe_fixture() {
+		return array(
+			array(
+				'requested' => 'wp_http_proxy',
+				'canonical' => 'WP_HTTP_Proxy',
+				'kind'      => 'class',
+			),
+			array(
+				'requested' => 'WP_LIST_UTIL',
+				'canonical' => 'WP_List_Util',
+				'kind'      => 'class',
+			),
+			array(
+				'requested' => 'Wp_Token_Map',
+				'canonical' => 'WP_Token_Map',
+				'kind'      => 'class',
+			),
+			array(
+				'requested' => 'wp_sync_storage',
+				'canonical' => 'WP_Sync_Storage',
+				'kind'      => 'interface',
+			),
+		);
+	}
+
+	/**
+	 * Runs the autoloader in a fresh PHP process and returns what it observed.
+	 *
+	 * Two of the guarantees under test are only observable before anything else
+	 * has loaded: whether the class map has been read yet, and whether a
+	 * reference resolves through the autoloader rather than through a symbol the
+	 * bootstrap already declared. Both are therefore measured in a process that
+	 * requires nothing but the autoloader, spawned with WP_PHP_BINARY so that the
+	 * interpreter matches the one running this suite.
+	 *
+	 * The probe writes its report between sentinels, so that anything else the
+	 * process emits stays visible in the failure message instead of corrupting
+	 * the report.
+	 *
+	 * @return array {
+	 *     @type bool  $handler_registered           Whether requiring the autoloader registered the handler.
+	 *     @type bool  $map_read_on_require          Whether requiring the autoloader read the class map.
+	 *     @type bool  $map_read_after_non_core_miss Whether a non-core miss read the class map.
+	 *     @type bool  $map_read_after_core_hit      Whether a mapped name read the class map.
+	 *     @type array $probes                       Per reference results, keyed by the requested name.
+	 * }
+	 */
+	private function get_isolated_autoloader_probe_report() {
+		static $report = null;
+
+		if ( null !== $report ) {
+			return $report;
+		}
+
+		$probe_file = get_temp_dir() . 'wp-autoload-probe-' . md5( __CLASS__ . ABSPATH ) . '.php';
+
+		$this->assertNotFalse(
+			file_put_contents( $probe_file, self::get_isolated_probe_source() ),
+			'The autoloader probe must be writable to the temporary directory.'
+		);
+
+		$command = sprintf(
+			'%s %s %s %s %s 2>&1',
+			WP_PHP_BINARY,
+			escapeshellarg( $probe_file ),
+			escapeshellarg( ABSPATH ),
+			escapeshellarg( WPINC ),
+			escapeshellarg( wp_json_encode( self::get_case_probe_fixture() ) )
+		);
+
+		$output = shell_exec( $command );
+
+		unlink( $probe_file );
+
+		$this->assertIsString(
+			$output,
+			'The autoloader probe must run in a separate PHP process. Process spawning is required by the test bootstrap itself.'
+		);
+
+		$matched = preg_match( '/--WP-AUTOLOAD-PROBE--(.*)--WP-AUTOLOAD-PROBE--/s', $output, $matches );
+
+		$this->assertSame(
+			1,
+			$matched,
+			"The autoloader probe must report between its sentinels. It emitted:\n" . $output
+		);
+
+		$decoded = json_decode( $matches[1], true );
+
+		$this->assertIsArray(
+			$decoded,
+			"The autoloader probe report must be readable JSON. It emitted:\n" . $output
+		);
+
+		$report = $decoded;
+
+		return $report;
+	}
+
+	/**
+	 * Returns the source of the isolated autoloader probe.
+	 *
+	 * The probe deliberately requires nothing but the autoloader, so that the
+	 * only thing that can put the class map into the included file list is the
+	 * autoloader itself. It misses on a non-core name before it resolves any
+	 * mapped name, because the order is what makes a premature read of the map
+	 * detectable.
+	 *
+	 * @return string The probe source.
+	 */
+	private static function get_isolated_probe_source() {
+		$non_core_name = self::get_non_core_probe_name();
+
+		$source = <<<'PROBE'
+<?php
+define( 'ABSPATH', $argv[1] );
+define( 'WPINC', $argv[2] );
+
+$class_map_file = ABSPATH . WPINC . '/autoload-classmap.php';
+$report         = array( 'probes' => array() );
+
+require ABSPATH . WPINC . '/autoload.php';
+
+$report['handler_registered']  = in_array( 'wp_autoload_class', (array) spl_autoload_functions(), true );
+$report['map_read_on_require'] = in_array( $class_map_file, get_included_files(), true );
+
+// A name no core file can declare must not make the handler read the map.
+class_exists( 'WP_AUTOLOAD_PROBE_NON_CORE_NAME' );
+
+$report['map_read_after_non_core_miss'] = in_array( $class_map_file, get_included_files(), true );
+
+foreach ( json_decode( $argv[3], true ) as $fixture ) {
+	$resolved = 'interface' === $fixture['kind']
+		? interface_exists( $fixture['requested'] )
+		: class_exists( $fixture['requested'] );
+
+	/*
+	 * The canonical name is checked without autoloading, so that it reports
+	 * whether resolving the reference declared the symbol rather than whether
+	 * a second autoload attempt would.
+	 */
+	$declared = class_exists( $fixture['canonical'], false )
+		|| interface_exists( $fixture['canonical'], false )
+		|| trait_exists( $fixture['canonical'], false );
+
+	$report['probes'][ $fixture['requested'] ] = array(
+		'resolved'           => $resolved,
+		'canonical_declared' => $declared,
+	);
+}
+
+$report['map_read_after_core_hit'] = in_array( $class_map_file, get_included_files(), true );
+
+echo '--WP-AUTOLOAD-PROBE--' . json_encode( $report ) . '--WP-AUTOLOAD-PROBE--';
+PROBE;
+
+		return str_replace( 'WP_AUTOLOAD_PROBE_NON_CORE_NAME', $non_core_name, $source );
+	}
+
+	/**
+	 * Writes the isolated resolution probe and returns its path.
+	 *
+	 * Written once and reused for every name, because the probe does not vary: only
+	 * the name it is asked to resolve does, and that arrives as an argument.
+	 *
+	 * @return string Path to the probe.
+	 */
+	private function write_isolated_resolution_probe() {
+		$probe_file = get_temp_dir() . 'wp-autoload-resolution-probe-' . md5( __CLASS__ . ABSPATH ) . '.php';
+
+		$this->assertNotFalse(
+			file_put_contents( $probe_file, self::get_isolated_resolution_probe_source() ),
+			'The resolution probe must be writable to the temporary directory.'
+		);
+
+		return $probe_file;
+	}
+
+	/**
+	 * Resolves one mapped name in a separate process and returns what it emitted.
+	 *
+	 * Spawned with the same PHP binary the test bootstrap uses for its install
+	 * step. Standard error is folded into the output so that the message of a fatal
+	 * error survives to be reported, and the whole output is returned rather than a
+	 * parsed report because a process that dies has no report to give.
+	 *
+	 * @param string $probe_file Path to the probe.
+	 * @param string $name       The name to resolve.
+	 * @return string Everything the process wrote to either stream.
+	 */
+	private function run_isolated_resolution_probe( $probe_file, $name ) {
+		$command = sprintf(
+			'%s %s %s %s 2>&1',
+			WP_PHP_BINARY,
+			escapeshellarg( $probe_file ),
+			escapeshellarg( ABSPATH ),
+			escapeshellarg( $name )
+		);
+
+		$output = shell_exec( $command );
+
+		$this->assertIsString(
+			$output,
+			'The resolution probe must run in a separate PHP process. Process spawning is required by the test bootstrap itself.'
+		);
+
+		return $output;
+	}
+
+	/**
+	 * Returns the source of the isolated resolution probe.
+	 *
+	 * Installs what a mapped symbol may depend on, and deliberately nothing else:
+	 *
+	 * - The two vendored autoloaders, so that a declaration inheriting from one of
+	 *   those namespaces resolves rather than reaching an undeclared parent.
+	 * - A stub for _deprecated_file(), which core declares in functions.php. Two
+	 *   mapped files announce their own deprecation as they load, and without the
+	 *   stub they would fail on an undefined function rather than on anything to do
+	 *   with the class map.
+	 *
+	 * The libraries core loads only where they are used are omitted, so a mapped
+	 * name that inherits from one of them fails here. The sentinel is emitted only
+	 * once the name has been resolved, so its absence is what reports a process that
+	 * did not survive resolving it.
+	 *
+	 * @return string The probe source.
+	 */
+	private static function get_isolated_resolution_probe_source() {
+		return <<<'PROBE'
+<?php
+define( 'ABSPATH', $argv[1] );
+define( 'WPINC', 'wp-includes' );
+
+// Declared by core in wp-includes/functions.php, which this probe does not load.
+function _deprecated_file( $file, $version, $replacement = '', $message = '' ) {}
+
+foreach ( array( '/Requests/src/Autoload.php', '/php-ai-client/autoload.php' ) as $vendor_autoloader ) {
+	require ABSPATH . WPINC . $vendor_autoloader;
+}
+
+WpOrg\Requests\Autoload::register();
+
+require ABSPATH . WPINC . '/autoload.php';
+
+$name     = $argv[2];
+$resolved = class_exists( $name ) || interface_exists( $name ) || trait_exists( $name );
+
+echo '--WP-AUTOLOAD-RESOLUTION--' . ( $resolved ? 'resolved' : 'unresolved' ) . "\n";
+PROBE;
+	}
+
+	/**
+	 * Returns the shipped entry points that run without the core autoloader.
+	 *
+	 * Both define ABSPATH and WPINC for themselves and load the handful of files
+	 * they need directly, never wp-settings.php, so wp-includes/autoload.php is
+	 * never registered in their process and nothing can have autoloaded the file
+	 * they require. That property is asserted by
+	 * test_the_exempt_entry_points_never_reach_the_autoloader().
+	 *
+	 * @return string[] Paths relative to ABSPATH.
+	 */
+	private static function get_shipped_files_without_the_autoloader() {
+		return array(
+			'wp-admin/load-scripts.php',
+			'wp-admin/load-styles.php',
+		);
+	}
+
+	/**
+	 * Returns every include of a shipped file made anywhere in the shipped tree.
+	 *
+	 * Each include is described rather than merely counted, because whether it can
+	 * redeclare a symbol depends on its form and on the guard in front of it.
+	 *
+	 * The scan is memoized, so the tree is walked once for the whole class.
+	 *
+	 * @return array[] Paths of the included files, relative to ABSPATH, each mapped
+	 *                 to a list of arrays with the keys 'file', 'line', 'form',
+	 *                 'once' and 'guarded'.
+	 */
+	private static function get_shipped_include_targets() {
+		static $targets = null;
+
+		if ( null !== $targets ) {
+			return $targets;
+		}
+
+		$targets    = array();
+		$files      = self::get_shipped_php_files();
+		$is_shipped = array_fill_keys( $files, true );
+
+		foreach ( $files as $file ) {
+			foreach ( self::get_include_targets( $file, $is_shipped ) as $include ) {
+				$path = $include['path'];
+
+				unset( $include['path'] );
+
+				if ( ! isset( $targets[ $path ] ) ) {
+					$targets[ $path ] = array();
+				}
+
+				$targets[ $path ][] = $include;
+			}
+		}
+
+		return $targets;
+	}
+
+	/**
+	 * Returns the PHP files of the shipped tree, relative to ABSPATH.
+	 *
+	 * The shipped tree is the root level files plus wp-includes and wp-admin,
+	 * which is the same surface the generator consults. Everything under
+	 * wp-content is bundled content rather than core, so it is left out: a
+	 * bundled theme or plugin cannot be held to a core loading invariant.
+	 *
+	 * @return string[] Sorted forward slashed paths, relative to ABSPATH.
+	 */
+	private static function get_shipped_php_files() {
+		static $files = null;
+
+		if ( null !== $files ) {
+			return $files;
+		}
+
+		$files = array();
+
+		foreach ( glob( ABSPATH . '*.php' ) as $file ) {
+			$files[] = basename( $file );
+		}
+
+		foreach ( array( 'wp-includes', 'wp-admin' ) as $directory ) {
+			if ( ! is_dir( ABSPATH . $directory ) ) {
+				continue;
+			}
+
+			$iterator = new RecursiveIteratorIterator(
+				new RecursiveDirectoryIterator( ABSPATH . $directory, FilesystemIterator::SKIP_DOTS )
+			);
+
+			foreach ( $iterator as $file ) {
+				if ( $file->isFile() && 'php' === strtolower( $file->getExtension() ) ) {
+					$files[] = str_replace( '\\', '/', substr( $file->getPathname(), strlen( ABSPATH ) ) );
+				}
+			}
+		}
+
+		sort( $files );
+
+		return $files;
+	}
+
+	/**
+	 * Returns the shipped files a single file includes, described one by one.
+	 *
+	 * Only literal paths are resolved, which is every include in the shipped tree
+	 * that names a file at all. The autoloader's own `require $file;` holds no
+	 * literal and is skipped, as is any other computed path: nothing that cannot
+	 * be resolved statically is reported, so a collision is only ever claimed on
+	 * evidence.
+	 *
+	 * @param string $file       Path of the including file, relative to ABSPATH.
+	 * @param array  $is_shipped Lookup of the shipped paths, keyed by path.
+	 * @return array[] One array per include, with the keys 'path', 'file', 'line',
+	 *                 'form', 'once' and 'guarded'.
+	 */
+	private static function get_include_targets( $file, $is_shipped ) {
+		$source = file_get_contents( ABSPATH . $file );
+
+		if ( ! is_string( $source ) ) {
+			return array();
+		}
+
+		// Tokenizing every shipped file is wasteful when most name no include at all.
+		if ( false === stripos( $source, 'require' ) && false === stripos( $source, 'include' ) ) {
+			return array();
+		}
+
+		$tokens    = token_get_all( $source );
+		$total     = count( $tokens );
+		$including = array(
+			T_REQUIRE      => 'require',
+			T_REQUIRE_ONCE => 'require_once',
+			T_INCLUDE      => 'include',
+			T_INCLUDE_ONCE => 'include_once',
+		);
+		$includes  = array();
+
+		for ( $index = 0; $index < $total; $index++ ) {
+			if ( ! is_array( $tokens[ $index ] ) || ! isset( $including[ $tokens[ $index ][0] ] ) ) {
+				continue;
+			}
+
+			$form = $including[ $tokens[ $index ][0] ];
+			$line = $tokens[ $index ][2];
+
+			/*
+			 * Read the statement up to its semicolon. The expression is needed
+			 * whole, because which directory a literal is relative to depends on
+			 * the constants that are concatenated with it.
+			 */
+			$expression = '';
+			$literal    = null;
+
+			for ( $cursor = $index + 1; $cursor < $total; $cursor++ ) {
+				if ( ';' === $tokens[ $cursor ] ) {
+					break;
+				}
+
+				if ( ! is_array( $tokens[ $cursor ] ) ) {
+					$expression .= $tokens[ $cursor ];
+					continue;
+				}
+
+				$expression .= $tokens[ $cursor ][1];
+
+				if ( null !== $literal || T_CONSTANT_ENCAPSED_STRING !== $tokens[ $cursor ][0] ) {
+					continue;
+				}
+
+				$value = substr( $tokens[ $cursor ][1], 1, -1 );
+
+				if ( '.php' === substr( $value, -4 ) ) {
+					$literal = ltrim( $value, '/' );
+				}
+			}
+
+			if ( null === $literal ) {
+				continue;
+			}
+
+			$resolved = self::resolve_include_target( $file, $expression, $literal, $is_shipped );
+
+			if ( null === $resolved ) {
+				continue;
+			}
+
+			$includes[] = array(
+				'path'    => $resolved,
+				'file'    => $file,
+				'line'    => $line,
+				'form'    => $form,
+				'once'    => '_once' === substr( $form, -5 ),
+				'guarded' => self::has_declaration_guard( $tokens, $index ),
+			);
+		}
+
+		return $includes;
+	}
+
+	/**
+	 * Determines whether an include is guarded against redeclaring a symbol.
+	 *
+	 * A guard is a `class_exists()`, `interface_exists()` or `trait_exists()` call
+	 * whose second argument is `false`, which suppresses autoloading and so reports
+	 * only whether the symbol is already declared. Core writes the guard as
+	 * `if ( ! class_exists( 'Name', false ) ) { require ... }`, so the search walks
+	 * back over the statement's own condition and stops at the brace or semicolon
+	 * that ends whatever precedes it.
+	 *
+	 * @param array $tokens Tokens of the including file.
+	 * @param int   $index  Index of the include token.
+	 * @return bool Whether the include is preceded by such a guard.
+	 */
+	private static function has_declaration_guard( $tokens, $index ) {
+		$probes = array( 'class_exists', 'interface_exists', 'trait_exists' );
+		$found  = false;
+
+		for ( $cursor = $index - 1; $cursor >= 0; $cursor-- ) {
+			$token = $tokens[ $cursor ];
+
+			if ( is_string( $token ) ) {
+				// The end of an unrelated statement or block: no guard belongs to this include.
+				if ( ';' === $token || '}' === $token ) {
+					return false;
+				}
+
+				continue;
+			}
+
+			if ( T_STRING === $token[0] && in_array( strtolower( $token[1] ), $probes, true ) ) {
+				$found = true;
+				continue;
+			}
+
+			/*
+			 * Reaching the `if` that opens the condition ends the search. The guard has
+			 * to have been seen inside it, and its second argument has to be false, or
+			 * the probe would autoload the very name the include is there to declare.
+			 */
+			if ( T_IF === $token[0] || T_ELSEIF === $token[0] ) {
+				return $found && self::guard_suppresses_autoloading( $tokens, $cursor, $index );
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Determines whether every declaration probe in a condition suppresses autoloading.
+	 *
+	 * @param array $tokens Tokens of the including file.
+	 * @param int   $from   Index of the `if` or `elseif` token.
+	 * @param int   $to     Index of the include token that follows the condition.
+	 * @return bool Whether a probe was found and every one of them passed `false`.
+	 */
+	private static function guard_suppresses_autoloading( $tokens, $from, $to ) {
+		$probes = array( 'class_exists', 'interface_exists', 'trait_exists' );
+		$found  = false;
+
+		for ( $cursor = $from; $cursor < $to; $cursor++ ) {
+			$token = $tokens[ $cursor ];
+
+			if ( ! is_array( $token ) || T_STRING !== $token[0] || ! in_array( strtolower( $token[1] ), $probes, true ) ) {
+				continue;
+			}
+
+			$found      = true;
+			$arguments  = 0;
+			$suppresses = false;
+
+			for ( $inner = $cursor + 1; $inner < $to; $inner++ ) {
+				$argument = $tokens[ $inner ];
+
+				if ( is_string( $argument ) ) {
+					if ( ',' === $argument ) {
+						++$arguments;
+						continue;
+					}
+
+					if ( ')' === $argument ) {
+						break;
+					}
+
+					continue;
+				}
+
+				if ( 1 === $arguments
+					&& T_STRING === $argument[0]
+					&& 'false' === strtolower( $argument[1] )
+				) {
+					$suppresses = true;
+				}
+			}
+
+			if ( ! $suppresses ) {
+				return false;
+			}
+		}
+
+		return $found;
+	}
+
+	/**
+	 * Resolves the literal of an include statement to a shipped path.
+	 *
+	 * Candidates are tried in the order the statement itself implies, and the
+	 * first one that names a shipped file wins. The bare literal and the
+	 * wp-includes prefixed form are always tried last, so a relative literal is
+	 * still resolved when the statement names no constant at all.
+	 *
+	 * @param string $file       Path of the including file, relative to ABSPATH.
+	 * @param string $expression Source of the include expression.
+	 * @param string $literal    Literal path taken from the expression.
+	 * @param array  $is_shipped Lookup of the shipped paths, keyed by path.
+	 * @return string|null Path relative to ABSPATH, or null when none is shipped.
+	 */
+	private static function resolve_include_target( $file, $expression, $literal, $is_shipped ) {
+		$candidates = array();
+
+		if ( false !== strpos( $expression, 'WPINC' ) ) {
+			$candidates[] = 'wp-includes/' . $literal;
+		}
+
+		if ( false !== strpos( $expression, '__DIR__' ) ) {
+			$candidates[] = dirname( $file ) . '/' . $literal;
+		}
+
+		$candidates[] = $literal;
+		$candidates[] = 'wp-includes/' . $literal;
+
+		foreach ( $candidates as $candidate ) {
+			// A concatenation can double a separator, and dirname() returns '.' at the root.
+			$candidate = preg_replace( '#/+#', '/', $candidate );
+			$candidate = preg_replace( '#(^|/)\./#', '$1', $candidate );
+
+			if ( isset( $is_shipped[ $candidate ] ) ) {
+				return $candidate;
+			}
+		}
+
+		return null;
 	}
 }

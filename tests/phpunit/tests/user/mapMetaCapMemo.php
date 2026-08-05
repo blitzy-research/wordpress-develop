@@ -112,6 +112,120 @@ class Tests_User_MapMetaCapMemo extends WP_UnitTestCase {
 	);
 
 	/**
+	 * Every filter a memoizable mapping reads, in the order the implementation watches them.
+	 *
+	 * A callback on any of these may answer differently for identical arguments, or
+	 * differently the next time it is asked, and none of them fires an action when it is
+	 * registered or removed. No mapping is memoized for as long as one carries a
+	 * callback.
+	 *
+	 * Kept as a literal list rather than read back out of the implementation, so that
+	 * dropping a name from the watch list fails a test instead of shrinking the
+	 * expectation along with it.
+	 *
+	 * @var string[]
+	 */
+	const POLICY_FILTERS = array(
+		'map_meta_cap',
+		'pre_option',
+		'alloptions',
+		'pre_wp_load_alloptions',
+		'pre_cache_alloptions',
+		'pre_option_page_for_posts',
+		'default_option_page_for_posts',
+		'option_page_for_posts',
+		'pre_option_page_on_front',
+		'default_option_page_on_front',
+		'option_page_on_front',
+		'pre_option_wp_page_for_privacy_policy',
+		'default_option_wp_page_for_privacy_policy',
+		'option_wp_page_for_privacy_policy',
+		'get_post_metadata',
+		'default_post_metadata',
+		'update_post_metadata_cache',
+		'get_post_status',
+		'get_comment',
+	);
+
+	/**
+	 * Every capability whose mapping is never memoized, whatever it is asked about.
+	 *
+	 * Each of these reads at least one input no static list of hook names can describe:
+	 * the capabilities the user themselves holds, the answer to
+	 * `wp_is_file_mod_allowed()`, a dynamically named taxonomy filter or option, or the
+	 * `link_manager_enabled` option whose default core supplies unconditionally.
+	 *
+	 * Kept as a literal list for the same reason as self::POLICY_FILTERS: a capability
+	 * quietly becoming memoizable is exactly the regression worth failing on.
+	 *
+	 * @var string[]
+	 */
+	const UNMEMOIZABLE_CAPS = array(
+		'remove_user',
+		'edit_user',
+		'edit_users',
+		'delete_user',
+		'delete_users',
+		'create_users',
+		'unfiltered_upload',
+		'edit_css',
+		'unfiltered_html',
+		'update_php',
+		'update_https',
+		'activate_plugins',
+		'deactivate_plugins',
+		'activate_plugin',
+		'deactivate_plugin',
+		'edit_files',
+		'edit_plugins',
+		'edit_themes',
+		'update_plugins',
+		'delete_plugins',
+		'install_plugins',
+		'upload_plugins',
+		'update_themes',
+		'delete_themes',
+		'install_themes',
+		'upload_themes',
+		'update_core',
+		'install_languages',
+		'update_languages',
+		'edit_term',
+		'delete_term',
+		'assign_term',
+		'manage_links',
+		'create_app_password',
+		'list_app_passwords',
+		'read_app_password',
+		'edit_app_password',
+		'delete_app_passwords',
+		'delete_app_password',
+	);
+
+	/**
+	 * Hooks that look like policy filters but are deliberately not watched.
+	 *
+	 * Each of these is read only by a mapping in self::UNMEMOIZABLE_CAPS, which is
+	 * declined by name, so watching them here would decline mappings no callback on them
+	 * can reach. Two of them - `user_has_cap` and
+	 * `default_option_link_manager_enabled` - are also registered unconditionally by
+	 * core itself, so a callback on them says nothing about third party involvement and
+	 * watching them would decline every mapping on every request.
+	 *
+	 * @var string[]
+	 */
+	const UNWATCHED_HOOKS = array(
+		'user_has_cap',
+		'site_admins',
+		'file_mod_allowed',
+		'pre_option_link_manager_enabled',
+		'default_option_link_manager_enabled',
+		'option_link_manager_enabled',
+		'pre_site_option_add_new_users',
+		'site_option_menu_items',
+	);
+
+	/**
 	 * Administrator user ID.
 	 *
 	 * @var int
@@ -306,6 +420,29 @@ class Tests_User_MapMetaCapMemo extends WP_UnitTestCase {
 	}
 
 	/**
+	 * Asserts that the answer read warm is the answer the mapping computes from scratch.
+	 *
+	 * Read warm first and cold second, and in that order only. A warm read is the one
+	 * that can be answered out of the memo, so it is the one that can be stale; asking
+	 * cold first would discard the memo and repopulate it with the current answer, after
+	 * which the warm read would agree with it however stale the memo had been.
+	 *
+	 * @param string $cap     Capability being checked.
+	 * @param int    $user_id User ID.
+	 * @param array  $args    Further parameters passed to `map_meta_cap()`.
+	 * @param string $message Assertion message.
+	 * @return string[] The answer, sorted, as computed from scratch.
+	 */
+	private function assert_warm_matches_cold( $cap, $user_id, $args, $message ) {
+		$warm = $this->warm( $cap, $user_id, ...$args );
+		$cold = $this->cold( $cap, $user_id, ...$args );
+
+		$this->assertSame( $cold, $warm, $message );
+
+		return $cold;
+	}
+
+	/**
 	 * Starts counting how many of the memo's invalidation actions fire from here on.
 	 *
 	 * Used to establish that a mutation really does go unannounced, which is what makes
@@ -410,6 +547,28 @@ class Tests_User_MapMetaCapMemo extends WP_UnitTestCase {
 		++$this->filter_calls;
 
 		return array( 'mmcm_call_' . $this->filter_calls );
+	}
+
+	/**
+	 * Returns a filtered value unchanged, as a passive third party callback would.
+	 *
+	 * Registered on a watched filter to prove that the memo stands down while a callback
+	 * is present, without changing what the filter answers. Every hook in
+	 * self::POLICY_FILTERS and self::UNWATCHED_HOOKS passes the value it is filtering as
+	 * its first argument, so one callback is safe on all of them: whatever else runs
+	 * between the `add_filter()` and the `remove_filter()` sees exactly the value it
+	 * would have seen anyway.
+	 *
+	 * That is the point of the test rather than an accident of it. The memo may not
+	 * assume a registered callback is inert, because it has no way to find out, so a
+	 * callback that changes nothing has to suppress the memo just as firmly as one that
+	 * changes everything.
+	 *
+	 * @param mixed $value Value being filtered.
+	 * @return mixed The value, unchanged.
+	 */
+	public function pass_filtered_value_through( $value ) {
+		return $value;
 	}
 
 	/**
@@ -762,6 +921,12 @@ class Tests_User_MapMetaCapMemo extends WP_UnitTestCase {
 	 * when it changes. Replacing its members without changing how many there are has to
 	 * change the key, or a mapping that read `is_super_admin()` would outlive it.
 	 *
+	 * Every capability whose mapping reads `is_super_admin()` is declined outright by
+	 * `_wp_map_meta_cap_is_memoizable_cap()`, so this component of the key is defensive
+	 * rather than load bearing today, and a memoizable capability is used to exercise it.
+	 * It is asserted all the same: the component is what would keep a future mapping that
+	 * did read the list from being memoized across a change to it.
+	 *
 	 * @global array|null $super_admins Super admin logins, when they are defined.
 	 */
 	public function test_the_key_carries_the_super_admin_members() {
@@ -770,13 +935,13 @@ class Tests_User_MapMetaCapMemo extends WP_UnitTestCase {
 		try {
 			$GLOBALS['super_admins'] = array( 'mmcm_first_admin', 'mmcm_second_admin' );
 
-			$baseline = $this->assert_memoizable( 'edit_user', self::$editor_id, array( self::$administrator_id ) );
+			$baseline = $this->assert_memoizable( 'edit_post', self::$editor_id, array( self::$post_id ) );
 
 			$GLOBALS['super_admins'] = array( 'mmcm_first_admin', 'mmcm_other_admin' );
 
 			$this->assertNotSame(
 				$baseline,
-				_wp_map_meta_cap_memo_key( 'edit_user', self::$editor_id, array( self::$administrator_id ) ),
+				_wp_map_meta_cap_memo_key( 'edit_post', self::$editor_id, array( self::$post_id ) ),
 				'Substituting a super admin for another should change the memo key.'
 			);
 
@@ -784,7 +949,7 @@ class Tests_User_MapMetaCapMemo extends WP_UnitTestCase {
 
 			$this->assertSame(
 				$baseline,
-				_wp_map_meta_cap_memo_key( 'edit_user', self::$editor_id, array( self::$administrator_id ) ),
+				_wp_map_meta_cap_memo_key( 'edit_post', self::$editor_id, array( self::$post_id ) ),
 				'Restoring the list should restore the memo key.'
 			);
 
@@ -792,7 +957,7 @@ class Tests_User_MapMetaCapMemo extends WP_UnitTestCase {
 
 			$this->assertNotSame(
 				$baseline,
-				_wp_map_meta_cap_memo_key( 'edit_user', self::$editor_id, array( self::$administrator_id ) ),
+				_wp_map_meta_cap_memo_key( 'edit_post', self::$editor_id, array( self::$post_id ) ),
 				'One login containing the separator should not look like two logins.'
 			);
 
@@ -800,7 +965,7 @@ class Tests_User_MapMetaCapMemo extends WP_UnitTestCase {
 
 			$this->assertSame(
 				'',
-				_wp_map_meta_cap_memo_key( 'edit_user', self::$editor_id, array( self::$administrator_id ) ),
+				_wp_map_meta_cap_memo_key( 'edit_post', self::$editor_id, array( self::$post_id ) ),
 				'A super admin entry that is not scalar should decline the memo.'
 			);
 		} finally {
@@ -1374,6 +1539,88 @@ class Tests_User_MapMetaCapMemo extends WP_UnitTestCase {
 	}
 
 	/**
+	 * A dynamic user capability policy change is visible to the next user edit check.
+	 *
+	 * Multisite maps `edit_user` through a nested `user_can()` check for
+	 * `manage_network_users`. The `user_has_cap` filter can change that answer without
+	 * writing user metadata or firing any memo invalidation action, so these mappings
+	 * must bypass the request-scoped memo entirely.
+	 *
+	 * @group ms-required
+	 */
+	public function test_multisite_edit_user_rechecks_user_has_cap_without_invalidation() {
+		$user_id   = self::factory()->user->create( array( 'role' => 'administrator' ) );
+		$target_id = self::factory()->user->create( array( 'role' => 'subscriber' ) );
+		$user      = new WP_User( $user_id );
+
+		$user->add_cap( 'manage_network_users' );
+
+		$deny_manage_network_users = false;
+		$filter                    = static function ( $allcaps, $required_caps, $args ) use ( &$deny_manage_network_users ) {
+			if ( $deny_manage_network_users && isset( $args[0] ) && 'manage_network_users' === $args[0] ) {
+				unset( $allcaps['manage_network_users'] );
+			}
+
+			return $allcaps;
+		};
+
+		$this->watch_invalidation_hooks(
+			array_merge(
+				self::INVALIDATION_HOOKS,
+				self::USER_META_INVALIDATION_HOOKS
+			)
+		);
+
+		add_filter( 'user_has_cap', $filter, 10, 3 );
+
+		try {
+			$this->assertSame(
+				'',
+				_wp_map_meta_cap_memo_key( 'edit_user', $user_id, array( $target_id ) ),
+				'Multisite edit_user mappings should never be memoized.'
+			);
+			$this->assertSame(
+				'',
+				_wp_map_meta_cap_memo_key( 'edit_users', $user_id, array( $target_id ) ),
+				'Multisite edit_users mappings should never be memoized when an object argument is supplied.'
+			);
+			$this->assertSame(
+				array( 'edit_users' ),
+				map_meta_cap( 'edit_user', $user_id, $target_id ),
+				'The mapping should allow the user while the dynamic policy grants manage_network_users.'
+			);
+			$this->assertTrue(
+				user_can( $user_id, 'edit_user', $target_id ),
+				'The end-to-end capability check should initially be allowed.'
+			);
+
+			$deny_manage_network_users = true;
+
+			$this->assertSame(
+				0,
+				$this->invalidation_fires,
+				'Changing only the user_has_cap policy should not fire a memo invalidation action.'
+			);
+			$this->assertSame(
+				array( 'do_not_allow' ),
+				map_meta_cap( 'edit_user', $user_id, $target_id ),
+				'The next mapping should immediately observe the dynamic policy denial.'
+			);
+			$this->assertFalse(
+				user_can( $user_id, 'edit_user', $target_id ),
+				'The next end-to-end capability check should immediately be denied.'
+			);
+			$this->assertSame(
+				0,
+				$this->invalidation_fires,
+				'No metadata write or other invalidation should be needed to observe the policy change.'
+			);
+		} finally {
+			remove_filter( 'user_has_cap', $filter, 10 );
+		}
+	}
+
+	/**
 	 * Granting a capability to a user is visible to the very next check.
 	 *
 	 * The opposite direction of the same invalidation, so that a memo that only happened
@@ -1805,10 +2052,11 @@ class Tests_User_MapMetaCapMemo extends WP_UnitTestCase {
 	/**
 	 * The self-removal mapping is never memoized, whichever user is asked about.
 	 *
-	 * `remove_user` is the one mapping whose answer is derived from the capabilities a
-	 * single user holds, and `WP_User::add_cap()`, `WP_User::remove_cap()` and
-	 * `WP_User::remove_all_caps()` change those capabilities without announcing which
-	 * user they changed. Rather than guess, the memo declines the whole capability.
+	 * `remove_user` derives its answer from the capabilities a single user holds, and
+	 * `WP_User::add_cap()`, `WP_User::remove_cap()` and `WP_User::remove_all_caps()`
+	 * change those capabilities without announcing which user they changed. Rather than
+	 * guess, the memo declines the whole capability, and every other mapping that reads
+	 * those same capabilities with it.
 	 */
 	public function test_the_self_removal_capability_is_never_memoized() {
 		$this->assertSame(
@@ -1822,9 +2070,21 @@ class Tests_User_MapMetaCapMemo extends WP_UnitTestCase {
 			'A removal check about somebody else should not be memoizable either, because one mapping serves both.'
 		);
 
-		// The decline is specific to this capability, not to user capabilities generally.
+		/*
+		 * Every mapping that reads the user's own capabilities is declined for the same
+		 * reason, so 'delete_user' is refused alongside it rather than memoized.
+		 */
+		$this->assertSame(
+			'',
+			_wp_map_meta_cap_memo_key( 'delete_user', self::$administrator_id, array( self::$subscriber_id ) ),
+			'A deletion check reads the same capabilities and should not be memoizable.'
+		);
+
+		/*
+		 * The decline follows what a mapping reads, not the word "user" in its name.
+		 * Both of these are plain rewrites that read nothing, so both stay memoizable.
+		 */
 		$this->assert_memoizable( 'promote_user', self::$administrator_id, array( self::$subscriber_id ) );
-		$this->assert_memoizable( 'delete_user', self::$administrator_id, array( self::$subscriber_id ) );
 		$this->assert_memoizable( 'remove_users', self::$administrator_id, array( self::$subscriber_id ) );
 	}
 
@@ -2544,6 +2804,425 @@ class Tests_User_MapMetaCapMemo extends WP_UnitTestCase {
 				$this->count_incorrect_usage_reports( $mapping, 3 ),
 				sprintf( 'Memoizing a capability checked against %s should not start a report.', $shape )
 			);
+		}
+	}
+
+	/**
+	 * No mapping is memoized while a callback sits on a filter that mapping reads.
+	 *
+	 * This is the transitive half of the memo's filter safety, and the half that is easy
+	 * to miss. A callback on `map_meta_cap` is the obvious way to change what a mapping
+	 * answers, but it is not the only one: the mappings the memo is allowed to keep read
+	 * post, post status, post meta, comment and option state, and every one of those
+	 * reads passes through a filter of its own. A callback on any of them changes the
+	 * answer just as completely, and none of them fires an action when it is registered,
+	 * so the memo cannot be discarded in response to one appearing.
+	 *
+	 * Each hook is proven three ways: the mapping stops being memoizable while the
+	 * callback is registered, the memoized answer stops being returned, and - because the
+	 * sentinel planted beforehand is still readable afterwards - the answer computed
+	 * while the callback was registered was never stored. The last of those is what
+	 * covers the guard on the write, not just the guard on the read.
+	 */
+	public function test_no_mapping_is_memoized_while_a_policy_filter_is_registered() {
+		foreach ( self::POLICY_FILTERS as $policy_filter ) {
+			$key = $this->assert_memoizable( 'edit_post', self::$subscriber_id, array( self::$post_id ) );
+			$this->plant_sentinel( $key );
+
+			add_filter( $policy_filter, array( $this, 'pass_filtered_value_through' ) );
+
+			$this->assertSame(
+				'',
+				_wp_map_meta_cap_memo_key( 'edit_post', self::$subscriber_id, array( self::$post_id ) ),
+				sprintf( 'A callback on %s should make the mapping unmemoizable.', $policy_filter )
+			);
+			$this->assertNotContains(
+				self::SENTINEL_CAP,
+				map_meta_cap( 'edit_post', self::$subscriber_id, self::$post_id ),
+				sprintf( 'A callback on %s should stop the memoized answer being returned.', $policy_filter )
+			);
+
+			remove_filter( $policy_filter, array( $this, 'pass_filtered_value_through' ) );
+
+			$this->assertSame(
+				array( self::SENTINEL_CAP ),
+				_wp_map_meta_cap_memo( $key ),
+				sprintf( 'The mapping computed while %s was registered should not have been stored.', $policy_filter )
+			);
+			$this->assertSame(
+				$key,
+				_wp_map_meta_cap_memo_key( 'edit_post', self::$subscriber_id, array( self::$post_id ) ),
+				sprintf( 'Removing the callback on %s should make the mapping memoizable again.', $policy_filter )
+			);
+
+			_wp_reset_map_meta_cap_memo();
+		}
+	}
+
+	/**
+	 * The watch list reports the filters it names, and nothing beyond them.
+	 *
+	 * The first half is the security property. The second half is what keeps the memo
+	 * worth having: watching a hook core itself occupies on every request, or one that
+	 * only an unmemoizable mapping reads, would stand the memo down permanently or
+	 * needlessly. `default_option_link_manager_enabled` is the sharpest case - core
+	 * registers `__return_true` on it unconditionally in `default-filters.php` - and it
+	 * is the reason `manage_links` is declined by capability name instead.
+	 */
+	public function test_only_the_watched_filters_make_a_mapping_unmemoizable() {
+		$this->assertFalse(
+			_wp_map_meta_cap_policy_filter_registered(),
+			'No watched filter should carry a callback before a test registers one.'
+		);
+
+		foreach ( self::POLICY_FILTERS as $policy_filter ) {
+			add_filter( $policy_filter, array( $this, 'pass_filtered_value_through' ) );
+
+			$this->assertTrue(
+				_wp_map_meta_cap_policy_filter_registered(),
+				sprintf( 'A callback on the watched filter %s should be reported.', $policy_filter )
+			);
+
+			remove_filter( $policy_filter, array( $this, 'pass_filtered_value_through' ) );
+
+			$this->assertFalse(
+				_wp_map_meta_cap_policy_filter_registered(),
+				sprintf( 'Removing the callback on %s should stop it being reported.', $policy_filter )
+			);
+		}
+
+		foreach ( self::UNWATCHED_HOOKS as $hook ) {
+			add_filter( $hook, array( $this, 'pass_filtered_value_through' ) );
+
+			$this->assertFalse(
+				_wp_map_meta_cap_policy_filter_registered(),
+				sprintf(
+					'%s is read only by a mapping that is never memoized, so a callback on it should not stand down every other mapping.',
+					$hook
+				)
+			);
+
+			remove_filter( $hook, array( $this, 'pass_filtered_value_through' ) );
+		}
+	}
+
+	/**
+	 * A watched filter cannot leave a stale answer behind it, in either direction.
+	 *
+	 * Deleting the page assigned to `page_on_front` requires `manage_options` instead of
+	 * the capability the page's own post type would ask for. The guard reads an option,
+	 * and an option read can be answered by a filter without the option, the page or the
+	 * user changing at all - so a memo that ignored the filter would answer from before
+	 * it appeared.
+	 *
+	 * Both directions matter and both are asserted. Carrying the pre-filter answer
+	 * forward grants a deletion the policy now forbids, which is the security failure.
+	 * Carrying the filtered answer forward past the removal denies a deletion the policy
+	 * now allows, which is the correctness failure. Every read after the first is taken
+	 * warm on purpose: asking cold would discard the memo and repopulate it with the
+	 * current answer, which would pass however stale the memo had been.
+	 */
+	public function test_a_watched_filter_cannot_leave_a_stale_answer_behind() {
+		$page_id = self::factory()->post->create(
+			array(
+				'post_type'   => 'page',
+				'post_status' => 'publish',
+				'post_author' => self::$author_id,
+			)
+		);
+
+		$unguarded = $this->cold( 'delete_post', self::$editor_id, $page_id );
+
+		$this->assertNotContains(
+			'manage_options',
+			$unguarded,
+			'A page that is not the front page should be deleted under its own post type capability.'
+		);
+		$this->assertTrue(
+			user_can( self::$editor_id, 'delete_post', $page_id ),
+			'An editor should be able to delete an ordinary published page.'
+		);
+
+		$front_page = static function () use ( $page_id ) {
+			return $page_id;
+		};
+
+		add_filter( 'pre_option_page_on_front', $front_page );
+
+		$this->assertSame(
+			array( 'manage_options' ),
+			$this->warm( 'delete_post', self::$editor_id, $page_id ),
+			'A filter that makes the page the front page should be obeyed, not answered from before it was registered.'
+		);
+		$this->assertFalse(
+			user_can( self::$editor_id, 'delete_post', $page_id ),
+			'An editor holds no manage_options, so the filtered option should deny the deletion.'
+		);
+
+		remove_filter( 'pre_option_page_on_front', $front_page );
+
+		$this->assertSame(
+			$unguarded,
+			$this->warm( 'delete_post', self::$editor_id, $page_id ),
+			'Removing the filter should restore the unguarded answer, rather than leaving the denial behind.'
+		);
+		$this->assertTrue(
+			user_can( self::$editor_id, 'delete_post', $page_id ),
+			'The editor should be able to delete the page again once the filter is gone.'
+		);
+	}
+
+	/**
+	 * A term deletion check follows the default term option through a filter.
+	 *
+	 * This is the reported reproduction, kept in the shape it was reported in: a
+	 * `pre_option_default_category` callback either side of `current_user_can(
+	 * 'delete_term' )`. Deleting a taxonomy's default term is refused outright, and the
+	 * check for it reads `default_{$taxonomy}` and `default_term_{$taxonomy}` - option
+	 * names that are only known once the taxonomy is registered, which is why no static
+	 * watch list can cover them and why the term capabilities are declined by name
+	 * instead.
+	 *
+	 * The answer is therefore recomputed on every ask, and has to track the filter both
+	 * as it appears and as it goes away.
+	 */
+	public function test_a_term_deletion_check_follows_the_default_term_option() {
+		$term_id = self::factory()->term->create( array( 'taxonomy' => 'category' ) );
+
+		$this->assertSame(
+			'',
+			_wp_map_meta_cap_memo_key( 'delete_term', self::$administrator_id, array( $term_id ) ),
+			'A term capability reads dynamically named filters and options, so it should never be memoized.'
+		);
+
+		wp_set_current_user( self::$administrator_id );
+		_wp_reset_map_meta_cap_memo();
+
+		$this->assertTrue(
+			current_user_can( 'delete_term', $term_id ),
+			'An administrator should be able to delete an ordinary category.'
+		);
+
+		$default_category = static function () use ( $term_id ) {
+			return $term_id;
+		};
+
+		add_filter( 'pre_option_default_category', $default_category );
+
+		$this->assertFalse(
+			current_user_can( 'delete_term', $term_id ),
+			'Once the filter makes the term the default category, deleting it should be refused.'
+		);
+
+		remove_filter( 'pre_option_default_category', $default_category );
+
+		$this->assertTrue(
+			current_user_can( 'delete_term', $term_id ),
+			'Removing the filter should restore the answer, rather than leaving the refusal behind.'
+		);
+	}
+
+	/**
+	 * Every mapping that reads state no watch list can describe is declined by name.
+	 *
+	 * The watch list can only name hooks that are known in advance. A mapping that reads
+	 * the capabilities the user themselves holds, the answer to
+	 * `wp_is_file_mod_allowed()`, or a hook whose name contains a taxonomy that is only
+	 * registered at runtime, is outside what any such list can cover - so those mappings
+	 * are refused the memo outright.
+	 *
+	 * The control half of the test is as important as the list half. A decline list that
+	 * quietly grew until nothing was memoizable would satisfy every assertion about
+	 * safety while delivering none of the value, so a representative mapping from each
+	 * memoizable family is asserted to still qualify.
+	 */
+	public function test_every_mapping_that_reads_unwatchable_state_is_declined() {
+		$this->assertSame(
+			self::UNMEMOIZABLE_CAPS,
+			array_values( array_unique( self::UNMEMOIZABLE_CAPS ) ),
+			'The decline list should name each capability exactly once.'
+		);
+
+		foreach ( self::UNMEMOIZABLE_CAPS as $cap ) {
+			$this->assertFalse(
+				_wp_map_meta_cap_is_memoizable_cap( $cap ),
+				sprintf( 'The %s mapping reads state no watch list can describe, so it should be declined.', $cap )
+			);
+			$this->assertSame(
+				'',
+				_wp_map_meta_cap_memo_key( $cap, self::$administrator_id, array( self::$post_id ) ),
+				sprintf( 'A %s call should never produce a memo key, whatever it is asked about.', $cap )
+			);
+		}
+
+		$memoizable = array(
+			'edit_post',
+			'delete_post',
+			'read_post',
+			'publish_post',
+			'edit_comment',
+			'promote_user',
+			'remove_users',
+			'edit_posts',
+			'customize',
+			'manage_privacy_options',
+			'edit_block_binding',
+			'resume_plugin',
+		);
+
+		foreach ( $memoizable as $cap ) {
+			$this->assertTrue(
+				_wp_map_meta_cap_is_memoizable_cap( $cap ),
+				sprintf( 'The %s mapping reads only watched state, so it should stay memoizable.', $cap )
+			);
+			$this->assertNotSame(
+				'',
+				_wp_map_meta_cap_memo_key( $cap, self::$administrator_id, array( self::$post_id ) ),
+				sprintf( 'A %s call with an object to check against should be memoizable.', $cap )
+			);
+		}
+	}
+
+	/**
+	 * A callback registered part way through a mapping leaves nothing memoized.
+	 *
+	 * The key is built before the mapping runs and the answer is stored after it
+	 * finishes, so a callback that appears in between would otherwise have its policy
+	 * ignored on the way in and preserved on the way out. The store is therefore guarded
+	 * a second time, against the state as it stands once the mapping is complete.
+	 *
+	 * Here the mapping for `read_post` reads the post's status, a callback on that read
+	 * registers a second watched filter while the mapping is still running, and neither
+	 * key ends up carrying an answer. The `$registrations` count is asserted so that a
+	 * mapping which stopped reading the status - and so never reached the callback -
+	 * could not pass this test by doing nothing.
+	 */
+	public function test_a_callback_registered_during_a_mapping_leaves_nothing_memoized() {
+		$private_post_id = self::factory()->post->create(
+			array(
+				'post_type'   => 'post',
+				'post_status' => 'private',
+				'post_author' => self::$author_id,
+			)
+		);
+
+		$front_page     = '__return_zero';
+		$registrations  = 0;
+		$register_while = static function ( $post_status ) use ( $front_page, &$registrations ) {
+			if ( ! has_filter( 'option_page_on_front', $front_page ) ) {
+				add_filter( 'option_page_on_front', $front_page );
+				++$registrations;
+			}
+
+			return $post_status;
+		};
+
+		$read_key   = $this->assert_memoizable( 'read_post', self::$subscriber_id, array( $private_post_id ) );
+		$delete_key = $this->assert_memoizable( 'delete_post', self::$subscriber_id, array( $private_post_id ) );
+
+		_wp_reset_map_meta_cap_memo();
+		add_filter( 'get_post_status', $register_while );
+
+		try {
+			$caps = map_meta_cap( 'read_post', self::$subscriber_id, $private_post_id );
+		} finally {
+			remove_filter( 'get_post_status', $register_while );
+			remove_filter( 'option_page_on_front', $front_page );
+		}
+
+		$this->assertSame( 1, $registrations, 'The mapping should have read the post status and reached the callback.' );
+		$this->assertNotEmpty( $caps, 'The mapping should still answer while callbacks are being registered around it.' );
+		$this->assertNull(
+			_wp_map_meta_cap_memo( $read_key ),
+			'An answer computed while a watched filter was appearing should not have been stored.'
+		);
+		$this->assertNull(
+			_wp_map_meta_cap_memo( $delete_key ),
+			'No other mapping should have been stored while a watched filter was appearing either.'
+		);
+
+		$this->assertSame(
+			$read_key,
+			_wp_map_meta_cap_memo_key( 'read_post', self::$subscriber_id, array( $private_post_id ) ),
+			'Once both callbacks are gone the mapping should be memoizable again.'
+		);
+		$this->assertSame(
+			$caps,
+			map_meta_cap( 'read_post', self::$subscriber_id, $private_post_id ),
+			'The recomputed answer should match the one the mapping gave while it was unmemoizable.'
+		);
+	}
+
+	/**
+	 * A policy input the watch list cannot name leaves no stale answer behind.
+	 *
+	 * `file_mod_allowed` and the network option filters are read by mappings whose
+	 * answers also depend on the capabilities the user themselves holds, so a watch list
+	 * cannot cover them: `user_has_cap` carries three core callbacks on every request and
+	 * so says nothing about whether a third party is involved. Those mappings are
+	 * therefore refused the memo by capability name instead, which is the stronger of the
+	 * two guarantees - there is no window in which one of them is memoized at all.
+	 *
+	 * Both halves are asserted for each. The mapping is declined even when it is handed
+	 * an object to check against, which is the only way it could otherwise reach the
+	 * memo, and the answer is recomputed as the callback appears and again as it goes
+	 * away. The second half holds on any installation: where the filtered input is only
+	 * consulted on Multisite, the answer is unchanged rather than stale, and a memo that
+	 * had kept it would have been caught by the same comparison.
+	 */
+	public function test_a_policy_input_the_watch_list_cannot_name_leaves_no_stale_answer() {
+		$scenarios = array(
+			'file modification permission'     => array( 'update_plugins', 'file_mod_allowed', '__return_false' ),
+			'the network menu_items option'    => array( 'activate_plugin', 'pre_site_option_menu_items', '__return_empty_array' ),
+			'the network add_new_users option' => array( 'create_users', 'pre_site_option_add_new_users', '__return_zero' ),
+			'the capabilities the user holds'  => array( 'delete_user', 'user_has_cap', '__return_empty_array' ),
+		);
+
+		foreach ( $scenarios as $label => $scenario ) {
+			list( $cap, $hook, $callback ) = $scenario;
+
+			$this->assertFalse(
+				_wp_map_meta_cap_is_memoizable_cap( $cap ),
+				sprintf( 'The %s mapping reads %s, which no watch list can name, so it should be declined.', $cap, $label )
+			);
+			$this->assertSame(
+				'',
+				_wp_map_meta_cap_memo_key( $cap, self::$administrator_id, array( self::$editor_id ) ),
+				sprintf( 'A %s call should not be memoized even when it is handed an object to check against.', $cap )
+			);
+
+			// Seed whatever the memo is willing to keep for this mapping, which should be nothing.
+			$this->cold( $cap, self::$administrator_id, self::$editor_id );
+
+			add_filter( $hook, $callback );
+
+			try {
+				$this->assert_warm_matches_cold(
+					$cap,
+					self::$administrator_id,
+					array( self::$editor_id ),
+					sprintf(
+						'A %s check should obey the callback on %s, not answer from before it was registered.',
+						$cap,
+						$hook
+					)
+				);
+			} finally {
+				remove_filter( $hook, $callback );
+			}
+
+			$this->assert_warm_matches_cold(
+				$cap,
+				self::$administrator_id,
+				array( self::$editor_id ),
+				sprintf(
+					'A %s check should be recomputed once the callback on %s is gone, not left holding the filtered answer.',
+					$cap,
+					$hook
+				)
+			);
+
+			_wp_reset_map_meta_cap_memo();
 		}
 	}
 }
