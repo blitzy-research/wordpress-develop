@@ -37,6 +37,13 @@ const countMetrics = new Set( [
 	'wpBootstrapValid',
 ] );
 
+/*
+ * Metrics whose value identifies the environment that produced a measurement instead of
+ * quantifying it. They are reported so a comparison can be read in context — a different
+ * PHP build, a different worker process — but they are labels, not amounts.
+ */
+const identifierMetrics = new Set( [ 'wpPhpVersionId', 'wpProcessId' ] );
+
 /**
  * Parse test files into JSON objects.
  *
@@ -176,6 +183,22 @@ function formatValue( metric, value ) {
 }
 
 /**
+ * Determines whether the difference between two values of a metric is meaningful.
+ *
+ * Flags and environment identifiers belong in the comparison because they qualify every
+ * other number in their row — an object cache that appeared, an OPcache that was switched
+ * off, a different PHP build — but they are not quantities. Subtracting, averaging or
+ * deviating them is arithmetic on labels, which renders as 'PHP 0.0.0' or 'PID -4' rather
+ * than as information, so their difference columns are left empty instead.
+ *
+ * @param {string} metric Metric.
+ * @return {boolean} Whether a numeric difference between two values of the metric is meaningful.
+ */
+function isComparableMetric( metric ) {
+	return ! booleanMetrics.has( metric ) && ! identifierMetrics.has( metric );
+}
+
+/**
  * Calculates deterministic raw and gzip-compressed JavaScript response sizes.
  *
  * HTTP servers and browsers can negotiate different transfer encodings, so the
@@ -264,6 +287,7 @@ module.exports = {
 	camelCaseDashes,
 	formatAsMarkdownTable,
 	formatValue,
+	isComparableMetric,
 	getJavaScriptResponseByteSizes,
 	linkToSha,
 	standardDeviation,

@@ -13,6 +13,7 @@ import {
 	camelCaseDashes,
 	formatValue,
 	getJavaScriptResponseByteSizes,
+	isComparableMetric,
 	median,
 } from '../utils';
 
@@ -44,6 +45,21 @@ const attachingSpecs = [ 'admin', 'home', 'single-post' ].map( ( name ) => [
 	`${ name }.test.js`,
 	readFileSync( join( __dirname, `${ name }.test.js` ), 'utf8' ),
 ] );
+
+/**
+ * Source of the reporter that renders the before/after comparison table.
+ *
+ * Which columns a metric may fill is a property of the reporter rather than of any single
+ * value, and the reporter cannot be called from a test: it reads the run artifacts, prints a
+ * table and writes its own summary files. Reading its source is what keeps the exclusion
+ * derived from the shared metric vocabulary instead of drifting back into a list of metric
+ * names, which is how the flag and identifier metrics came to report a difference of
+ * 'PHP 0.0.0' and 'PID -4'.
+ */
+const reporterSource = readFileSync(
+	join( __dirname, '..', 'compare-results.js' ),
+	'utf8'
+);
 
 /**
  * How every reported metric is expected to appear in the results table.
@@ -253,6 +269,60 @@ test.describe( 'Performance report utilities', () => {
 			expect( formatValue( 'wpOpcacheEnabled', null ) ).toBe( 'N/A' );
 			expect( formatValue( 'wpPhpVersionId', null ) ).toBe( 'N/A' );
 			expect( formatValue( 'adminJsGzipped', null ) ).toBe( 'N/A' );
+		} );
+	} );
+
+	test.describe( 'isComparableMetric()', () => {
+		test( 'refuses to compare flags and environment identifiers', () => {
+			/*
+			 * Every one of these formats into a label. Differencing them produced the cells
+			 * the classification exists to prevent: 'no' for a flag that never changed,
+			 * 'PHP 0.0.0' for two identical PHP builds, and 'PID -4' / '-21.05 %' for two
+			 * unrelated worker processes.
+			 */
+			for ( const metric of [
+				'wpExtObjCache',
+				'wpOpcacheEnabled',
+				'wpOpcacheJit',
+				'wpPhpVersionId',
+				'wpProcessId',
+			] ) {
+				expect( isComparableMetric( metric ), metric ).toBe( false );
+			}
+		} );
+
+		test( 'compares every metric that carries a quantity', () => {
+			const labelUnits = [ 'flag', 'version', 'process' ];
+
+			for ( const [ metric, unit ] of Object.entries( reportedAs ) ) {
+				expect( isComparableMetric( metric ), metric ).toBe(
+					! labelUnits.includes( unit )
+				);
+			}
+
+			// The metrics the specs measure in the browser are quantities as well.
+			for ( const metric of [
+				'timeToFirstByte',
+				'domContentLoaded',
+				'largestContentfulPaint',
+				'lcpMinusTtfb',
+				'adminJsRaw',
+				'adminJsGzipped',
+			] ) {
+				expect( isComparableMetric( metric ), metric ).toBe( true );
+			}
+		} );
+
+		test( 'the reporter derives its difference columns from this classification', () => {
+			expect(
+				reporterSource,
+				'compare-results.js should ask whether the metric is comparable'
+			).toMatch( /isComparableMetric\(\s*metric\s*\)/ );
+
+			expect(
+				reporterSource,
+				'the difference columns must not be excluded one metric name at a time'
+			).not.toMatch( /metric\s*!==\s*'/ );
 		} );
 	} );
 

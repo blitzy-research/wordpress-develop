@@ -56,6 +56,12 @@
  *   core must not start claiming ownership of names that belong to them.
  * - Generated or externally synchronised trees. Their contents are rewritten by
  *   tooling, so a class map entry pointing into them would go stale silently.
+ *   `blocks`, `build` and `icons` are all written by `tools/gutenberg/copy.js`,
+ *   which is also why the map has to be listed here rather than inferred from
+ *   what happens to be in the tree: whether the map depends on synchronised
+ *   state is what decides whether it regenerates identically in a fresh clone
+ *   and in a fully built one, and the workflows compare those with
+ *   `git diff --exit-code`.
  * - Trees that hold no PHP class at all.
  *
  * @return string[] Directory names relative to `wp-includes/`.
@@ -75,6 +81,7 @@ function wp_autoload_classmap_excluded_directories() {
 		// Generated or externally synchronised trees.
 		'blocks',
 		'build',
+		'icons',
 
 		// Trees that hold no PHP class.
 		'assets',
@@ -447,7 +454,20 @@ function wp_autoload_classmap_inspect_file( $file ) {
 		'has_side_effects' => false,
 	);
 
-	$tokens = @token_get_all( (string) file_get_contents( $file ) );
+	/*
+	 * A file that cannot be read cannot be judged. Treating the failure as "declares
+	 * nothing" would drop a mappable class from the map without saying so, and the
+	 * loss would only appear later as a name the autoloader cannot resolve, so the
+	 * read is checked and reported here instead. The suppression stays on the
+	 * tokenizer alone, which warns about a source file it cannot make sense of.
+	 */
+	$source = file_get_contents( $file );
+
+	if ( false === $source ) {
+		wp_autoload_classmap_fail( sprintf( 'Unable to read %s while deciding whether it can be autoloaded.', $file ) );
+	}
+
+	$tokens = @token_get_all( $source );
 
 	if ( ! is_array( $tokens ) ) {
 		$result['has_side_effects'] = true;
@@ -942,7 +962,19 @@ function wp_autoload_classmap_read_body( $tokens, $index, $namespace = '', $impo
  * @return string[] Paths relative to the WordPress root.
  */
 function wp_autoload_classmap_required_paths( $file, $src_dir ) {
-	$tokens = @token_get_all( (string) file_get_contents( $file ) );
+	/*
+	 * Reported rather than read as an empty file, for the same reason as in
+	 * wp_autoload_classmap_inspect_file(): a file whose requires cannot be read would
+	 * be taken to require nothing, which would shrink the set of names the bootstrap
+	 * is known to load and let a class be mapped whose parent is not resolvable.
+	 */
+	$source = file_get_contents( $file );
+
+	if ( false === $source ) {
+		wp_autoload_classmap_fail( sprintf( 'Unable to read %s while resolving what the bootstrap loads.', $file ) );
+	}
+
+	$tokens = @token_get_all( $source );
 
 	if ( ! is_array( $tokens ) ) {
 		return array();
@@ -1248,6 +1280,20 @@ function wp_autoload_classmap_build( $src_dir ) {
 				continue;
 			}
 
+			/*
+			 * The map is keyed on the bare name the autoloader is handed, so a name
+			 * declared inside a namespace has no key it could be stored under. Rejecting
+			 * it here rather than letting the renderer refuse it is what keeps such a
+			 * file out of the map without stopping generation: the prefix test below
+			 * compares against the qualified name, so a namespace that happens to begin
+			 * with a core prefix would otherwise reach the renderer and turn an
+			 * ineligible file into a failed build.
+			 */
+			if ( false !== strpos( $key, '\\' ) ) {
+				$rejected[ $key ] = 'declared inside a namespace';
+				continue;
+			}
+
 			// A drop-in owns the declaration, so core's own must stay unmapped.
 			if ( isset( $replaced[ $key ] ) ) {
 				$rejected[ $key ] = 'owned by a drop-in replacement';
@@ -1523,7 +1569,9 @@ function wp_autoload_classmap_replace_file( $file, $contents ) {
  *
  *     @type string $file    Absolute path of the file that was written.
  *     @type int    $entries Number of mapped names.
- *     @type bool   $changed Whether the file contents changed.
+ *     @type bool   $changed Whether this run rewrote the file. False means the file
+ *                           already held this run's output, never that a write was
+ *                           attempted and did not land: that condition is raised.
  *     @type int    $bytes   Length of the published contents.
  *     @type string $sha256  Digest of the published contents.
  * }
@@ -1536,9 +1584,21 @@ function wp_autoload_classmap_write( $src_dir ) {
 	$contents = wp_autoload_classmap_render( $built['map'] );
 	$file     = $src_dir . 'wp-includes/autoload-classmap.php';
 	$existing = is_readable( $file ) ? file_get_contents( $file ) : null;
+	$changed  = false;
 
 	if ( $contents !== $existing ) {
 		wp_autoload_classmap_replace_file( $file, $contents );
+
+		/*
+		 * Recorded once the replacement has landed rather than from the comparison
+		 * above, so that reporting a rewrite means one happened. A write that does not
+		 * land leaves the previous map in place, and that map is well formed: it is
+		 * simply missing whatever the source tree has gained since it was produced.
+		 * copy:files would package it as this run's output, and the autoloader answers
+		 * a name the map has lost by doing nothing, so the loss would surface much
+		 * later as an unresolvable class rather than as a failed build.
+		 */
+		$changed = true;
 	}
 
 	/*
@@ -1558,7 +1618,7 @@ function wp_autoload_classmap_write( $src_dir ) {
 	return array(
 		'file'    => $file,
 		'entries' => count( $built['map'] ),
-		'changed' => $contents !== $existing,
+		'changed' => $changed,
 		'bytes'   => strlen( $contents ),
 		'sha256'  => hash( 'sha256', $contents ),
 	);
@@ -1568,11 +1628,21 @@ function wp_autoload_classmap_write( $src_dir ) {
 if ( 'cli' === PHP_SAPI && isset( $argv[0] ) && realpath( $argv[0] ) === realpath( __FILE__ ) ) {
 	try {
 		$written = wp_autoload_classmap_write( isset( $argv[1] ) ? $argv[1] : dirname( __DIR__, 2 ) . '/src' );
-	} catch ( Exception $exception ) {
+	} catch ( RuntimeException $exception ) {
 		/*
 		 * Reported on standard error and with a nonzero status, so that
-		 * build:autoload-classmap fails the build instead of shipping whatever
-		 * happens to be on disk.
+		 * build:autoload-classmap fails the build instead of shipping whatever happens
+		 * to be on disk. Every condition raised above already names the file, the symbol
+		 * or the path that stopped generation, so the message is the whole diagnosis,
+		 * and it is reported on one line rather than as an uncaught exception because a
+		 * trace through this generator's own call chain only buries the line that
+		 * matters in the build log.
+		 *
+		 * Only conditions this file raises on purpose are caught:
+		 * wp_autoload_classmap_fail() throws RuntimeException, and the one other
+		 * deliberate failure, a missing input directory, reaches here as the
+		 * UnexpectedValueException that extends it. The unwinding of a genuine defect is
+		 * deliberately left alone, so it keeps its trace.
 		 */
 		fwrite( STDERR, 'Autoload class map generation failed: ' . $exception->getMessage() . PHP_EOL );
 		exit( 1 );
