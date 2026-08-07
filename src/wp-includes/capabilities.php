@@ -848,9 +848,10 @@ function map_meta_cap( $cap, $user_id, ...$args ) {
 			 * Capabilities that no case above claims map to themselves, or to their post
 			 * equivalent, and that result is decided by the capability name alone.
 			 * Resolving it again on every check is repeated work: a default dashboard
-			 * request enters this function 159 times to resolve 32 distinct capabilities,
-			 * and only one of those checks carries an object. The result is therefore
-			 * memoized below and read back here.
+			 * request enters this function 176 times for 33 distinct capabilities, 99 of
+			 * those calls reach this branch, and 84 of those 99 repeat a mapping the same
+			 * request has already resolved. The result is therefore memoized below and
+			 * read back here.
 			 *
 			 * The memo is only used while nothing can make the mapping vary:
 			 *

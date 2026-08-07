@@ -918,6 +918,41 @@ test.describe( 'Performance reporter contract', () => {
 		body: Buffer.from( JSON.stringify( { wpFilesLoaded: [ 373 ] } ) ),
 	};
 
+	/*
+	 * The reporter reads two variables out of the environment, and both have to be
+	 * pinned for these tests to describe the reporter rather than the shell they were
+	 * started from. WP_ARTIFACTS_PATH decides the directory, and TEST_RESULTS_PREFIX
+	 * decides the file name - a baseline arm runs with it set, which renames the file
+	 * these tests assert on and would otherwise turn a passing contract into a failure
+	 * that has nothing to do with the reporter. Both are saved and restored around every
+	 * test below, so the suite behaves identically whether or not a prefix is in effect.
+	 */
+	const previousArtifactsPath = process.env.WP_ARTIFACTS_PATH;
+	const previousResultsPrefix = process.env.TEST_RESULTS_PREFIX;
+
+	/**
+	 * Points the reporter at a directory with no results-file prefix in effect.
+	 *
+	 * @param {string} artifacts Directory the reporter writes to.
+	 */
+	function isolateReporterEnvironment( artifacts ) {
+		process.env.WP_ARTIFACTS_PATH = artifacts;
+		delete process.env.TEST_RESULTS_PREFIX;
+	}
+
+	/**
+	 * Restores the two environment variables the reporter reads.
+	 */
+	function restoreReporterEnvironment() {
+		process.env.WP_ARTIFACTS_PATH = previousArtifactsPath;
+
+		if ( undefined === previousResultsPrefix ) {
+			delete process.env.TEST_RESULTS_PREFIX;
+		} else {
+			process.env.TEST_RESULTS_PREFIX = previousResultsPrefix;
+		}
+	}
+
 	/**
 	 * Builds a reporter that has ingested one measured scenario.
 	 *
@@ -925,7 +960,7 @@ test.describe( 'Performance reporter contract', () => {
 	 * @return {PerformanceReporter} Reporter.
 	 */
 	function reporterWithOneResult( artifacts ) {
-		process.env.WP_ARTIFACTS_PATH = artifacts;
+		isolateReporterEnvironment( artifacts );
 
 		const reporter = new PerformanceReporter();
 
@@ -958,7 +993,6 @@ test.describe( 'Performance reporter contract', () => {
 		const artifacts = mkdtempSync(
 			join( tmpdir(), 'wp-performance-reporter-' )
 		);
-		const previousArtifactsPath = process.env.WP_ARTIFACTS_PATH;
 
 		try {
 			reporterWithOneResult( artifacts ).onEnd( { status: 'failed' } );
@@ -968,7 +1002,7 @@ test.describe( 'Performance reporter contract', () => {
 				'a partial run must not leave results behind'
 			).toBe( false );
 		} finally {
-			process.env.WP_ARTIFACTS_PATH = previousArtifactsPath;
+			restoreReporterEnvironment();
 		}
 	} );
 
@@ -976,10 +1010,9 @@ test.describe( 'Performance reporter contract', () => {
 		const artifacts = mkdtempSync(
 			join( tmpdir(), 'wp-performance-reporter-' )
 		);
-		const previousArtifactsPath = process.env.WP_ARTIFACTS_PATH;
 
 		try {
-			process.env.WP_ARTIFACTS_PATH = artifacts;
+			isolateReporterEnvironment( artifacts );
 
 			new PerformanceReporter().onEnd( { status: 'passed' } );
 
@@ -988,7 +1021,7 @@ test.describe( 'Performance reporter contract', () => {
 				'an empty run must not replace an existing artifact'
 			).toBe( false );
 		} finally {
-			process.env.WP_ARTIFACTS_PATH = previousArtifactsPath;
+			restoreReporterEnvironment();
 		}
 	} );
 
@@ -996,7 +1029,6 @@ test.describe( 'Performance reporter contract', () => {
 		const artifacts = mkdtempSync(
 			join( tmpdir(), 'wp-performance-reporter-' )
 		);
-		const previousArtifactsPath = process.env.WP_ARTIFACTS_PATH;
 
 		try {
 			reporterWithOneResult( artifacts ).onEnd( { status: 'passed' } );
@@ -1016,7 +1048,40 @@ test.describe( 'Performance reporter contract', () => {
 				{ wpFilesLoaded: [ 373 ] },
 			] );
 		} finally {
-			process.env.WP_ARTIFACTS_PATH = previousArtifactsPath;
+			restoreReporterEnvironment();
+		}
+	} );
+
+	test( 'names the results file after the prefix the arm was run with', () => {
+		const artifacts = mkdtempSync(
+			join( tmpdir(), 'wp-performance-reporter-' )
+		);
+
+		try {
+			const reporter = reporterWithOneResult( artifacts );
+
+			process.env.TEST_RESULTS_PREFIX = 'before';
+
+			reporter.onEnd( { status: 'passed' } );
+
+			/*
+			 * The baseline arm is the one arm that runs with a prefix, and the
+			 * comparison reads the two arms out of two differently named files. A
+			 * prefix that stopped being honoured would overwrite the after arm with
+			 * the before arm and the comparator would report a tree against itself.
+			 */
+			expect(
+				existsSync(
+					join( artifacts, 'before-performance-results.json' )
+				),
+				'a prefixed arm must write the prefixed artifact'
+			).toBe( true );
+			expect(
+				existsSync( join( artifacts, 'performance-results.json' ) ),
+				'a prefixed arm must not write the unprefixed artifact'
+			).toBe( false );
+		} finally {
+			restoreReporterEnvironment();
 		}
 	} );
 } );

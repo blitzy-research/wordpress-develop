@@ -317,15 +317,7 @@ jobs:
           if-no-files-found: ignore
           include-hidden-files: true
 
-      # compare-results.js refuses to report a comparison without a baseline, because a
-      # table of after values with every difference column reading N/A is
-      # indistinguishable from a comparison that found no change. Here the target run is
-      # conditional on a previous build existing, so an absent baseline is expected
-      # rather than a mistake. The comparison itself stays strict either way, and the
-      # summary states plainly that it is not a comparison when no baseline was measured.
       - name: Compare results
-        env:
-          PERFORMANCE_ALLOW_MISSING_BASELINE: true
         run: node ./tests/performance/compare-results.js "${RUNNER_TEMP}/summary.md"
 
       - name: Add workflow summary
