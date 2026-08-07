@@ -74,13 +74,6 @@
 		</whitelist>
 	</filter>
 	<logging>
-		<!--
-		PHPUnit resolves this target relative to the directory holding this configuration
-		file, exactly as it does for the bootstrap and test-suite paths above. The root
-		phpunit.xml.dist writes the same report to the same place with the prefix its own
-		location requires; from here the path is relative to tests/phpunit/, which keeps the
-		report inside the gitignored tests/phpunit/build directory.
-		-->
-		<log type="junit" target="build/logs/junit.xml" />
+		<log type="junit" target="tests/phpunit/build/logs/junit.xml" />
 	</logging>
 </phpunit>

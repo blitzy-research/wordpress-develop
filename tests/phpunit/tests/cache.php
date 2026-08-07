@@ -502,6 +502,9 @@ class Tests_Cache extends WP_UnitTestCase {
 			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
 		}
 
+		// Per-group counting is opt-in, so the subject of these assertions has to be switched on.
+		$this->cache->track_group_stats = true;
+
 		$this->assertSame(
 			array(),
 			$this->cache->cache_group_stats,
@@ -534,6 +537,9 @@ class Tests_Cache extends WP_UnitTestCase {
 		if ( wp_using_ext_object_cache() ) {
 			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
 		}
+
+		// Per-group counting is opt-in, so the subject of these assertions has to be switched on.
+		$this->cache->track_group_stats = true;
 
 		$this->cache->set( 'foo', 'bar', 'group-a' );
 
@@ -570,6 +576,9 @@ class Tests_Cache extends WP_UnitTestCase {
 			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
 		}
 
+		// Per-group counting is opt-in, so the subject of these assertions has to be switched on.
+		$this->cache->track_group_stats = true;
+
 		$this->assertFalse( $this->cache->get( 'foo', '' ), 'Reading a key that was never set should return false.' );
 		$this->assertFalse( $this->cache->get( 'foo', null ), 'Reading a key that was never set should return false.' );
 
@@ -598,6 +607,9 @@ class Tests_Cache extends WP_UnitTestCase {
 		if ( wp_using_ext_object_cache() ) {
 			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
 		}
+
+		// Per-group counting is opt-in, so the subject of these assertions has to be switched on.
+		$this->cache->track_group_stats = true;
 
 		$this->cache->set( 'foo', 'bar', 'group-a' );
 
@@ -643,6 +655,9 @@ class Tests_Cache extends WP_UnitTestCase {
 			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
 		}
 
+		// Per-group counting is opt-in, so the subject of these assertions has to be switched on.
+		$this->cache->track_group_stats = true;
+
 		// 'global-cache-test' is registered as a global group by init_cache().
 		$this->cache->set( 'foo', 'bar', 'global-cache-test' );
 
@@ -669,6 +684,9 @@ class Tests_Cache extends WP_UnitTestCase {
 			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
 		}
 
+		// Per-group counting is opt-in, so the subject of these assertions has to be switched on.
+		$this->cache->track_group_stats = true;
+
 		$this->cache->set( 'foo1', 'bar', 'group1' );
 		$this->cache->set( 'foo2', 'bar', 'group1' );
 
@@ -693,6 +711,9 @@ class Tests_Cache extends WP_UnitTestCase {
 		if ( wp_using_ext_object_cache() ) {
 			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
 		}
+
+		// Per-group counting is opt-in, so the subject of these assertions has to be switched on.
+		$this->cache->track_group_stats = true;
 
 		$this->cache->set( 'foo', 'bar', 'group-a' );
 		$this->cache->set( 'foo', 'bar', 'group-b' );
@@ -727,6 +748,9 @@ class Tests_Cache extends WP_UnitTestCase {
 			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
 		}
 
+		// Per-group counting is opt-in, so the subject of these assertions has to be switched on.
+		$this->cache->track_group_stats = true;
+
 		$this->setExpectedIncorrectUsage( 'WP_Object_Cache::get' );
 
 		$this->assertFalse( $this->cache->get( '', 'group-a' ), 'An empty key is not valid, so the read should fail.' );
@@ -747,6 +771,9 @@ class Tests_Cache extends WP_UnitTestCase {
 		if ( wp_using_ext_object_cache() ) {
 			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
 		}
+
+		// Per-group counting is opt-in, so the subject of these assertions has to be switched on.
+		$this->cache->track_group_stats = true;
 
 		$this->cache->set( 'foo', 'bar', 'group-a' );
 		$this->cache->get( 'foo', 'group-a' );
@@ -789,6 +816,9 @@ class Tests_Cache extends WP_UnitTestCase {
 		if ( wp_using_ext_object_cache() ) {
 			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
 		}
+
+		// Per-group counting is opt-in, so the subject of these assertions has to be switched on.
+		$this->cache->track_group_stats = true;
 
 		$this->cache->set( 'foo', 'bar', 'group-a' );
 		$this->cache->set( 'foo', 'bar', 'group-b' );
@@ -844,6 +874,9 @@ class Tests_Cache extends WP_UnitTestCase {
 			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
 		}
 
+		// Per-group counting is opt-in, so the subject of these assertions has to be switched on.
+		$this->cache->track_group_stats = true;
+
 		$this->setExpectedDeprecated( 'reset' );
 
 		$this->cache->set( 'foo', 'bar', 'group-a' );
@@ -878,6 +911,9 @@ class Tests_Cache extends WP_UnitTestCase {
 			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
 		}
 
+		// Per-group counting is opt-in, so the subject of these assertions has to be switched on.
+		$this->cache->track_group_stats = true;
+
 		$this->cache->set( 'foo', 'bar', 'group-a' );
 		$this->cache->get( 'foo', 'group-a' );
 		$this->cache->get( 'missing', 'group-a' );
@@ -904,6 +940,9 @@ class Tests_Cache extends WP_UnitTestCase {
 		if ( wp_using_ext_object_cache() ) {
 			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
 		}
+
+		// Per-group counting is opt-in, so the subject of these assertions has to be switched on.
+		$this->cache->track_group_stats = true;
 
 		$this->cache->set( 'foo', 'bar', 'group-a' );
 		$this->cache->get( 'foo', 'group-a' );
@@ -937,6 +976,9 @@ class Tests_Cache extends WP_UnitTestCase {
 			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
 		}
 
+		// Opt in, so that the section listing groups that were never stored is printed at all.
+		$this->cache->track_group_stats = true;
+
 		$stored_group   = '<script>alert(1)</script>';
 		$unstored_group = '<em>missing</em>';
 
@@ -952,5 +994,378 @@ class Tests_Cache extends WP_UnitTestCase {
 		$this->assertStringNotContainsString( '<em>', $output, 'A group name should not be printed as markup.' );
 		$this->assertStringContainsString( esc_html( $stored_group ), $output, 'The stored group name should be escaped.' );
 		$this->assertStringContainsString( esc_html( $unstored_group ), $output, 'The group name that was never stored should be escaped as well.' );
+	}
+
+	/**
+	 * Ensures per-group counting stays off until it is asked for.
+	 *
+	 * get() is reached several hundred times in a page view, so the breakdown is
+	 * diagnostic work that a request which never reads it must not pay for.
+	 *
+	 * @covers WP_Object_Cache::get
+	 */
+	public function test_group_statistics_are_not_collected_by_default() {
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
+		}
+
+		$this->assertFalse(
+			$this->cache->track_group_stats,
+			'Per-group counting should be off on a new cache object.'
+		);
+
+		$this->cache->set( 'foo', 'bar', 'group-a' );
+		$this->cache->get( 'foo', 'group-a' );
+		$this->cache->get( 'missing', 'group-a' );
+
+		$this->assertSame(
+			array(),
+			$this->cache->cache_group_stats,
+			'No per-group entry should be created while counting is off.'
+		);
+
+		$this->assertSame(
+			1,
+			$this->cache->cache_hits,
+			'The overall hit total should still be counted while the breakdown is off.'
+		);
+
+		$this->assertSame(
+			1,
+			$this->cache->cache_misses,
+			'The overall miss total should still be counted while the breakdown is off.'
+		);
+	}
+
+	/**
+	 * Ensures the statistics output says so rather than printing zeros.
+	 *
+	 * A group line reading "0 hits, 0 misses" would describe a group nothing ever
+	 * asked for, which is not what an unmeasured group is.
+	 *
+	 * @covers WP_Object_Cache::stats
+	 */
+	public function test_stats_reports_that_the_breakdown_was_not_collected() {
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
+		}
+
+		$this->cache->set( 'foo', 'bar', 'group-a' );
+		$this->cache->get( 'foo', 'group-a' );
+
+		ob_start();
+		$this->cache->stats();
+		$output = ob_get_clean();
+
+		$this->assertStringContainsString(
+			'<strong>Cache Hits:</strong> 1',
+			$output,
+			'The totals should be reported whether or not the breakdown was collected.'
+		);
+
+		$this->assertStringContainsString(
+			'Per-group hit and miss counts were not collected',
+			$output,
+			'The output should say the breakdown is unavailable.'
+		);
+
+		$this->assertStringNotContainsString(
+			'0 hits, 0 misses',
+			$output,
+			'An uncollected group must not be printed as a group with no activity.'
+		);
+	}
+
+	/**
+	 * Ensures the collected breakdown cannot grow without limit.
+	 *
+	 * The group name comes from the caller, so code that derives one per user or per
+	 * object would otherwise add an entry per distinct name for the whole request.
+	 *
+	 * @covers WP_Object_Cache::get
+	 */
+	public function test_group_statistics_stop_at_the_tracked_group_limit() {
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
+		}
+
+		$this->cache->track_group_stats  = true;
+		$this->cache->max_tracked_groups = 8;
+
+		for ( $i = 0; $i < 12; $i++ ) {
+			$this->cache->get( 'foo', 'group-' . $i );
+		}
+
+		$this->assertCount(
+			8,
+			$this->cache->cache_group_stats,
+			'No more groups than the limit should be given counters.'
+		);
+
+		$this->assertSame(
+			4,
+			$this->cache->untracked_group_count,
+			'Every group left out should be counted.'
+		);
+
+		// A group that is already counted keeps counting once the limit is reached.
+		$this->cache->get( 'foo', 'group-0' );
+
+		$this->assertSame(
+			2,
+			$this->cache->cache_group_stats['group-0']['misses'],
+			'A group admitted before the limit should keep counting after it.'
+		);
+
+		$this->assertSame(
+			4,
+			$this->cache->untracked_group_count,
+			'Reading a group that is already counted should not change the untracked count.'
+		);
+
+		// Re-reading an omitted group must not count it a second time.
+		$this->cache->get( 'foo', 'group-11' );
+
+		$this->assertSame(
+			4,
+			$this->cache->untracked_group_count,
+			'The untracked count is a count of distinct groups, not of calls.'
+		);
+	}
+
+	/**
+	 * Ensures the statistics output admits when the breakdown is incomplete.
+	 *
+	 * @covers WP_Object_Cache::stats
+	 */
+	public function test_stats_reports_a_partial_breakdown_after_the_limit() {
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
+		}
+
+		$this->cache->track_group_stats  = true;
+		$this->cache->max_tracked_groups = 2;
+
+		for ( $i = 0; $i < 5; $i++ ) {
+			$this->cache->get( 'foo', 'group-' . $i );
+		}
+
+		ob_start();
+		$this->cache->stats();
+		$output = ob_get_clean();
+
+		$this->assertStringContainsString(
+			'The breakdown above is partial',
+			$output,
+			'An incomplete breakdown should say so.'
+		);
+
+		/*
+		 * Five groups were requested with room for two, so three were omitted - but the
+		 * register of omitted names holds two at most, so the figure is a lower bound
+		 * and has to be reported as one rather than as a total.
+		 */
+		$this->assertStringContainsString(
+			'at least 2 further group(s)',
+			$output,
+			'A saturated omission count should be reported as a lower bound.'
+		);
+	}
+
+	/**
+	 * Ensures the overall totals stay exact for groups the breakdown left out.
+	 *
+	 * $max_tracked_groups bounds the breakdown, not the accounting. A group admitted
+	 * after the limit carries no per-group counters, so the sum of the per-group figures
+	 * can be smaller than the totals. This is the one asymmetry the bound introduces and
+	 * it is deliberate: $cache_hits and $cache_misses are the documented public surface
+	 * and the pair the performance harness reads, so they must stay exact for every
+	 * group whether or not it earned a row in the breakdown.
+	 *
+	 * @covers WP_Object_Cache::get
+	 */
+	public function test_overall_totals_stay_exact_for_untracked_groups() {
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
+		}
+
+		$this->cache->track_group_stats  = true;
+		$this->cache->max_tracked_groups = 2;
+
+		$this->cache->set( 'foo', 'bar', 'group-0' );
+
+		// One hit in a tracked group, then a miss in each of four further groups.
+		$this->cache->get( 'foo', 'group-0' );
+
+		for ( $i = 1; $i < 5; $i++ ) {
+			$this->cache->get( 'foo', 'group-' . $i );
+		}
+
+		$this->assertSame( 1, $this->cache->cache_hits, 'Every hit must be counted overall.' );
+		$this->assertSame( 4, $this->cache->cache_misses, 'Every miss must be counted overall, tracked or not.' );
+
+		$this->assertCount(
+			2,
+			$this->cache->cache_group_stats,
+			'The breakdown must stop at the limit.'
+		);
+
+		$tracked_hits   = 0;
+		$tracked_misses = 0;
+
+		foreach ( $this->cache->cache_group_stats as $group_stats ) {
+			$tracked_hits   += $group_stats['hits'];
+			$tracked_misses += $group_stats['misses'];
+		}
+
+		$this->assertSame( 1, $tracked_hits, 'The tracked hit belongs to a tracked group.' );
+
+		$this->assertLessThan(
+			$this->cache->cache_misses,
+			$tracked_misses,
+			'The per-group misses must be allowed to fall short of the exact total once the limit is reached.'
+		);
+
+		/*
+		 * Three groups were left out of the breakdown, but the register that stops one being
+		 * counted twice is capped at $max_tracked_groups as well, so the count saturates at
+		 * the cap and becomes a lower bound on the shortfall rather than an exact tally. That
+		 * is the documented behaviour, and it is what stats() reports as 'at least'.
+		 */
+		$this->assertSame(
+			$this->cache->max_tracked_groups,
+			$this->cache->untracked_group_count,
+			'The groups the breakdown left out must be counted, up to the cap, so the shortfall is visible.'
+		);
+
+		$this->cache->get( 'foo', 'group-5' );
+
+		$this->assertSame(
+			5,
+			$this->cache->cache_misses,
+			'A miss in a group past both caps must still be counted overall.'
+		);
+
+		$this->assertSame(
+			$this->cache->max_tracked_groups,
+			$this->cache->untracked_group_count,
+			'Once the register of omitted groups is full the count must stop rising rather than grow without limit.'
+		);
+	}
+
+	/**
+	 * Ensures the per-group figures are optional for anything reading them.
+	 *
+	 * An object-cache.php drop-in replaces this class wholesale and is under no obligation to
+	 * track anything per group. Every consumer must therefore treat the property as absent
+	 * rather than empty, which is what the performance harness does when it reads only the two
+	 * documented public totals.
+	 *
+	 * @covers WP_Object_Cache::$cache_group_stats
+	 */
+	public function test_group_statistics_degrade_when_a_drop_in_replaces_the_cache() {
+		$replacement = new class() {
+			/**
+			 * Overall hit count, the one counter a drop-in conventionally exposes.
+			 *
+			 * @var int
+			 */
+			public $cache_hits = 7;
+
+			/**
+			 * Overall miss count, the one counter a drop-in conventionally exposes.
+			 *
+			 * @var int
+			 */
+			public $cache_misses = 3;
+		};
+
+		$public_properties = get_object_vars( $replacement );
+
+		$this->assertArrayHasKey( 'cache_hits', $public_properties, 'The overall totals are the documented surface.' );
+		$this->assertArrayHasKey( 'cache_misses', $public_properties, 'The overall totals are the documented surface.' );
+
+		$this->assertArrayNotHasKey(
+			'cache_group_stats',
+			$public_properties,
+			'A drop-in is free to omit the per-group figures, so nothing may require them.'
+		);
+
+		$this->assertSame(
+			7,
+			(int) ( $public_properties['cache_hits'] ?? 0 ),
+			'The overall hit count should still be readable from a replacement cache.'
+		);
+
+		$this->assertSame(
+			0,
+			(int) ( $public_properties['cache_group_stats']['group-a']['hits'] ?? 0 ),
+			'Reading absent per-group figures should degrade to zero rather than fail.'
+		);
+	}
+
+	/**
+	 * Ensures the per-group figures are declared as a public array on the core cache.
+	 *
+	 * @covers WP_Object_Cache::$cache_group_stats
+	 */
+	public function test_group_statistics_are_a_public_array_on_the_core_cache() {
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
+		}
+
+		$this->assertObjectHasProperty( 'cache_group_stats', $this->cache, 'The core cache should expose the per-group figures.' );
+
+		$this->assertArrayHasKey(
+			'cache_group_stats',
+			get_object_vars( $this->cache ),
+			'The per-group figures should be readable from outside the class.'
+		);
+
+		$this->assertIsArray( $this->cache->cache_group_stats, 'The per-group figures should be an array.' );
+	}
+
+	/**
+	 * Ensures no shipped file outside the cache class itself depends on the per-group figures.
+	 *
+	 * The previous test shows a replacement cache may omit the property; this one shows that
+	 * omitting it cannot break anything, by proving the property is read in exactly one file.
+	 * A drop-in replaces that file's class wholesale, taking every reader with it, so there is
+	 * nothing left to degrade. Scanning is what makes the claim durable: an assertion about the
+	 * shape of a hand-written stub would keep passing if a second reader appeared elsewhere.
+	 *
+	 * @covers WP_Object_Cache::$cache_group_stats
+	 */
+	public function test_no_shipped_file_outside_the_cache_class_reads_the_group_statistics() {
+		$owner   = realpath( ABSPATH . WPINC . '/class-wp-object-cache.php' );
+		$readers = array();
+
+		foreach ( array( ABSPATH . WPINC, ABSPATH . 'wp-admin' ) as $directory ) {
+			$files = new RecursiveIteratorIterator(
+				new RecursiveDirectoryIterator( $directory, FilesystemIterator::SKIP_DOTS )
+			);
+
+			foreach ( $files as $file ) {
+				if ( 'php' !== strtolower( $file->getExtension() ) ) {
+					continue;
+				}
+
+				$path = $file->getRealPath();
+
+				if ( $path === $owner ) {
+					continue;
+				}
+
+				if ( str_contains( (string) file_get_contents( $path ), 'cache_group_stats' ) ) {
+					$readers[] = str_replace( ABSPATH, '', $path );
+				}
+			}
+		}
+
+		$this->assertSame(
+			array(),
+			$readers,
+			'Only class-wp-object-cache.php may read the per-group figures, so a drop-in that omits them breaks nothing.'
+		);
 	}
 }

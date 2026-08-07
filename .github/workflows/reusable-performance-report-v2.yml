@@ -77,7 +77,16 @@ jobs:
       - name: List files
         run: tree artifacts
 
+      # compare-results.js refuses to report a comparison without a baseline, because a
+      # table of after values with every difference column reading N/A is
+      # indistinguishable from a comparison that found no change. This pipeline is the
+      # one place where an absent baseline is expected rather than a mistake: the
+      # 'before' subject is only measured when determine-matrix asks for it. The
+      # comparison itself stays strict either way, and the summary states plainly that
+      # it is not a comparison when no baseline was downloaded.
       - name: Compare results
+        env:
+          PERFORMANCE_ALLOW_MISSING_BASELINE: true
         run: node ./tests/performance/compare-results.js "${RUNNER_TEMP}/summary.md"
 
       - name: Add workflow summary

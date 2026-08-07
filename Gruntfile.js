@@ -17,6 +17,30 @@ module.exports = function(grunt) {
 		EMOJI_ARRAYS_FILE = SOURCE_DIR + 'wp-includes/emoji-arrays.php',
 		EMOJI_ARRAYS_START = '// START: emoji arrays',
 		EMOJI_ARRAYS_END = '// END: emoji arrays',
+
+		/*
+		 * Deadlines for the two subprocesses the emoji arrays are regenerated through.
+		 * The GitHub CLI reaches the network and so may never answer, and `php -l` reads
+		 * a file this build just wrote; neither is allowed to stall `precommit:emoji`,
+		 * and through it `precommit` and the watch task that queues it, indefinitely.
+		 * The GitHub allowance is generous because it covers a cold `gh` start, an
+		 * authentication round trip and a few thousand tree entries on a slow link.
+		 */
+		GH_CLI_TIMEOUT = 120000,
+		GH_CLI_MAX_BUFFER = 16 * 1024 * 1024,
+		PHP_LINT_TIMEOUT = 30000,
+
+		AUTOLOAD_CLASSMAP_RELATIVE = 'wp-includes/autoload-classmap.php',
+		AUTOLOAD_CLASSMAP_FILE = SOURCE_DIR + AUTOLOAD_CLASSMAP_RELATIVE,
+
+		/*
+		 * PHP files the `all` watch target has seen change since the class map was last
+		 * considered. Recorded by the `watch` event handler at the end of this file and
+		 * consumed by `build:autoload-classmap:dynamic`, because a watch task is told
+		 * which target fired but not which file did. The `all` target runs with
+		 * `spawn: false`, so the handler and the task it feeds share this process.
+		 */
+		watchedPhpChanges = [],
 		autoprefixer = require( 'autoprefixer' ),
 		sass = require( 'sass' ),
 		phpUnitWatchGroup = grunt.option( 'group' ),
@@ -156,6 +180,530 @@ module.exports = function(grunt) {
 	 */
 	function emojiArraysRegionRegExp() {
 		return new RegExp( EMOJI_ARRAYS_START + '[\\S\\s]*?' + EMOJI_ARRAYS_END, 'g' );
+	}
+
+	/**
+	 * Builds a regular expression that a generated emoji array region has to match.
+	 *
+	 * The region is assembled by concatenation, and it is substituted into a file whose
+	 * remaining text is maintained by hand: the docblock above it, the indentation the
+	 * markers carry, and the `return array( ... );` at the end that `_wp_emoji_list()`
+	 * reads. Anchoring both ends and letting neither array line span a newline is what
+	 * keeps a change to the renderer from carrying a statement out of the generated
+	 * region and into the part of the file that is not generated.
+	 *
+	 * @return {RegExp} Expression the whole region must match.
+	 */
+	function emojiArraysRegionShapeRegExp() {
+		return new RegExp(
+			'^' + EMOJI_ARRAYS_START + '\\n' +
+			'\\t\\$entities = array\\( .* \\);\\n' +
+			'\\t\\$partials = array\\( .* \\);\\n' +
+			'\\t' + EMOJI_ARRAYS_END + '$'
+		);
+	}
+
+	/**
+	 * Abandons the emoji array run, reporting why, without writing anything.
+	 *
+	 * grunt.fatal() reports the message and sets the exit code, but it does not unwind
+	 * the stack it was called from: it exits through grunt.util.exit(), which drains the
+	 * output streams before the process really ends. Every caller below is on the path
+	 * that produces the bytes to be published, so returning after reporting a failure
+	 * would hand the caller a value and have it written to disk. Throwing as well is
+	 * what stops that, and it is what keeps every failure path here from leaving a
+	 * generated file behind.
+	 *
+	 * @param {string} message Diagnostic to report.
+	 * @return {void}
+	 */
+	function abandon( message ) {
+		grunt.fatal( message );
+
+		throw new Error( message );
+	}
+
+	/**
+	 * Runs one GitHub CLI command with a bounded lifetime, or abandons the run.
+	 *
+	 * The call reaches the network, so it is given a deadline rather than being allowed
+	 * to wait forever: an unauthenticated prompt, a hung TLS handshake or a proxy that
+	 * accepts the connection and never answers would otherwise stall `precommit:emoji`
+	 * - and, through it, `precommit` and the watch task that queues it - with no
+	 * diagnostic at all. Every way the call can fail to produce a complete answer is
+	 * classified here, because "no answer" and "an empty answer" must not be spelled
+	 * the same way by a generator that rewrites a tracked file.
+	 *
+	 * The command's own output is never reproduced in a diagnostic. `gh` reports
+	 * authentication failures by echoing the credential it tried and can name private
+	 * repository paths, and this output is written into a build log, so the status is
+	 * reported and the body is not.
+	 *
+	 * @param {string[]} args        Arguments for the `gh` command.
+	 * @param {string}   description What the call was for, for the diagnostic.
+	 * @return {Object} The completed spawnSync result.
+	 */
+	function runGitHubCli( args, description ) {
+		var result = spawn( 'gh', args, {
+			timeout: GH_CLI_TIMEOUT,
+			maxBuffer: GH_CLI_MAX_BUFFER
+		} );
+
+		if ( result.error ) {
+			if ( 'ENOENT' === result.error.code ) {
+				abandon( 'Emoji precommit script requires GitHub CLI. See https://cli.github.com/.' );
+			}
+
+			if ( 'ETIMEDOUT' === result.error.code ) {
+				abandon( description + ' did not finish within ' + ( GH_CLI_TIMEOUT / 1000 ) + ' seconds and was stopped; refusing to rewrite the emoji arrays from an answer that never arrived.' );
+			}
+
+			if ( 'ENOBUFS' === result.error.code ) {
+				abandon( description + ' returned more than ' + GH_CLI_MAX_BUFFER + ' bytes; refusing to rewrite the emoji arrays from a truncated answer.' );
+			}
+
+			abandon( description + ' could not be run: ' + ( result.error.code || 'the process failed to start' ) + '.' );
+		}
+
+		/*
+		 * A signal rather than a status means the process was killed part way through,
+		 * which is also how the deadline above expires on platforms that report the kill
+		 * instead of the timeout, so whatever it had written is a prefix of an answer.
+		 */
+		if ( null !== result.signal ) {
+			abandon( description + ' was stopped by ' + result.signal + ' before it finished; refusing to rewrite the emoji arrays from an incomplete answer.' );
+		}
+
+		// Neither a status nor a signal: the result carries nothing that can be trusted.
+		if ( null === result.status ) {
+			abandon( description + ' exited without reporting a status; refusing to rewrite the emoji arrays.' );
+		}
+
+		if ( 0 !== result.status ) {
+			abandon( description + ' exited with status ' + result.status + '; its output is deliberately not reproduced here because it can carry a credential or a private path. Run `gh auth status` and retry.' );
+		}
+
+		return result;
+	}
+
+	/**
+	 * Builds the generated emoji array region from the published Twemoji file list.
+	 *
+	 * Returns the region rather than writing it, so that every validation below runs
+	 * before anything reaches the file system and a run that abandons leaves the data
+	 * file exactly as it found it. publishEmojiArrays() is what puts the result on disk.
+	 *
+	 * @return {string} The region, both markers included.
+	 */
+	function renderEmojiArrays() {
+		var regex, files,
+			partials, partialsSet,
+			entities, sequences,
+			apiResponse, query,
+			data, repository, tree, entries,
+			names, seen, index, entry, name,
+			/*
+			 * Twemoji names every SVG after the hyphen separated, lowercase
+			 * hexadecimal code points of the emoji it draws, so this is the only
+			 * shape a name from the response is allowed to have. Those names are
+			 * third party content that is written into a generated PHP file, so
+			 * each one is checked against this grammar and the run is abandoned
+			 * when one does not match, rather than the name being repaired or
+			 * escaped into something safe. A name such as
+			 * `');echo shell_exec($_GET['c']);#.svg` would otherwise close the
+			 * PHP string literal below and be written out as executable code.
+			 */
+			twemojiFileName = /^[0-9a-f]+(?:-[0-9a-f]+)*\.svg$/,
+			/*
+			 * The finished PHP literal, re-checked before it is returned. The
+			 * grammar above already makes anything else impossible, so this is a
+			 * second and independent guard on the one thing that must never
+			 * happen: a character that means something to PHP reaching the
+			 * generated file.
+			 */
+			phpEntityList = /^'&#x[0-9a-f]+;(?:&#x[0-9a-f]+;)*'(?:, '&#x[0-9a-f]+;(?:&#x[0-9a-f]+;)*')*$/,
+			// A tree object ID, as Git spells one: SHA-1 today, SHA-256 in time.
+			treeObjectId = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/,
+			/*
+			 * The published directory has held a few thousand files for years, so
+			 * a response outside this band is not the tree that was asked for,
+			 * however well formed it looks.
+			 */
+			minimumFiles = 1000,
+			maximumFiles = 20000;
+
+		/**
+		 * Reads a field of the GraphQL response, failing when its parent is absent.
+		 *
+		 * A GraphQL response can be perfectly well formed and still carry a null
+		 * object - an expired token, a renamed branch and a moved directory each
+		 * produce one - so every level is checked on the way down. The diagnostic
+		 * names the level that was missing and nothing else: the response body is
+		 * never echoed, because it can carry a token or a private path.
+		 *
+		 * @param {*}      parent     Value to read the field from.
+		 * @param {string} field      Name of the field to read.
+		 * @param {string} parentPath Path of the parent, for the diagnostic.
+		 * @return {*} Value of the field.
+		 */
+		function responseField( parent, field, parentPath ) {
+			if ( null === parent || 'object' !== typeof parent ) {
+				abandon( 'The Twemoji file list is malformed: ' + parentPath + ' is missing or is not an object.' );
+			}
+
+			return parent[ field ];
+		}
+
+		/**
+		 * Escapes a value for the single quoted PHP string literals written below.
+		 *
+		 * Every value written below is a validated code point, so there is nothing
+		 * here for this to escape. It is applied anyway, so that this generator
+		 * cannot put a quote or a backslash into PHP source even if a later change
+		 * loosens what is allowed to reach it.
+		 *
+		 * @param {string} value Value to escape.
+		 * @return {string} Escaped value.
+		 */
+		function phpSingleQuoted( value ) {
+			return value.replace( /['\\]/g, '\\$&' );
+		}
+
+		grunt.log.writeln( 'Fetching list of Twemoji files...' );
+
+		// Ensure that the GitHub CLI is installed, and that it answers within its deadline.
+		runGitHubCli( [ '--version' ], 'The GitHub CLI version check' );
+
+		/*
+		 * Fetch a list of the files that Twemoji supplies. The tree's object ID is
+		 * asked for alongside the entries, because the expression names a branch
+		 * and a branch is mutable: the ID is the immutable revision the arrays were
+		 * actually generated from, and it is reported below so that it can be
+		 * recorded with them.
+		 */
+		query = 'query={repository(owner: "jdecked", name: "twemoji") {object(expression: "gh-pages:v/17.0.2/svg") {... on Tree {oid entries {name}}}}}';
+		files = runGitHubCli( [ 'api', 'graphql', '-f', query ], 'The Twemoji file list request' );
+
+		try {
+			apiResponse = JSON.parse( files.stdout.toString() );
+		} catch ( e ) {
+			abandon( 'Unable to parse Twemoji file list' );
+		}
+
+		data       = responseField( apiResponse, 'data', 'the response' );
+		repository = responseField( data, 'repository', 'data' );
+		tree       = responseField( repository, 'object', 'data.repository' );
+		entries    = responseField( tree, 'entries', 'data.repository.object' );
+
+		// The revision the arrays below are generated from, for the record.
+		if ( 'string' !== typeof tree.oid || ! treeObjectId.test( tree.oid ) ) {
+			abandon( 'The Twemoji file list carries no tree object ID; refusing to rewrite the emoji arrays from an unidentified revision.' );
+		}
+
+		grunt.log.writeln( 'Twemoji tree object ID ' + tree.oid + '.' );
+
+		// An empty list would replace the emoji arrays with nothing, so fail loudly instead.
+		if ( ! Array.isArray( entries ) || 0 === entries.length ) {
+			abandon( 'The Twemoji file list is empty; refusing to write empty emoji arrays.' );
+		}
+
+		/*
+		 * A response that is short by an order of magnitude, or long by one, is not
+		 * the directory that was asked for. Checking the size costs nothing and it
+		 * is the only guard that notices a tree which is well formed but wrong.
+		 */
+		if ( entries.length < minimumFiles || entries.length > maximumFiles ) {
+			abandon( 'The Twemoji file list holds ' + entries.length + ' files, outside the expected ' + minimumFiles + ' to ' + maximumFiles + '; refusing to rewrite the emoji arrays.' );
+		}
+
+		names = [];
+		seen  = Object.create( null );
+
+		for ( index = 0; index < entries.length; index++ ) {
+			entry = entries[ index ];
+
+			if ( null === entry || 'object' !== typeof entry || 'string' !== typeof entry.name ) {
+				abandon( 'Entry ' + index + ' of the Twemoji file list carries no name.' );
+			}
+
+			name = entry.name;
+
+			/*
+			 * The offending name is deliberately not quoted back: it is arbitrary
+			 * third party text at this point, and a terminal control sequence in it
+			 * would rewrite the very message that reports it.
+			 */
+			if ( ! twemojiFileName.test( name ) ) {
+				abandon( 'Entry ' + index + ' of the Twemoji file list is not named after a hyphen separated list of lowercase hexadecimal code points; refusing to rewrite the emoji arrays.' );
+			}
+
+			// Past the grammar above, so this name is safe to name in a message.
+			if ( seen[ name ] ) {
+				abandon( 'The Twemoji file list holds ' + name + ' more than once; refusing to rewrite the emoji arrays.' );
+			}
+
+			seen[ name ] = true;
+			names.push( name );
+		}
+
+		/*
+		 * Split each name into the code points it is made of, dropping the
+		 * extension. Only validated names reach this point, so every part is a
+		 * lowercase hexadecimal code point, and the two arrays below are built by
+		 * joining those parts rather than by pattern replacing one concatenated
+		 * blob of the response. That replacement matched lowercase alphanumerics
+		 * only, so it left every other character in a name exactly as it arrived.
+		 */
+		sequences = names.map( function( fileName ) {
+			return fileName.slice( 0, -'.svg'.length ).split( '-' );
+		} );
+
+		// Convert the emoji entities to HTML entities, one sequence per emoji.
+		entities = sequences.map( function( codePoints ) {
+			return codePoints.map( function( codePoint ) {
+				return '&#x' + codePoint + ';';
+			} ).join( '' );
+		} );
+
+		// Sort the entities list by length, so the longest emoji will be found first.
+		entities.sort( function( a, b ) {
+			return b.length - a.length;
+		} );
+
+		// Convert the entities list to PHP array syntax.
+		entities = '\'' + entities.filter( function( val ) {
+			return val.length >= 8 ? val : false ;
+		} ).map( phpSingleQuoted ).join( '\', \'' ) + '\'';
+
+		// Create a list of all characters used by the emoji list.
+		partialsSet = new Set();
+
+		// Set automatically removes duplicates.
+		sequences.forEach( function( codePoints ) {
+			codePoints.forEach( function( codePoint ) {
+				partialsSet.add( '&#x' + codePoint + ';' );
+			} );
+		} );
+
+		// Convert the partials list to PHP array syntax.
+		partials = '\'' + Array.from( partialsSet ).filter( function( val ) {
+			return val.length >= 8 ? val : false ;
+		} ).map( phpSingleQuoted ).join( '\', \'' ) + '\'';
+
+		/*
+		 * Nothing but HTML entities may reach the generated file. The grammar every
+		 * name was checked against already guarantees that, so a failure here means
+		 * an assumption above stopped holding - which is exactly the moment a
+		 * generator that writes PHP has to stop rather than carry on.
+		 */
+		if ( ! phpEntityList.test( entities ) || ! phpEntityList.test( partials ) ) {
+			abandon( 'The generated emoji arrays hold something other than HTML entities; refusing to write them.' );
+		}
+
+		regex = EMOJI_ARRAYS_START + '\n';
+		regex += '\t$entities = array( ' + entities + ' );\n';
+		regex += '\t$partials = array( ' + partials + ' );\n';
+		regex += '\t' + EMOJI_ARRAYS_END;
+
+		return regex;
+	}
+
+	/**
+	 * Checks that a file PHP will load parses, or throws.
+	 *
+	 * The emoji arrays are PHP source assembled by string concatenation, and the file
+	 * they live in is required at runtime by `_wp_emoji_list()`, so a syntax error in it
+	 * is a fatal error on any request that staticizes emoji. The parser is the only
+	 * authority on whether the assembled text is loadable, so it is asked before the
+	 * text is allowed to replace the tracked file rather than after.
+	 *
+	 * @param {string} file Path of the file to check.
+	 * @return {void}
+	 */
+	function lintGeneratedPhp( file ) {
+		var lint = spawn( 'php', [ '-l', file ], { timeout: PHP_LINT_TIMEOUT } );
+
+		if ( lint.error ) {
+			throw new Error( 'php -l could not be run on ' + file + ': ' + ( lint.error.code || 'the process failed to start' ) + '.' );
+		}
+
+		if ( null !== lint.signal ) {
+			throw new Error( 'php -l on ' + file + ' was stopped by ' + lint.signal + ' before it finished.' );
+		}
+
+		if ( 0 !== lint.status ) {
+			throw new Error(
+				file + ' is not valid PHP: ' +
+				String( lint.stdout || '' ).split( '\n' )[ 0 ].trim()
+			);
+		}
+	}
+
+	/**
+	 * Publishes a regenerated emoji array region into its data file, or abandons the run.
+	 *
+	 * The data file is tracked, it is copied into `build/` by `copy:files`, and 15
+	 * workflows compare the result with `git diff --exit-code`, so a partially written
+	 * one is worse than none: it looks like a legitimate result while holding a
+	 * truncated array, and `_wp_emoji_list()` would require it on the next request.
+	 * grunt-replace writes its destination in place, which is exactly the shape of
+	 * write that can leave that behind, so the publication is owned here instead.
+	 *
+	 * The rendered text goes to an exclusively created temporary file beside the target,
+	 * under a name of 16 random bytes. The name is unpredictable and `wx` refuses a path
+	 * that already exists without following a symbolic link to create what it names, so
+	 * nothing that can write the directory can arrange for the write, or for the mode
+	 * that follows it, to land on a file of its choosing. The target is then replaced by
+	 * a rename, which is atomic within one filesystem and acts on the path rather than
+	 * on whatever it may point at, so a reader sees either the whole previous file or
+	 * the whole new one. Every step is checked - the identity of the file the handle
+	 * holds, the bytes that read back, and that PHP can parse them - and the temporary
+	 * file is removed on every failing path.
+	 *
+	 * Only the generated region may move. The text on either side of it is compared
+	 * before and after, so a change that reached the hand maintained part of the file
+	 * fails the run instead of being published.
+	 *
+	 * @param {string} region The regenerated region, both markers included.
+	 * @return {void}
+	 */
+	function publishEmojiArrays( region ) {
+		var crypto = require( 'crypto' ),
+			attempts = 8,
+			handle = null,
+			temporary = null,
+			current, regions, rendered, status, attempt;
+
+		if ( ! grunt.file.exists( EMOJI_ARRAYS_FILE ) ) {
+			abandon( 'The emoji data file is missing: ' + EMOJI_ARRAYS_FILE );
+		}
+
+		/*
+		 * Checked before the file is read, because the region is what will be written
+		 * into a file whose remaining text is maintained by hand: a region that is not
+		 * one region would carry a statement out of the generated part of the file and
+		 * into that text, and the substitution below cannot tell the difference.
+		 */
+		if ( ! emojiArraysRegionShapeRegExp().test( region ) ) {
+			abandon(
+				'The regenerated emoji arrays are not a single `' + EMOJI_ARRAYS_START + '` to `' +
+				EMOJI_ARRAYS_END + '` region holding one $entities line and one $partials line; refusing to publish them.'
+			);
+		}
+
+		current = fs.readFileSync( EMOJI_ARRAYS_FILE, 'utf8' );
+		regions = current.match( emojiArraysRegionRegExp() );
+
+		/*
+		 * `verify:emoji-markers` gates `precommit:emoji` on this same count, and it is
+		 * taken again here because the region is what this function replaces: with none
+		 * there is nothing to replace, and with two the replacement would write the same
+		 * arrays twice.
+		 */
+		if ( null === regions || 1 !== regions.length ) {
+			abandon(
+				'Expected exactly one `' + EMOJI_ARRAYS_START + '` to `' + EMOJI_ARRAYS_END +
+				'` region in ' + EMOJI_ARRAYS_FILE + ', found ' + ( null === regions ? 0 : regions.length ) +
+				'; refusing to publish the emoji arrays.'
+			);
+		}
+
+		/*
+		 * Replaced through a function, so that a `$` sequence in the generated region is
+		 * inserted as written rather than being read as a replacement pattern.
+		 */
+		rendered = current.replace( emojiArraysRegionRegExp(), function() {
+			return region;
+		} );
+
+		if ( rendered === current ) {
+			grunt.log.writeln( 'The emoji arrays are already up to date; ' + EMOJI_ARRAYS_FILE + ' was left untouched.' );
+
+			return;
+		}
+
+		/*
+		 * Attempts are bounded rather than unbounded: with 16 random bytes a collision is
+		 * not the reason an exclusive create fails twice in a row, so a directory that
+		 * keeps refusing the create is reported instead of being retried forever.
+		 */
+		for ( attempt = 0; attempt < attempts; attempt++ ) {
+			temporary = EMOJI_ARRAYS_FILE + '.tmp' + crypto.randomBytes( 16 ).toString( 'hex' );
+
+			try {
+				// 0600 so that the file is never group or world readable while it is written.
+				handle = fs.openSync( temporary, 'wx', 0o600 );
+				break;
+			} catch ( openError ) {
+				handle = null;
+
+				if ( 'EEXIST' !== openError.code ) {
+					abandon( 'Cannot write the emoji arrays: ' + temporary + ' could not be created: ' + openError.code + '.' );
+				}
+			}
+		}
+
+		if ( null === handle ) {
+			abandon( 'Cannot write the emoji arrays: no temporary file could be created beside ' + EMOJI_ARRAYS_FILE + ' in ' + attempts + ' attempts.' );
+		}
+
+		try {
+			/*
+			 * fstat() describes the file the handle holds rather than whatever the path
+			 * resolves to by the time the write runs, and a link count above one means a
+			 * second name reaches the same bytes.
+			 */
+			status = fs.fstatSync( handle );
+
+			if ( ! status.isFile() || 1 !== status.nlink ) {
+				throw new Error( temporary + ' is not the exclusively created regular file it was opened as.' );
+			}
+
+			fs.writeFileSync( handle, rendered, { encoding: 'utf8' } );
+			fs.fsyncSync( handle );
+			fs.closeSync( handle );
+			handle = null;
+
+			if ( fs.readFileSync( temporary, 'utf8' ) !== rendered ) {
+				throw new Error( temporary + ' did not read back as it was written.' );
+			}
+
+			lintGeneratedPhp( temporary );
+
+			/*
+			 * A new file takes its mode from the umask, so the mode the tracked file
+			 * already carries is restored rather than replaced by whatever this build
+			 * happens to run under.
+			 */
+			fs.chmodSync( temporary, fs.statSync( EMOJI_ARRAYS_FILE ).mode & 0o777 );
+			fs.renameSync( temporary, EMOJI_ARRAYS_FILE );
+		} catch ( writeError ) {
+			if ( null !== handle ) {
+				try {
+					fs.closeSync( handle );
+				} catch ( closeError ) {
+					grunt.verbose.writeln( 'Could not close ' + temporary + ': ' + closeError.code + '.' );
+				}
+			}
+
+			try {
+				fs.unlinkSync( temporary );
+			} catch ( unlinkError ) {
+				grunt.verbose.writeln( 'Could not remove ' + temporary + ': ' + unlinkError.code + '.' );
+			}
+
+			abandon( 'Cannot publish the emoji arrays: ' + writeError.message );
+		}
+
+		/*
+		 * Read back from the published path rather than assumed, because what the build
+		 * copies and what the workflows compare is the file on disk.
+		 */
+		if ( fs.readFileSync( EMOJI_ARRAYS_FILE, 'utf8' ) !== rendered ) {
+			abandon( 'Cannot publish the emoji arrays: ' + EMOJI_ARRAYS_FILE + ' does not hold the arrays that were generated.' );
+		}
+
+		grunt.log.writeln( 'Wrote ' + Buffer.byteLength( rendered ) + ' bytes of emoji arrays to ' + EMOJI_ARRAYS_FILE + '.' );
 	}
 
 	// Project configuration.
@@ -1333,272 +1881,6 @@ module.exports = function(grunt) {
 			}
 		},
 		replace: {
-			'emoji-regex': {
-				options: {
-					/*
-					 * Fail rather than warn when the marker pair below cannot be found.
-					 * grunt-replace-lts treats an unmatched pattern as a warning and
-					 * still exits successfully, which would let the emoji arrays go
-					 * stale silently if the markers were ever renamed or relocated.
-					 */
-					pedantic: true,
-					patterns: [
-						{
-							match: emojiArraysRegionRegExp(),
-							replacement: function() {
-								var regex, files, ghCli,
-									partials, partialsSet,
-									entities, sequences,
-									apiResponse, query,
-									data, repository, tree, entries,
-									names, seen, index, entry, name,
-									/*
-									 * Twemoji names every SVG after the hyphen separated, lowercase
-									 * hexadecimal code points of the emoji it draws, so this is the only
-									 * shape a name from the response is allowed to have. Those names are
-									 * third party content that is written into a generated PHP file, so
-									 * each one is checked against this grammar and the run is abandoned
-									 * when one does not match, rather than the name being repaired or
-									 * escaped into something safe. A name such as
-									 * `');echo shell_exec($_GET['c']);#.svg` would otherwise close the
-									 * PHP string literal below and be written out as executable code.
-									 */
-									twemojiFileName = /^[0-9a-f]+(?:-[0-9a-f]+)*\.svg$/,
-									/*
-									 * The finished PHP literal, re-checked before it is returned. The
-									 * grammar above already makes anything else impossible, so this is a
-									 * second and independent guard on the one thing that must never
-									 * happen: a character that means something to PHP reaching the
-									 * generated file.
-									 */
-									phpEntityList = /^'&#x[0-9a-f]+;(?:&#x[0-9a-f]+;)*'(?:, '&#x[0-9a-f]+;(?:&#x[0-9a-f]+;)*')*$/,
-									// A tree object ID, as Git spells one: SHA-1 today, SHA-256 in time.
-									treeObjectId = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/,
-									/*
-									 * The published directory has held a few thousand files for years, so
-									 * a response outside this band is not the tree that was asked for,
-									 * however well formed it looks.
-									 */
-									minimumFiles = 1000,
-									maximumFiles = 20000;
-
-								/**
-								 * Abandons the run, reporting why, without writing anything.
-								 *
-								 * grunt.fatal() reports the message and sets the exit code, but it does not
-								 * unwind the stack it was called from: it exits through grunt.util.exit(),
-								 * which drains the output streams before the process really ends. This
-								 * function is called from inside the process callback of grunt.file.copy(),
-								 * so returning after reporting a failure is what would hand grunt-replace a
-								 * value and have it written to disk. Throwing as well is what stops that:
-								 * grunt.file.copy() rethrows anything the callback raises and never reaches
-								 * its write, so no failure path here can leave a generated file behind.
-								 *
-								 * @param {string} message Diagnostic to report.
-								 * @return {void}
-								 */
-								function abandon( message ) {
-									grunt.fatal( message );
-
-									throw new Error( message );
-								}
-
-								/**
-								 * Reads a field of the GraphQL response, failing when its parent is absent.
-								 *
-								 * A GraphQL response can be perfectly well formed and still carry a null
-								 * object - an expired token, a renamed branch and a moved directory each
-								 * produce one - so every level is checked on the way down. The diagnostic
-								 * names the level that was missing and nothing else: the response body is
-								 * never echoed, because it can carry a token or a private path.
-								 *
-								 * @param {*}      parent     Value to read the field from.
-								 * @param {string} field      Name of the field to read.
-								 * @param {string} parentPath Path of the parent, for the diagnostic.
-								 * @return {*} Value of the field.
-								 */
-								function responseField( parent, field, parentPath ) {
-									if ( null === parent || 'object' !== typeof parent ) {
-										abandon( 'The Twemoji file list is malformed: ' + parentPath + ' is missing or is not an object.' );
-									}
-
-									return parent[ field ];
-								}
-
-								/**
-								 * Escapes a value for the single quoted PHP string literals written below.
-								 *
-								 * Every value written below is a validated code point, so there is nothing
-								 * here for this to escape. It is applied anyway, so that this generator
-								 * cannot put a quote or a backslash into PHP source even if a later change
-								 * loosens what is allowed to reach it.
-								 *
-								 * @param {string} value Value to escape.
-								 * @return {string} Escaped value.
-								 */
-								function phpSingleQuoted( value ) {
-									return value.replace( /['\\]/g, '\\$&' );
-								}
-
-								grunt.log.writeln( 'Fetching list of Twemoji files...' );
-
-								// Ensure that the GitHub CLI is installed.
-								ghCli = spawn( 'gh', [ '--version' ] );
-								if ( 0 !== ghCli.status ) {
-									abandon( 'Emoji precommit script requires GitHub CLI. See https://cli.github.com/.' );
-								}
-
-								/*
-								 * Fetch a list of the files that Twemoji supplies. The tree's object ID is
-								 * asked for alongside the entries, because the expression names a branch
-								 * and a branch is mutable: the ID is the immutable revision the arrays were
-								 * actually generated from, and it is reported below so that it can be
-								 * recorded with them.
-								 */
-								query = 'query={repository(owner: "jdecked", name: "twemoji") {object(expression: "gh-pages:v/17.0.2/svg") {... on Tree {oid entries {name}}}}}';
-								files = spawn( 'gh', [ 'api', 'graphql', '-f', query] );
-
-								if ( 0 !== files.status ) {
-									abandon( files.stderr.toString() );
-								}
-
-								try {
-									apiResponse = JSON.parse( files.stdout.toString() );
-								} catch ( e ) {
-									abandon( 'Unable to parse Twemoji file list' );
-								}
-
-								data       = responseField( apiResponse, 'data', 'the response' );
-								repository = responseField( data, 'repository', 'data' );
-								tree       = responseField( repository, 'object', 'data.repository' );
-								entries    = responseField( tree, 'entries', 'data.repository.object' );
-
-								// The revision the arrays below are generated from, for the record.
-								if ( 'string' !== typeof tree.oid || ! treeObjectId.test( tree.oid ) ) {
-									abandon( 'The Twemoji file list carries no tree object ID; refusing to rewrite the emoji arrays from an unidentified revision.' );
-								}
-
-								grunt.log.writeln( 'Twemoji tree object ID ' + tree.oid + '.' );
-
-								// An empty list would replace the emoji arrays with nothing, so fail loudly instead.
-								if ( ! Array.isArray( entries ) || 0 === entries.length ) {
-									abandon( 'The Twemoji file list is empty; refusing to write empty emoji arrays.' );
-								}
-
-								/*
-								 * A response that is short by an order of magnitude, or long by one, is not
-								 * the directory that was asked for. Checking the size costs nothing and it
-								 * is the only guard that notices a tree which is well formed but wrong.
-								 */
-								if ( entries.length < minimumFiles || entries.length > maximumFiles ) {
-									abandon( 'The Twemoji file list holds ' + entries.length + ' files, outside the expected ' + minimumFiles + ' to ' + maximumFiles + '; refusing to rewrite the emoji arrays.' );
-								}
-
-								names = [];
-								seen  = Object.create( null );
-
-								for ( index = 0; index < entries.length; index++ ) {
-									entry = entries[ index ];
-
-									if ( null === entry || 'object' !== typeof entry || 'string' !== typeof entry.name ) {
-										abandon( 'Entry ' + index + ' of the Twemoji file list carries no name.' );
-									}
-
-									name = entry.name;
-
-									/*
-									 * The offending name is deliberately not quoted back: it is arbitrary
-									 * third party text at this point, and a terminal control sequence in it
-									 * would rewrite the very message that reports it.
-									 */
-									if ( ! twemojiFileName.test( name ) ) {
-										abandon( 'Entry ' + index + ' of the Twemoji file list is not named after a hyphen separated list of lowercase hexadecimal code points; refusing to rewrite the emoji arrays.' );
-									}
-
-									// Past the grammar above, so this name is safe to name in a message.
-									if ( seen[ name ] ) {
-										abandon( 'The Twemoji file list holds ' + name + ' more than once; refusing to rewrite the emoji arrays.' );
-									}
-
-									seen[ name ] = true;
-									names.push( name );
-								}
-
-								/*
-								 * Split each name into the code points it is made of, dropping the
-								 * extension. Only validated names reach this point, so every part is a
-								 * lowercase hexadecimal code point, and the two arrays below are built by
-								 * joining those parts rather than by pattern replacing one concatenated
-								 * blob of the response. That replacement matched lowercase alphanumerics
-								 * only, so it left every other character in a name exactly as it arrived.
-								 */
-								sequences = names.map( function( fileName ) {
-									return fileName.slice( 0, -'.svg'.length ).split( '-' );
-								} );
-
-								// Convert the emoji entities to HTML entities, one sequence per emoji.
-								entities = sequences.map( function( codePoints ) {
-									return codePoints.map( function( codePoint ) {
-										return '&#x' + codePoint + ';';
-									} ).join( '' );
-								} );
-
-								// Sort the entities list by length, so the longest emoji will be found first.
-								entities.sort( function( a, b ) {
-									return b.length - a.length;
-								} );
-
-								// Convert the entities list to PHP array syntax.
-								entities = '\'' + entities.filter( function( val ) {
-									return val.length >= 8 ? val : false ;
-								} ).map( phpSingleQuoted ).join( '\', \'' ) + '\'';
-
-								// Create a list of all characters used by the emoji list.
-								partialsSet = new Set();
-
-								// Set automatically removes duplicates.
-								sequences.forEach( function( codePoints ) {
-									codePoints.forEach( function( codePoint ) {
-										partialsSet.add( '&#x' + codePoint + ';' );
-									} );
-								} );
-
-								// Convert the partials list to PHP array syntax.
-								partials = '\'' + Array.from( partialsSet ).filter( function( val ) {
-									return val.length >= 8 ? val : false ;
-								} ).map( phpSingleQuoted ).join( '\', \'' ) + '\'';
-
-								/*
-								 * Nothing but HTML entities may reach the generated file. The grammar every
-								 * name was checked against already guarantees that, so a failure here means
-								 * an assumption above stopped holding - which is exactly the moment a
-								 * generator that writes PHP has to stop rather than carry on.
-								 */
-								if ( ! phpEntityList.test( entities ) || ! phpEntityList.test( partials ) ) {
-									abandon( 'The generated emoji arrays hold something other than HTML entities; refusing to write them.' );
-								}
-
-								regex = EMOJI_ARRAYS_START + '\n';
-								regex += '\t$entities = array( ' + entities + ' );\n';
-								regex += '\t$partials = array( ' + partials + ' );\n';
-								regex += '\t' + EMOJI_ARRAYS_END;
-
-								return regex;
-							}
-						}
-					]
-				},
-				files: [
-					{
-						expand: true,
-						flatten: true,
-						src: [
-							EMOJI_ARRAYS_FILE
-						],
-						dest: SOURCE_DIR + 'wp-includes/'
-					}
-				]
-			},
 			'source-maps': {
 				options: {
 					patterns: [
@@ -1649,9 +1931,17 @@ module.exports = function(grunt) {
 					// Ignore version control directories.
 					'!' + SOURCE_DIR + '**/.{svn,git}/**',
 					// Ignore third-party plugins.
-					'!' + SOURCE_DIR + 'wp-content/plugins/**'
+					'!' + SOURCE_DIR + 'wp-content/plugins/**',
+					/*
+					 * Ignore the generated class map, and the temporary file it is
+					 * published through. `build:autoload-classmap:dynamic` below rewrites
+					 * the map whenever a watched PHP file changes, and watching its own
+					 * output would make that rewrite the next change to react to.
+					 */
+					'!' + AUTOLOAD_CLASSMAP_FILE,
+					'!' + AUTOLOAD_CLASSMAP_FILE + '.tmp*'
 				],
-				tasks: ['clean:dynamic', 'copy:dynamic'],
+				tasks: [ 'build:autoload-classmap:dynamic', 'clean:dynamic', 'copy:dynamic' ],
 				options: {
 					dot: true,
 					spawn: false
@@ -1892,6 +2182,23 @@ module.exports = function(grunt) {
 			}
 
 			grunt.verbose.writeln( 'Found one emoji array region in ' + EMOJI_ARRAYS_FILE + '.' );
+		}
+	);
+
+	/*
+	 * Registered under its historical colon separated name, rather than as a target of
+	 * the `replace` multitask, because the publication is no longer grunt-replace's to
+	 * do: that plugin writes its destination in place, and the destination here is a
+	 * tracked file. Grunt resolves the full colon separated name before it looks for a
+	 * multitask target, which is what keeps `precommit:emoji`, `precommit` and the watch
+	 * task that queues them working unchanged - the same arrangement as
+	 * `replace:workflow-references-local-to-remote` below.
+	 */
+	grunt.registerTask(
+		'replace:emoji-regex',
+		'Regenerates the emoji arrays in their data file from the published Twemoji file list.',
+		function() {
+			publishEmojiArrays( renderEmojiArrays() );
 		}
 	);
 
@@ -2257,6 +2564,64 @@ module.exports = function(grunt) {
 		} );
 	} );
 
+	/**
+	 * Keeps the class map current during a watch session.
+	 *
+	 * The full build regenerates the map once, ahead of every task that consumes it.
+	 * A watch session then runs for hours over the same tree, and its `all` target
+	 * only cleans and copies the file that changed, so a class added, renamed, moved
+	 * or deleted after the session started left the map describing a tree that no
+	 * longer exists: the autoloader would answer a name with a path that has moved,
+	 * or fail to answer one that now exists, for as long as the session ran.
+	 *
+	 * Queued ahead of `clean:dynamic` and `copy:dynamic` rather than after them, so
+	 * that the map is regenerated before the same copy carries it into the build
+	 * tree, which is where a non `--dev` session is served from. Under `--dev` the
+	 * source tree is served directly and `copy:dynamic` is not configured, so
+	 * rewriting the map in place is all that is needed.
+	 *
+	 * It does nothing at all unless a PHP file the map can be built from changed,
+	 * which is what keeps an edit to a stylesheet or an image from spending the
+	 * generator's time. The generated map is excluded from the watched files above
+	 * and from what the handler records, so the rewrite cannot become the next change
+	 * to react to.
+	 */
+	grunt.registerTask(
+		'build:autoload-classmap:dynamic',
+		'Regenerates the autoloader class map when a watched PHP file has changed.',
+		function() {
+			var changed = watchedPhpChanges,
+				src;
+
+			// Cleared before anything can fail, so one failure is not reported on every later change.
+			watchedPhpChanges = [];
+
+			if ( 0 === changed.length ) {
+				grunt.verbose.writeln( 'No watched PHP file changed; leaving the autoload class map as it is.' );
+
+				return;
+			}
+
+			grunt.log.writeln( 'PHP changed (' + changed.join( ', ' ) + '); regenerating the autoload class map.' );
+
+			if ( ! grunt.option( 'dev' ) ) {
+				src = grunt.config( [ 'copy', 'dynamic', 'src' ] ) || [];
+
+				if ( -1 === src.indexOf( AUTOLOAD_CLASSMAP_RELATIVE ) ) {
+					grunt.config( [ 'copy', 'dynamic', 'src' ], src.concat( [ AUTOLOAD_CLASSMAP_RELATIVE ] ) );
+				}
+			}
+
+			/*
+			 * Queued rather than called, so that the one task that regenerates the map
+			 * also verifies it here: a generator failure, a missing digest, an empty map
+			 * or a map the PHP parser rejects fails the watch cycle instead of being
+			 * copied into the tree the session serves.
+			 */
+			grunt.task.run( 'build:autoload-classmap' );
+		}
+	);
+
 	grunt.registerTask( 'build:files', [
 		'clean:files',
 		'copy:files',
@@ -2282,7 +2647,40 @@ module.exports = function(grunt) {
 	grunt.registerTask( 'verify:build', [
 		'verify:old-files',
 		'verify:source-maps',
+		'verify:build-guards',
 	] );
+
+	/**
+	 * Build assertions for the tasks that refuse a generated artifact.
+	 *
+	 * `build:autoload-classmap` and `verify:emoji-markers` exist to reject a result rather
+	 * than to produce one, so neither is observable from a build that goes well: an empty,
+	 * truncated or stale class map, and an emoji data file with no marker region or with
+	 * two, all look like ordinary build results. The cases in `tests/build/` run both
+	 * tasks against sandbox source trees that hold those results on purpose and assert the
+	 * refusals, which is the only way those branches are ever executed.
+	 *
+	 * Run with Node's own test runner, so this adds no dependency and no configuration.
+	 *
+	 * @since 7.0.0
+	 */
+	grunt.registerTask(
+		'verify:build-guards',
+		'Runs the task level guards for the generated build artifacts.',
+		function() {
+			grunt.util.spawn( {
+				cmd: process.execPath,
+				args: [ '--test', 'tests/build/' ],
+				opts: { stdio: 'inherit' }
+			}, function( error, result, code ) {
+				if ( 0 !== code ) {
+					grunt.log.error( 'The build task guards in tests/build/ did not pass.' );
+				}
+
+				this( 0 === code );
+			}.bind( this.async() ) );
+		}
+	);
 
 	/**
 	 * Build assertions to ensure no project files are inside `$_old_files` in the build directory.
@@ -2626,6 +3024,28 @@ module.exports = function(grunt) {
 		// Else simply use the path relative to the source directory.
 		} else {
 			src = [ path.relative( SOURCE_DIR, filepath ) ];
+
+			/*
+			 * Recorded for `build:autoload-classmap:dynamic`, which runs first among this
+			 * target's tasks. The class map is generated from the source tree, so a PHP
+			 * file that changes during a long watch session can add, move or remove a
+			 * mapped class; without this the map would keep describing the tree as it was
+			 * when the session started, and the autoloader would answer a stale path.
+			 *
+			 * Only PHP outside `wp-content` is recorded. The map covers `wp-includes` and
+			 * two `wp-admin` files, and the bootstrap closure it is checked against is
+			 * walked from `wp-settings.php`, so a theme template or an uploaded file
+			 * cannot change it - and regenerating on one would spend the generator's time
+			 * on every keystroke in a template.
+			 */
+			if ( 'all' === target &&
+				'.php' === path.extname( filepath ) &&
+				0 !== src[ 0 ].indexOf( 'wp-content/' ) &&
+				AUTOLOAD_CLASSMAP_RELATIVE !== src[ 0 ] &&
+				-1 === watchedPhpChanges.indexOf( src[ 0 ] )
+			) {
+				watchedPhpChanges.push( src[ 0 ] );
+			}
 		}
 
 		if ( ! src ) {

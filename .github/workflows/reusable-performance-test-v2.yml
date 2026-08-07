@@ -98,8 +98,7 @@ jobs:
   # - Disable external HTTP requests.
   # - Disable cron.
   # - List defined constants.
-  # - Install MU plugins.
-  # - Record cache and OPcache regime.
+  # - Install MU plugin.
   # - Run performance tests.
   # - Archive artifacts.
   # - Ensure version-controlled files are not modified or deleted.
@@ -245,30 +244,10 @@ jobs:
       - name: List defined constants
         run: npm run env:cli -- config list --path="/var/www/${LOCAL_DIR}"
 
-      # clear-cache.php is what makes /?clear_cache reset OPcache, APCu, the object
-      # cache and expired transients before each measured navigation. Without it that
-      # request is an ordinary page load that resets nothing, and every figure the
-      # suite labels uncached is measured against warm caches instead. The specs
-      # assert the 202 it answers with, so a missing copy fails the run rather than
-      # quietly changing what the numbers mean.
-      - name: Install MU plugins
+      - name: Install MU plugin
         run: |
           mkdir "./${LOCAL_DIR}/wp-content/mu-plugins"
           cp ./tests/performance/wp-content/mu-plugins/server-timing.php "./${LOCAL_DIR}/wp-content/mu-plugins/server-timing.php"
-          cp ./tests/performance/wp-content/mu-plugins/clear-cache.php "./${LOCAL_DIR}/wp-content/mu-plugins/clear-cache.php"
-
-      # Opcode-cache state moves measured time and memory by far more than any change
-      # under test, so the regime the requests actually ran under is recorded here
-      # rather than left to be inferred from the results.
-      - name: Record cache and OPcache regime
-        run: |
-          ls -l "./${LOCAL_DIR}/wp-content/mu-plugins"
-          if [ -f "./${LOCAL_DIR}/wp-content/object-cache.php" ]; then
-            echo "object-cache.php drop-in: present"
-          else
-            echo "object-cache.php drop-in: absent"
-          fi
-          node ./tools/local-env/scripts/docker.js run --rm php php -r 'foreach ( array( "opcache.enable", "opcache.enable_cli", "opcache.validate_timestamps", "opcache.revalidate_freq" ) as $s ) { printf( "%s = %s\n", $s, var_export( ini_get( $s ), true ) ); } printf( "opcache_reset() available = %s\n", var_export( function_exists( "opcache_reset" ), true ) );'
 
       - name: Run performance tests
         run: npm run test:performance

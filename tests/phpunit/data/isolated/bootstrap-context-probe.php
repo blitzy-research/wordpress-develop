@@ -207,6 +207,88 @@ function wp_probe_site_health_hooks() {
 	return $hooks;
 }
 
+/**
+ * Describes every callback registered on the Site Health weekly check.
+ *
+ * The identity, the priority and the accepted argument count are all part of what a site
+ * observes, and all three were changed by an earlier attempt to construct Site Health
+ * conditionally. Reporting them is what lets the caller pin them to what base registers,
+ * so that the same change cannot be made again without a test saying so.
+ *
+ * @return array[] One entry per callback, each with its priority, identity and argument count.
+ */
+function wp_probe_site_health_cron_callbacks() {
+	$hook = 'wp_site_health_scheduled_check';
+
+	if ( ! isset( $GLOBALS['wp_filter'][ $hook ] ) ) {
+		return array();
+	}
+
+	$callbacks = array();
+	$hook_object = $GLOBALS['wp_filter'][ $hook ];
+
+	foreach ( $hook_object as $priority => $registered ) {
+		foreach ( $registered as $callback ) {
+			$function = $callback['function'];
+
+			if ( is_array( $function ) ) {
+				$identity = ( is_object( $function[0] ) ? get_class( $function[0] ) : (string) $function[0] ) . '::' . $function[1];
+			} elseif ( is_string( $function ) ) {
+				$identity = $function;
+			} else {
+				$identity = '(' . gettype( $function ) . ')';
+			}
+
+			$callbacks[] = array(
+				'priority'      => (int) $priority,
+				'identity'      => $identity,
+				'accepted_args' => (int) $callback['accepted_args'],
+			);
+		}
+	}
+
+	return $callbacks;
+}
+
+/**
+ * Returns the mapped files that were loaded, as paths relative to the WordPress root.
+ *
+ * Every value in the generated class map names a file the bootstrap is supposed to have
+ * stopped requiring, so the ones that are loaded anyway are the complete list of exceptions
+ * to the deferral. Reporting the list rather than its length is what makes a re-eagered
+ * file identifiable rather than merely countable.
+ *
+ * @return string[] Sorted relative paths of mapped files that are loaded.
+ */
+function wp_probe_eager_mapped_files() {
+	$classmap_file = ABSPATH . WPINC . '/autoload-classmap.php';
+
+	if ( ! file_exists( $classmap_file ) ) {
+		return array();
+	}
+
+	$classmap = require $classmap_file;
+
+	if ( ! is_array( $classmap ) ) {
+		return array();
+	}
+
+	$root   = wp_normalize_path( ABSPATH );
+	$loaded = array();
+
+	foreach ( array_map( 'wp_normalize_path', get_included_files() ) as $file ) {
+		if ( 0 === strpos( $file, $root ) ) {
+			$loaded[ substr( $file, strlen( $root ) ) ] = true;
+		}
+	}
+
+	$eager = array_values( array_intersect( array_unique( array_values( $classmap ) ), array_keys( $loaded ) ) );
+
+	sort( $eager );
+
+	return $eager;
+}
+
 $wp_probe_declared_before = wp_probe_site_health_declared();
 
 require_once ABSPATH . 'wp-settings.php';
@@ -235,6 +317,8 @@ $wp_probe_result = array(
 	'schedule_attempts'     => $GLOBALS['wp_probe_schedule_attempts'],
 	'scheduled_events'      => $GLOBALS['wp_probe_scheduled_events'],
 	'cron_handler'          => false !== has_action( 'wp_site_health_scheduled_check' ),
+	'cron_callbacks'        => wp_probe_site_health_cron_callbacks(),
+	'eager_mapped_files'    => wp_probe_eager_mapped_files(),
 	'plugin'                => array(
 		'api_file_loaded'   => in_array( $wp_probe_plugin_api, $wp_probe_included_files, true ),
 		'api_available'     => function_exists( 'get_plugin_data' ),
@@ -308,15 +392,23 @@ if ( ! defined( 'SHORTINIT' ) || ! SHORTINIT ) {
 /*
  * A REST request only differs in that a server is created, which is the single place
  * `rest_api_init` is fired from, and therefore the only time the REST routes are
- * registered. The ordering is what is observed here: the routes are registered at
- * priority 99, nothing before that references Site Health, and the class map is what
- * makes the name resolve at the moment something does. So a callback at any priority in
- * between sees the class still undeclared, and any callback that asks for it gets it.
+ * registered. The ordering is what is observed here, measured on a REST controller rather
+ * than on Site Health, because the controllers are the classes the bootstrap genuinely
+ * stopped loading: `create_initial_rest_routes()` runs on `rest_api_init` at priority 99,
+ * and referencing a controller name there is what loads it through the class map. So a
+ * callback at any priority before that sees the name still undeclared, and any callback
+ * that asks for it gets it anyway.
  *
- * The two reads are ordered deliberately. `wp_probe_site_health_declared()` never
- * autoloads, so it can be taken at every priority without disturbing the next one, while
- * the resolving read is taken only at the last probed priority, after that priority's
- * declared read, because resolving the name is what loads the class.
+ * Both halves matter. That no earlier priority has the name declared is what says the
+ * deferral is real rather than undone by something loading the file during the bootstrap;
+ * that a callback at one of those priorities can still resolve the name is what says the
+ * deferral costs a plugin nothing, since a plugin's own `rest_api_init` callback is exactly
+ * the code a broken deferral would break.
+ *
+ * The two reads are ordered deliberately. The non-autoloading read can be taken at every
+ * priority without disturbing the next one, while the resolving read is taken only at the
+ * last probed priority, after that priority's non-autoloading read, because resolving the
+ * name is what loads the class.
  */
 if ( 'rest' === $wp_probe_context ) {
 	$wp_probe_seen       = array();
@@ -326,10 +418,10 @@ if ( 'rest' === $wp_probe_context ) {
 		add_action(
 			'rest_api_init',
 			static function () use ( &$wp_probe_seen, &$wp_probe_resolvable, $wp_probe_priority ) {
-				$wp_probe_seen[ $wp_probe_priority ] = wp_probe_site_health_declared();
+				$wp_probe_seen[ $wp_probe_priority ] = class_exists( 'WP_REST_Posts_Controller', false );
 
 				if ( 98 === $wp_probe_priority ) {
-					$wp_probe_resolvable = class_exists( 'WP_Site_Health' );
+					$wp_probe_resolvable = class_exists( 'WP_REST_Posts_Controller' );
 				}
 			},
 			$wp_probe_priority
@@ -338,6 +430,9 @@ if ( 'rest' === $wp_probe_context ) {
 
 	$wp_probe_declared_before_server = wp_probe_site_health_declared();
 	$wp_probe_routes                 = array_keys( rest_get_server()->get_routes() );
+	$wp_probe_sorted_routes          = $wp_probe_routes;
+
+	sort( $wp_probe_sorted_routes );
 
 	$wp_probe_result['rest'] = array(
 		'declared_before_server'    => $wp_probe_declared_before_server,
@@ -347,6 +442,12 @@ if ( 'rest' === $wp_probe_context ) {
 		'seen_at_priority'          => $wp_probe_seen,
 		'resolvable_at_priority_98' => $wp_probe_resolvable,
 		'routes'                    => count( $wp_probe_routes ),
+		/*
+		 * Reported in full, and sorted, so that the caller can pin the inventory rather than
+		 * its size. A deferral that dropped one namespace while a plugin added another would
+		 * leave the count unchanged.
+		 */
+		'route_list'                => $wp_probe_sorted_routes,
 		'site_health_routes'        => count(
 			array_values(
 				array_filter(

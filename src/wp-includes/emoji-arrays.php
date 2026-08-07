@@ -6,8 +6,14 @@
  * `precommit:emoji` task in Gruntfile.js and must not be edited manually. The rest of
  * this file is maintained by hand.
  *
- * The arrays are built from the regex in twemoji.js - if they need to be updated, you
- * should update the regex there, then run the `npm run grunt precommit:emoji` job.
+ * The arrays are built from the list of SVG files Twemoji ships, not from any regular
+ * expression: the task asks the GitHub API for the `gh-pages:v/17.0.2/svg` tree of the
+ * jdecked/twemoji repository, records that tree's object ID, and derives one HTML entity
+ * sequence per file name, because Twemoji names every SVG after the hyphen separated,
+ * lowercase hexadecimal code points of the emoji it draws. `$entities` holds one sequence
+ * per emoji, longest first; `$partials` holds the individual code points those sequences
+ * are made of. To update them, point the task at a newer Twemoji revision and run the
+ * `npm run grunt precommit:emoji` job.
  *
  * The data lives here rather than inline in wp-includes/formatting.php, and this file is
  * loaded on demand by _wp_emoji_list() rather than during the bootstrap.

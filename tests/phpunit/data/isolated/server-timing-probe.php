@@ -387,19 +387,6 @@ if ( 'list' === $argv[2] ) {
 	exit( 0 );
 }
 
-$wp_perf_probe_counter_directory = '';
-
-if ( 'measurement-metadata' === $argv[2] ) {
-	$wp_perf_probe_counter_directory = sys_get_temp_dir() . '/wp-performance-probe-' . getmypid();
-
-	if ( ! mkdir( $wp_perf_probe_counter_directory, 0700 ) && ! is_dir( $wp_perf_probe_counter_directory ) ) {
-		fwrite( STDERR, "Cannot create the process-counter fixture directory.\n" );
-		exit( 1 );
-	}
-
-	define( 'WP_PERFORMANCE_PROCESS_COUNTER_DIR', $wp_perf_probe_counter_directory );
-}
-
 require $argv[1];
 
 list( $wp_perf_probe_set_global, $wp_perf_probe_value ) = wp_perf_probe_fixture( $argv[2] );
@@ -440,50 +427,138 @@ if ( 'measurement-metadata' === $argv[2] ) {
 	$wp_perf_probe_metadata['runtime_first']  = array_map( 'wp_perf_probe_describe', wp_perf_runtime_metadata() );
 	$wp_perf_probe_metadata['runtime_reread'] = array_map( 'wp_perf_probe_describe', wp_perf_runtime_metadata() );
 
-	$wp_perf_probe_metadata['opcache_enabled'] = array_map(
+	/*
+	 * The regime fields come from the interpreter flags and the diagnostic fields from the
+	 * status, and these cases hold those two axes apart. The one that matters most is the
+	 * inactive accelerator: the suite resets the opcode cache before every measured
+	 * iteration, a reset is only performed once a request can take the lock with no other
+	 * worker active, and every request arriving before that reports an inactive accelerator
+	 * while the cache still holds its scripts. Reading the regime from there would make it
+	 * change between iterations of one scenario.
+	 */
+	$wp_perf_probe_opcache_status = array(
+		'opcache_enabled'    => true,
+		'jit'                => array(
+			'on' => true,
+		),
+		'opcache_statistics' => array(
+			'num_cached_scripts' => '321',
+			'opcache_hit_rate'   => 98.7654,
+		),
+	);
+
+	$wp_perf_probe_opcache_inactive                    = $wp_perf_probe_opcache_status;
+	$wp_perf_probe_opcache_inactive['opcache_enabled'] = false;
+	$wp_perf_probe_opcache_inactive['jit']             = array( 'on' => false );
+
+	$wp_perf_probe_opcache_on = array(
+		'opcache.enable'          => true,
+		'opcache.enable_cli'      => true,
+		'opcache.jit'             => 'tracing',
+		'opcache.jit_buffer_size' => 67108864,
+	);
+
+	$wp_perf_probe_opcache_off                   = $wp_perf_probe_opcache_on;
+	$wp_perf_probe_opcache_off['opcache.enable'] = false;
+
+	$wp_perf_probe_opcache_jit_off                = $wp_perf_probe_opcache_on;
+	$wp_perf_probe_opcache_jit_off['opcache.jit'] = 'disable';
+
+	$wp_perf_probe_opcache_no_buffer                            = $wp_perf_probe_opcache_on;
+	$wp_perf_probe_opcache_no_buffer['opcache.jit_buffer_size'] = 0;
+
+	$wp_perf_probe_metadata['opcache_configured_on'] = array_map(
 		'wp_perf_probe_describe',
-		wp_perf_opcache_metadata(
-			array(
-				'opcache_enabled'   => true,
-				'jit'               => array(
-					'on' => true,
-				),
-				'opcache_statistics' => array(
-					'num_cached_scripts' => '321',
-					'opcache_hit_rate'   => 98.7654,
-				),
-			)
-		)
+		wp_perf_opcache_metadata( $wp_perf_probe_opcache_status, $wp_perf_probe_opcache_on )
+	);
+
+	$wp_perf_probe_metadata['opcache_configured_off'] = array_map(
+		'wp_perf_probe_describe',
+		wp_perf_opcache_metadata( $wp_perf_probe_opcache_status, $wp_perf_probe_opcache_off )
+	);
+
+	$wp_perf_probe_metadata['opcache_accelerator_inactive'] = array_map(
+		'wp_perf_probe_describe',
+		wp_perf_opcache_metadata( $wp_perf_probe_opcache_inactive, $wp_perf_probe_opcache_on )
+	);
+
+	$wp_perf_probe_metadata['opcache_jit_off'] = array_map(
+		'wp_perf_probe_describe',
+		wp_perf_opcache_metadata( $wp_perf_probe_opcache_status, $wp_perf_probe_opcache_jit_off )
+	);
+
+	$wp_perf_probe_metadata['opcache_jit_without_buffer'] = array_map(
+		'wp_perf_probe_describe',
+		wp_perf_opcache_metadata( $wp_perf_probe_opcache_status, $wp_perf_probe_opcache_no_buffer )
 	);
 
 	$wp_perf_probe_metadata['opcache_unavailable'] = array_map(
 		'wp_perf_probe_describe',
-		wp_perf_opcache_metadata( false )
+		wp_perf_opcache_metadata( false, $wp_perf_probe_opcache_off )
 	);
 
-	$wp_perf_probe_metadata['opcache_invalid_statistics'] = array_map(
+	/*
+	 * Directive resolution. A configuration snapshot wins whenever it carries the name, and
+	 * an absent one delegates to ini_get() rather than reporting an unknown regime, because
+	 * opcache.restrict_api refuses opcache_get_configuration() while never refusing
+	 * ini_get(). Delegation is reported beside ini_get() read here in the same process, so
+	 * asserting it needs no assumption about how this process is configured.
+	 */
+	$wp_perf_probe_metadata['opcache_directive'] = array_map(
 		'wp_perf_probe_describe',
-		wp_perf_opcache_metadata(
-			array(
-				'opcache_enabled'    => true,
-				'opcache_statistics' => array(
-					'num_cached_scripts' => -1,
-					'opcache_hit_rate'   => 101,
-				),
-			)
+		array(
+			'from_snapshot' => wp_perf_opcache_directive( array( 'opcache.enable' => 'off' ), 'opcache.enable' ),
+			'from_ini'      => wp_perf_opcache_directive( null, 'opcache.enable' ),
+			'ini_value'     => ini_get( 'opcache.enable' ),
+			'name_absent'   => wp_perf_opcache_directive( array(), 'opcache.jit' ),
+			'jit_ini_value' => ini_get( 'opcache.jit' ),
+			'unknown_name'  => wp_perf_opcache_directive( null, 'opcache.not.a.real.directive' ),
 		)
 	);
 
-	$wp_perf_probe_metadata['process_counter'] = array(
-		'first'          => wp_perf_process_request_count( 123, 456, $wp_perf_probe_counter_directory ),
-		'second'         => wp_perf_process_request_count( 123, 456, $wp_perf_probe_counter_directory ),
-		'new_generation' => wp_perf_process_request_count( 123, 457, $wp_perf_probe_counter_directory ),
+	/*
+	 * Boolean normalization. opcache_get_configuration() types a boolean directive as a
+	 * boolean and ini_get() types it as a string whose spelling differs between builds, so
+	 * every form either source can answer with is covered here.
+	 */
+	$wp_perf_probe_metadata['opcache_flag'] = array_map(
+		'wp_perf_probe_describe',
+		array(
+			'boolean_true'  => wp_perf_opcache_flag( array( 'directive' => true ), 'directive' ),
+			'boolean_false' => wp_perf_opcache_flag( array( 'directive' => false ), 'directive' ),
+			'integer_one'   => wp_perf_opcache_flag( array( 'directive' => 1 ), 'directive' ),
+			'integer_zero'  => wp_perf_opcache_flag( array( 'directive' => 0 ), 'directive' ),
+			'float_one'     => wp_perf_opcache_flag( array( 'directive' => 1.0 ), 'directive' ),
+			'float_zero'    => wp_perf_opcache_flag( array( 'directive' => 0.0 ), 'directive' ),
+			'float_nan'     => wp_perf_opcache_flag( array( 'directive' => NAN ), 'directive' ),
+			'string_one'    => wp_perf_opcache_flag( array( 'directive' => '1' ), 'directive' ),
+			'string_on'     => wp_perf_opcache_flag( array( 'directive' => ' On ' ), 'directive' ),
+			'string_true'   => wp_perf_opcache_flag( array( 'directive' => 'TRUE' ), 'directive' ),
+			'string_yes'    => wp_perf_opcache_flag( array( 'directive' => 'yes' ), 'directive' ),
+			'string_zero'   => wp_perf_opcache_flag( array( 'directive' => '0' ), 'directive' ),
+			'string_off'    => wp_perf_opcache_flag( array( 'directive' => 'Off' ), 'directive' ),
+			'string_empty'  => wp_perf_opcache_flag( array( 'directive' => '' ), 'directive' ),
+			'array_value'   => wp_perf_opcache_flag( array( 'directive' => array( 1 ) ), 'directive' ),
+			'null_value'    => wp_perf_opcache_flag( array( 'directive' => null ), 'directive' ),
+		)
 	);
 
+	/*
+	 * Only the four duration slugs are scaled to milliseconds. Every other slug carries a
+	 * count, a flag or a byte size, so a value that is merely represented as a float must
+	 * still pass through untouched: scaling one would multiply a byte total by 1000.
+	 */
 	$wp_perf_probe_metadata['header_values'] = array(
-		'duration' => wp_perf_server_timing_value( 'total', 0.01234 ),
-		'hit_rate' => wp_perf_server_timing_value( 'opcache-hit-rate', 98.7654 ),
-		'count'    => wp_perf_server_timing_value( 'opcache-cached-scripts', 321 ),
+		'before_template' => wp_perf_server_timing_value( 'before-template', 0.01234 ),
+		'template'        => wp_perf_server_timing_value( 'template', 0.01234 ),
+		'total'           => wp_perf_server_timing_value( 'total', 0.01234 ),
+		'bootstrap'       => wp_perf_server_timing_value( 'bootstrap', 0.01234 ),
+		'rounds'          => wp_perf_server_timing_value( 'total', 0.0123456 ),
+		'float_count'     => wp_perf_server_timing_value( 'files-loaded', 98.7654 ),
+		'count'           => wp_perf_server_timing_value( 'files-loaded', 321 ),
+		'bytes'           => wp_perf_server_timing_value( 'memory-peak', 7445592 ),
+		'flag'            => wp_perf_server_timing_value( 'opcache-enabled', 1 ),
+		'unknown'         => wp_perf_server_timing_value( 'not-a-metric', 0.01234 ),
 	);
 }
 
@@ -500,18 +575,15 @@ $wp_perf_probe_report = array(
 	'registrations' => $GLOBALS['wp_perf_probe_registrations'],
 	'bootstrap'     => $wp_perf_probe_bootstrap,
 	'metadata'      => $wp_perf_probe_metadata,
+	'functions'     => array_values(
+		array_filter(
+			get_defined_functions()['user'],
+			static function ( $name ) {
+				// This probe's own helpers share the prefix, so they are excluded by name.
+				return 0 === strpos( $name, 'wp_perf_' ) && 0 !== strpos( $name, 'wp_perf_probe_' );
+			}
+		)
+	),
 );
-
-if ( $wp_perf_probe_counter_directory ) {
-	$wp_perf_probe_counter_files = glob( $wp_perf_probe_counter_directory . '/*' );
-
-	if ( is_array( $wp_perf_probe_counter_files ) ) {
-		foreach ( $wp_perf_probe_counter_files as $wp_perf_probe_counter_file ) {
-			unlink( $wp_perf_probe_counter_file );
-		}
-	}
-
-	rmdir( $wp_perf_probe_counter_directory );
-}
 
 echo wp_perf_probe_encode( $wp_perf_probe_report );

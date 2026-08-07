@@ -1,1834 +1,2581 @@
-# WordPress Core Performance Optimization Report — measured bottlenecks, minimal changes, proven deltas
+# WordPress Core Performance Optimization Report
+
+Measured against base commit `5e9d05d7dd` on the `trunk` line of `wordpress-develop` 7.0.0. The
+measured tree is the one recorded by commit `77aecc34e9`, which carries the final state of all twelve
+measured runtime files.
+
+Every figure is bound to that tree by **content hash rather than by branch position**, so it stays
+verifiable after `HEAD` advances: the per-file blob and SHA-256 identities for both arms are tabulated
+in §*Evidence manifest*, and `git hash-object <path>` reproduces each one. Content hashing is used
+deliberately in preference to file timestamps, which are not a sound provenance signal — a reversible
+A/B swap rewrites a file's mtime even when it restores the file byte-for-byte.
+
+Two limits of that binding are stated plainly, because both would otherwise be discovered as
+surprises. First, **`HEAD` is no longer the measured tree.** An earlier draft asserted that
+`git diff 77aecc34e9..HEAD --name-only` lists documentation only; that is not true of the delivered
+tree, where **32 non-documentation files differ**, and every one of those differences is accounted for
+in §*Reconciliation to the delivered tree*. Second, **the commit id `77aecc34e9` is not guaranteed to
+resolve** in a published clone: it names an intermediate state that the delivered history need not
+retain. The durable anchor is therefore the content-hash manifest, not the commit id — the manifest
+reproduces from the working tree with `git hash-object` and needs no reachable commit. For the same
+reason, the retained measurement logs cited throughout this document live under `artifacts/`, which is
+gitignored (`.gitignore:47`) and so is local evidence rather than published evidence; every conclusion
+that rests on one is restated in this document's own tables so that nothing load-bearing depends on a
+file a reader cannot open.
+
+An earlier draft of this document stated `5dd476efb5`. That commit was `HEAD` while the draft was being
+written, but it is **not** the tree that was measured: eight of the twelve runtime files and nine
+harness files changed between `5dd476efb5` and `77aecc34e9`. The most consequential difference is the
+class map, which held **228 entries / 19,521 bytes** (`sha256 ca35cc38…`) at `5dd476efb5` against the
+**145 entries / 13,372 bytes** (`sha256 2bf786ba…`) measured and described throughout this document.
+The delivered map is smaller again — **143 entries / 13,195 bytes** (`sha256 8ba69d69…`) — for the
+reason given in §*Reconciliation to the delivered tree*.
+Any figure in circulation that cites `5dd476efb5` therefore describes a different tree from this one.
+
+Every figure in this document was produced in this repository by the project's own performance
+suite (`npm run test:performance` → `tests/performance/compare-results.js`) or by a directly
+reproducible measurement described inline. Nothing is carried over from prior documentation. The
+document contains four forward-looking estimates; each is labelled **Estimate** at the point of use
+and is never mixed into a verdict.
+
+**Headline result: two of the six targets are met and four are not.** The four misses are quantified
+rather than glossed, and §*Why four targets are not met* accounts for each one with the measurement
+that blocks it.
+
+Measurement was taken on one tree and the code ships on another, because correctness review followed
+measurement. Every difference between the two — including the **+2 files** that move the canonical
+file-count figure from −21.29 % to −20.90 % — is accounted for in
+§*Reconciliation to the delivered tree*, immediately below. No measured table in this document was
+rewritten to match the delivered tree; the deltas are stated in one place instead.
 
 ---
 
-This report documents every optimization that landed on top of base commit `5e9d05d7dd` (branch `trunk`,
-`[package.json:version]` = `7.0.0`), and the measurement that justifies each one. It is the value
-documentation the brief requires: one entry per landed change, an aggregate summary across all six
-target metrics, and a prioritized list of opportunities that were discovered and deliberately not
-implemented.
+## Reconciliation to the delivered tree
 
-Three disciplines govern the whole document and are worth stating before any number appears.
+Every measurement in this report was taken on the tree recorded by commit `77aecc34e9`. The tree that
+ships differs from it, because correctness review after measurement required changes that measurement
+could not have anticipated. This section is the single authoritative account of that gap. It exists so
+that no reader has to reconcile a figure themselves, and so that no measured number anywhere in this
+document had to be quietly rewritten to match a tree it was not taken on. **Measured tables are left
+exactly as measured; every delta the delivered tree introduces is stated here.**
 
-1. **Nothing is claimed that was not measured.** Every figure below was produced by a named
-   instrument, in a named opcode-cache regime, over a named number of samples, in this environment.
-   Where a target was not reached, it is reported as not reached.
-2. **Every before/after pair is same-regime and same-instrument.** A pair whose two halves were
-   measured under different interpreter configurations is not evidence, and several such pairs had to
-   be discarded during verification — see *Measurement integrity: pairs that had to be discarded*.
-3. **Every claim about the existing system carries a file-and-line locator.** There are no external
-   citations anywhere in this document. Four web searches for external performance guidance returned
-   no results, so no external source is cited and none is invented; the conventions followed here are
-   anchored to first-party precedents inside this repository instead.
+The verdict does not move. **Two of six targets are met and four are not, before and after
+reconciliation.** No target crosses its threshold in either direction.
 
----
+### What changed, and why
 
-## The targets as specified
+**1. Two `require` statements were restored to prevent a fatal error.** Review found that five classes
+loaded by the vendored library bootstrap could be reached by a drop-in — `object-cache.php` or
+`advanced-cache.php` — or by any code running between the core autoloader's registration and those
+libraries' own loaders. Reached that early, the class map would resolve them, their parent or interface
+would not yet be declared, and the request would die. Three were already eager; the remaining two are
+now eager too, sitting next to the loaders they depend on, and the generator excludes them from the map
+by name:
 
-The brief specified six metrics, each with its measurement method and its required improvement. The
-table is reproduced exactly as given:
+| Restored require | Class | Only instantiation site |
+|---|---|---|
+| `wp-includes/class-wp-http-requests-hooks.php` | `WP_HTTP_Requests_Hooks` | `class-wp-http.php:345`, inside `WP_Http::request()` |
+| `wp-includes/ai-client/adapters/class-wp-ai-client-http-client.php` | `WP_AI_Client_HTTP_Client` | `class-wp-ai-client-discovery-strategy.php:35` |
 
-| Metric | Method | Target |
-|--------|--------|--------|
-| Front-end TTFB (uncached) | tests/performance/ suite | >=20% reduction |
-| Admin DOMContentLoaded | tests/performance/ suite | >=15% reduction |
-| Admin JS transfer size (gzipped) | Build output analysis | >=30% reduction |
-| PHP memory per front-end request | memory_get_peak_usage() instrumentation | >=10% reduction |
-| DB queries per front-end page load | SAVEQUERIES count | >=15% reduction |
-| PHP files loaded per front-end request | get_included_files() count | >=30% reduction |
+Both classes are **provably unreachable on an anonymous front-end page render**: the first is
+constructed only when an outbound HTTP request is made, the second only when the AI client discovers a
+provider. Neither happens while rendering a page. In the measured tree they were therefore mapped and
+never loaded; in the delivered tree they are parsed on every request. The cost is exactly **+2 files**,
+and it buys the elimination of a fatal-error class. That trade is not close.
 
-One of those six had no baseline at all when the work started. The admin performance spec recorded
-`timeToFirstByte` and nothing else, so no DOM-ready figure existed to improve on. Establishing that
-measurement was therefore a prerequisite rather than an option, and it is the first optimization
-documented below.
+**2. The class map shrank accordingly.** The generator omits any name the bootstrap requires
+unconditionally, so restoring two requires removes two entries:
+
+| | Measured tree `77aecc34e9` | Delivered tree |
+|---|---|---|
+| Class map entries | 145 | **143** |
+| Class map bytes | 13,372 | **13,195** |
+| Class map `sha256` | `2bf786ba…` | **`8ba69d69…`** |
+| `wp-settings.php` include-family constructs | 214 | **216** |
+| — of which `require` / `require_once` / `include` / `include_once` | 202 / 7 / 2 / 3 | **204 / 7 / 2 / 3** |
+| Unique resolved require paths | 208 | **210** |
+| Removable requires deliberately restored | 85 | **87** |
+| Classes resolved lazily on first use | 110 | **108** |
+
+The map was regenerated **only** through `grunt build:autoload-classmap`, never by hand. It reproduced
+byte-identically on a second consecutive run and again inside a full `grunt build`, and
+`git diff --exit-code` is clean, so the committed map is exactly what the generator emits from the
+committed source.
+
+**3. Two optimizations were withdrawn.** `src/wp-includes/comment.php` and `src/wp-includes/update.php`
+ship **byte-identical to base**. Both removed queries only from authenticated/admin requests, while the
+plan's target names the front-end page load, so under gate 4 neither addressed a named bottleneck. Their
+sections record the measurement and the reasoning; the opportunity is carried in the backlog. The
+consequence for the target table is **nil**: front-end DB queries were 0.00 % with those changes present
+and are 0.00 % without them.
+
+**4. Five harness metrics were withdrawn.** The mu-plugin now declares **8 helpers** and emits
+**14 metrics**. `php-version-id`, `process-id`, `process-requests`, `opcache-cached-scripts` and
+`opcache-hit-rate` are gone, and `serverTimingMetrics.php` asserts their absence. The OPcache regime is
+now derived from **configuration alone**, which is the more reliable source and the one the comparator
+gates on. The practical loss is that the regime-certification argument built from
+`opcache-cached-scripts` / `opcache-hit-rate` is a retained record rather than a reproducible check;
+those passages are marked as such where they appear.
+
+**5. The `map_meta_cap()` memo is a smaller design than the one measured.** The delivered memo is a
+plain `$GLOBALS['_wp_map_meta_cap_memo'][ $user_id ][ $cap ]` store, admitted under five conditions,
+capped at 512 mappings per user, living entirely inside the `default:` arm. It has no composite key, no
+invalidation machinery, no configuration constant and no observability helper, because — as
+§*Request-scoped memoization of `map_meta_cap()`* now sets out — the value it stores is a pure function
+of the capability name and cannot go stale. Its per-call cost is therefore **bounded above** by the
+measured arm's, so the measured break-even shares are conservative.
+
+### Adjusted headline figures
+
+Only the file-count metric moves, by exactly the +2 files of item 1. Every figure below is arithmetic on
+the measured before/after pair, not a new measurement:
+
+| Scenario | Before | After (measured) | After (delivered) | Reduction (measured → delivered) |
+|---|---:|---:|---:|---|
+| **Homepage › twentytwentyfive › en_US** *(canonical, target row 6)* | 512 | 403 | **405** | −21.29 % → **−20.90 %** |
+| Homepage › twentytwentythree › en_US *(best case)* | 484 | 375 | **377** | −22.52 % → **−22.11 %** |
+| Admin, both locales | 530 | 424 | **426** | −20.00 % → **−19.62 %** |
+
+The canonical row 6 verdict is **❌ not met** at −20.90 % exactly as it was at −21.29 %; the target is
+≥30 %. *(The admin figure is the worst case: an admin request that performs an outbound HTTP call would
+already have loaded `WP_HTTP_Requests_Hooks`, making it 425 and −19.81 %. The distinction changes
+nothing and is noted only for completeness.)*
+
+No other target metric is affected. Peak memory, TTFB, admin JS transfer size, admin DOMContentLoaded
+and front-end DB queries are all unchanged by items 1–5: the two restored files are small class
+declarations, and items 3–5 touch no code on a measured front-end path.
+
+### What was re-verified on the delivered tree
+
+The reconciliation was not assumed to be safe. On the delivered tree: the full single-site PHPUnit suite
+reports **29,555 tests / 3,542,245 assertions / 0 failures / 0 errors**, QUnit reports **456 / 0 failed**,
+the comparator/reporter contract spec reports **96 passed / 0 failed**, the two E2E specs this change set
+adds report **13 passed / 0 failed**, `grunt verify:build-guards` reports **15/15**, PHPStan reports
+**no errors**, PHPCS reports **0 errors**,
+`npm run build` followed by `npm run build:dev` leaves **`git diff --exit-code` clean**, and all 14
+in-scope PHP files are **sha256-identical between `src/` and `build/`**. Runtime behaviour was confirmed
+in a real browser — front end 200 with no emoji detection script and `_wpemojiSettings` absent from both
+DOM and raw response, Dashboard 200 with **0** command/block-editor/components requests and
+`wp.commands` undefined, the block editor with **4** command requests and a working Ctrl+K palette
+returning live results, and `site-health.php` 200 with all 20 tests producing results and all four
+`wp-site-health/v1` REST endpoints returning 200 — the last being the strongest available evidence that
+the class map resolves `WP_Site_Health` at both the admin-page and REST-controller layers. `/wp/v2`
+registers **108** routes and `/wp-json` **133** across 6 namespaces.
 
 ---
 
 ## How to read the numbers in this report
 
-### 1. Two percentage conventions, and which one this report judges on
+Three conventions are stated up front because each of them, if left implicit, would materially
+misrepresent a result.
 
-The repository's own comparison tool computes a percentage against the **after** value:
-`tests/performance/compare-results.js:L124` reads `const percentage = ( delta / value ) * 100;`
-where `value` is the after-arm median. Every figure in this document instead uses
-`delta / before`, the conservative convention, because a reduction expressed against the smaller
-number is always the larger-looking of the two.
+### 1. Percentages are reported relative to the *before* value
 
-The difference is not cosmetic. The same 18 measured file-count pairs give a median of
-**−23.08 %** on `delta / before` and **−30.01 %** on the harness's `delta / after`. One of those
-crosses the 30 % target and the other does not. Every verdict in this report is taken on
-`delta / before`; where the harness's own convention would produce a different verdict, that is
-stated in the row.
+`tests/performance/compare-results.js:416` computes `percentage = ( delta / prevValue ) * 100`, where
+`prevValue` is the median of the **before** measurement. That is what "N% reduction" ordinarily
+means, and it is the more conservative of the two available readings: dividing by the *after* value
+instead inflates the magnitude of every reduction, and the gap decides target verdicts.
 
-One table convention, so that no cell is ambiguous: in the per-optimization tables an **em dash in a
-Before or After column** means only the ratio was recorded for that row in that run and the two
-absolute halves were not, so the Δ column is the measured quantity for that row. It never stands in
-for a value that was measured and withheld, and it never stands in for a value that was not measured
-at all — a row with no measurement behind it does not appear in this report.
+| Context | Before | After | Δ | `delta / before` (harness and this report) | `delta / after` (rejected) |
+|---|---|---|---|---|---|
+| Homepage › twentytwentyfive › en_US, `wpFilesLoaded` | 512 | 403 † | −109 † | **−21.29 %** † | −27.05 % |
+
+† *Measured on the tree at `77aecc34e9`. The delivered tree parses **+2 files** more, for the fatal-error fix set out in §*Reconciliation to the delivered tree*: 405, −107, −20.90 %.*
+
+Both columns describe the same data. The `delta / after` convention would still not have carried
+this row past a ≥30% target, but it would have made the miss look half as large, which is precisely
+why the harness was changed to divide by the before value. Every percentage in this document
+therefore comes from the same denominator as the harness output in
+`artifacts/performance-results.md`.
 
 ### 2. The OPcache Measurement Law
 
-Opcode-cache state moves the numbers by far more than any change documented here. Measured on the
-authenticated front page of this instance, with only the interpreter flag differing: peak memory
-**33,382,320 B** with the opcode cache off against **4,375,384 B** with it on — a factor of **7.6** —
-and TTFB **193.35 ms** against **46.65 ms**, a factor of **4.1**. A carelessly assembled pair can
-therefore show a 5× "improvement" that is entirely an artifact of the interpreter. Six rules follow,
-and they are applied without exception:
+Opcode-cache state moves measured memory by roughly 6× and measured wall time by roughly 5× on this
+codebase — an order of magnitude more than any optimization here. Consequently every pair below was
+taken with bit-identical interpreter flags, using `memory_get_peak_usage( false )`, over at least
+10 samples, reported as medians, and with the opcode-cache configuration named alongside the figure.
+The original source A/B restarted php-fpm between code states because a stale worker demonstrably
+kept reporting the previous file count. The final query-isolation A/B instead required a successful
+`opcache_reset()` response before every measured request, so both arms were cold by construction.
+Both regimes are reported, because they answer different questions: the parse-dominated regime
+answers cold-start, post-deploy and OPcache-off cost; the warm regime answers steady-state cost.
 
-1. **Bit-identical interpreter flags across both halves of every pair**, in the same session, with
-   both arms served by processes started from the same command with the same flags. Cross-regime
-   pairs appear nowhere in this document.
-2. **The opcode-cache configuration is reported with each figure**, not once at the top.
-3. **The PHP process is restarted, or the cache cleared, between code states.** This is not
-   theoretical. One attribution run initially produced zero samples because a shared opcode file
-   cache configured with `validate_timestamps=0` still held the previous code state and fatally
-   required a file the new arm did not have; clearing the cache directory between states fixed it.
-   In an earlier source A/B a stale worker kept reporting the previous file count after the code had
-   been restored, which would have been read as "no regression" had the process not been recycled.
-4. **`memory_get_peak_usage( false )`**, never the `true` variant, which quantizes to the allocator
-   chunk size. The landed instrumentation uses exactly that call at
-   `tests/performance/wp-content/mu-plugins/server-timing.php:L416` for front-end requests and
-   `:L488` for admin requests.
-5. **At least 10 samples, reported as the median.** Every A/B below is 10 or 12 interleaved samples
-   per arm; the suite-derived figures are 40 per arm (20 iterations × 2 repetitions).
-6. **Both regimes are reported**, because they answer different questions. The parse-dominated
-   regime answers cold-start, post-deploy and opcode-cache-off cost; the warm regime answers
-   steady-state cost.
+Recorded configurations:
 
-The regimes used, with their exact configuration:
+| Regime | Configuration |
+|---|---|
+| **Warm (php-fpm, HTTP)** | `opcache.enable=On`, `opcache.enable_cli=Off`, `validate_timestamps=On`, `revalidate_freq=2`, `jit=disable`, `memory_consumption=128`, PHP 8.5.9 |
+| **Cold compile (php-fpm, HTTP)** | Same php-fpm configuration, but `clear-cache.php` calls `opcache_reset()` before every measured navigation |
+| **Parse-dominated (CLI)** | `opcache.enable=On`, `opcache.enable_cli=0`, PHP 8.5.9 |
+| **Warm CLI** | `opcache.enable=On`, `opcache.enable_cli=1`, PHP 8.5.9 |
 
-| Regime label | Configuration | What it answers |
-|---|---|---|
-| **Parse-dominated (HTTP)** | `php -d opcache.enable=0 -S …`; `wpOpcacheEnabled` = 0, `wpOpcacheHitRate` = 0, `wpOpcacheCachedScripts` = 0 | Cold start, first request after deploy, opcode cache unavailable |
-| **Warm (HTTP, shared memory)** | `php -d opcache.enable=1 -S …`; `wpOpcacheEnabled` = 1, `wpOpcacheHitRate` 91.34–91.55 % | Steady state |
-| **Parse-dominated (CLI bootstrap)** | `php -d opcache.enable_cli=0`; `opcache_get_status()` returns `false` | Per-request parse and compile cost, isolated in a fresh process |
-| **Primed (CLI bootstrap)** | `php -d opcache.enable_cli=1 -d opcache.file_cache=… -d opcache.file_cache_only=1 -d opcache.validate_timestamps=0 -d opcache.max_accelerated_files=20000` | Wall time with compilation already paid |
-| **Cold compile (php-fpm, suite)** | php-fpm with the opcode cache enabled, reset immediately before each measured navigation; `wpOpcacheCachedScripts` equals `wpFilesLoaded` and the hit rate is 0.73–1.07 % | Every measured request compiles everything it loads |
+**The canonical before/after pair used throughout this document was regenerated from scratch on
+the measured tree, and both arms were produced by one identical harness.** Earlier drafts of this report
+compared the final tree against a baseline artifact that had been captured by a *different* workflow
+— one that installed only `server-timing.php`, so `/?clear_cache` returned an ordinary HTTP 200 page
+and reset nothing, and one whose front-end specs omitted the newly added metrics from their reset
+object, so `wpDbQueries` accumulated across theme and locale buckets (140 values per repetition
+instead of 20). Every figure derived from that artifact has been discarded. It is described here only
+so that no reader mistakes a superseded number for a retracted measurement.
 
-Two methodological findings emerged during measurement and are recorded because they invalidate
-otherwise reasonable-looking setups:
+The replacement pair was produced as follows, and this is the single source of every measured figure
+below:
 
-- **`opcache.enable_cli` does not gate the PHP built-in web server.** That server's SAPI is
-  `cli-server`, not `cli`. A run started with `-d opcache.enable_cli=0` still reported
-  `wp-opcache-enabled;dur=1` with a live 3.05 % hit rate; only `-d opcache.enable=0` produced
-  `wp-opcache-enabled;dur=0` with a zero hit rate. The first "parse-dominated" HTTP run of this
-  project was therefore silently warm, and it was caught only because the landed instrumentation
-  emits `wp-opcache-enabled` and `wp-opcache-hit-rate` alongside every timing. It was relabelled as
-  an additional warm replicate rather than discarded.
-- **`opcache.file_cache_only=1` deserializes opcodes into process memory.** Under that flag the
-  base arm's bootstrap peak reads 29.9 MB against 4.23 MB for the same code in the shared-memory
-  warm regime. Memory figures from that regime measure the deserialization arena, not the request,
-  so the primed CLI regime is used for **wall time only** and all warm-regime memory figures come
-  from the shared-memory HTTP instrument.
+| Property | Value |
+|---|---|
+| Code states | **after** = the tree recorded by `77aecc34e9`; **before** = the twelve in-scope `src/` and `tests/` files reverted to base `5e9d05d7dd` by a hash-verified, reversible swap, with the three files absent from base parked aside |
+| Swap integrity | SHA256 of all twelve files recorded before and after each swap; the tree was confirmed byte-identical to HEAD after restoration, and `git status` was unchanged |
+| Interpreter | PHP 8.5.9 (php-fpm), `opcache.enable=1`, `opcache.enable_cli=0`, `opcache.jit=disable`, `jit_buffer_size=64M`, `memory_consumption=128`, `max_accelerated_files=10000`, `interned_strings_buffer=8`, `validate_timestamps=On`, `revalidate_freq=2`. **Xdebug absent on both SAPIs.** Identical in both arms, asserted per request by the comparator |
+| Services | MySQL 8.4.11; no external object cache (`wpExtObjCache` = `no`) |
+| Cold-compile discipline | Both arms required an HTTP 202 from `clear-cache.php` — which calls `opcache_reset()`, `apcu_clear_cache()`, `wp_cache_flush()` and `delete_expired_transients()` — before **every** measured navigation |
+| Process generation | php-fpm restarted between code states, and the after arm was then **re-run on freshly restarted workers** so that both arms were measured on equally young worker generations. The fresh/fresh pair is canonical |
+| Samples | `TEST_RUNS=20`, `repeatEach=2` → 40 samples per scenario per metric; medians reported |
+| Scenarios | 18 (2 admin locales, 8 homepage theme×locale, 8 single-post theme×locale) |
+| Result | **786 passed / 0 failed** on the measured tree, retained at `artifacts/qa-logs-remediation/R04-performance-final-head.log`. The suite *declares* 786 tests in 4 spec files at this tree — `npx playwright test --config tests/performance/playwright.config.js --list` → `Total: 786 tests in 4 files`, retained at `R17-perf-declared-count.log`. What each individual harness run attests is its own JSON: both canonical artifacts carry **18 result entries, 2 repetitions each, and every metric series exactly 20 samples** (788 series per artifact, verified at `R18-artifact-cardinality.log`) |
 
-### 3. Which metrics are regime-independent, and which are not
+Two structural properties of this harness shape how its numbers must be read, and both were
+established by measurement rather than assumed:
 
-This distinction decides which pairs are usable at all, and it is derived from the instrumentation
-rather than assumed:
+- **The homepage scenarios are parse-dominated, not warm.** Because `clear-cache.php` resets the
+  opcode cache before every measured navigation, each homepage request is a full cold compile:
+  `wpBootstrap` is roughly 90% of `wpTotal` (median 357.82 ms of 396 ms before the change), and the
+  OPcache hit rate for the measured request is near zero with the cached-script count equal to the
+  file count. This is the regime the OPcache Measurement Law asks to be reported for cold-start and
+  post-deploy cost, and it is where a file-count reduction can pay at all.
+- **The single-post scenarios measure a *warm* request, for a reason that predates this work.** The
+  spec navigates to `/2018/11/03/block-image/`, but this install's permalink structure —
+  `/%year%/%monthnum%/%postname%/`, set by `tools/local-env/scripts/install.js:49`, the same value CI
+  uses — makes that URL answer **HTTP 301** to `/2018/11/block-image/`. The redirect pays the cold
+  compile; the measured 200 that follows runs against a populated opcode cache. The spec's URL is
+  unchanged from base (`git show 5e9d05d7dd:tests/performance/specs/single-post.test.js`), so the
+  property is identical in both arms and biases neither. The split is visible directly in the data:
+  on Single Post › `twentytwentyone` › `en_US` the browser-measured `timeToFirstByte` is 437.25 ms
+  before, while `wpTotal` — read from the `Server-Timing` header of the final 200 response — is
+  53.91 ms, with `wpBootstrap` only 25.57 ms. TTFB spans both legs and is dominated by the redirect's
+  cold compile; the Server-Timing metrics describe the warm leg alone. That is the direct reason
+  single-post peak memory moves by roughly 0% while the homepage moves by −5.44% to −9.50%, and it
+  is a clean in-suite confirmation of the proxy-metric rule stated next. It is documented, not
+  changed: changing it would alter the measured subject mid-comparison.
 
-- **Regime-independent.** File counts (`count( get_included_files() )`, `server-timing.php:L441`
-  and `:L513`), query counts (`wpDbQueries`), and byte counts. All three were measured identically
-  in the warm and parse-dominated regimes in every A/B below — for example the authenticated
-  front-page query reduction reads **32 → 26** in both regimes, and the file reduction reads
-  **500 → 382** in both.
-- **Regime-independent in this environment.** `domContentLoaded`, because the landed spec subtracts
-  `responseEnd`: `tests/performance/specs/admin.test.js:L313-L321` evaluates
-  `navigation.domContentLoadedEventEnd - navigation.responseEnd`. The document's own server time is
-  excluded by construction, and with `SCRIPT_DEBUG=true` every admin script is a static file served
-  by nginx rather than by PHP, so no PHP timing enters the interval.
-- **Regime-sensitive.** All server wall time (`wpTotal`, `wpBootstrap`, `wpBeforeTemplate`,
-  `timeToFirstByte`) and per-request peak memory. These are only ever compared within one regime.
+Because the absolute values this harness produces are regime-specific — four themes, two locales, a
+content-loaded database, and an opcode-cache reset per iteration — they are **not** comparable to the
+single-scenario baseline figures quoted in the Agent Action Plan (484 files, 5.55 MB, 25 queries,
+39.75 ms). Only the percentage deltas within this pair are comparable to the targets, and only
+percentage deltas are used for verdicts.
 
-One further instrument caveat applies to peak memory over HTTP: the PHP built-in server reuses a
-process across requests, and `wpProcessRequests` read a median of **11.5** in both arms of every HTTP
-A/B, so an HTTP peak-memory reading is process-cumulative. The CLI bootstrap probe runs one fresh
-process per sample and is therefore the per-request memory instrument; HTTP peak memory is reported
-only as corroboration, and always alongside its process-request count.
+### 3. Proxy metrics are not cost metrics — neither file counts nor isolated micro-benchmarks
 
-### 4. Proxy metrics are not cost metrics
+The canonical pair demonstrates this inside the suite itself. The four single-post scenarios are
+warm requests (see the 301 note above), and there removing 106–107 files from the request moved peak
+memory by **+0.78 %, −0.42 %, −0.76 % and −0.54 %** — one of them in the *wrong* direction, all four
+indistinguishable from zero. The identical code change on the parse-dominated homepage moved peak
+memory by −5.44 % to −9.50 %. The file count measures exactly what deferral changes and nothing more.
+Memory and time improvements are therefore claimed *only* from parse-cost and work-reduction
+measurements that stand on their own, never inferred from the file count.
 
-`get_included_files()` measures exactly what deferral changes and nothing more. In the warm
-shared-memory regime, removing 118 files from the authenticated front-page request changed peak
-memory by **+16,984 B (+0.39 %)** and TTFB by **−2.16 %**; on the anonymous front page the same
-deferral changed peak memory by **+19,632 B (+0.46 %)**, reproduced on two independent replicates.
-No memory or TTFB claim anywhere in this document is derived from a file count. Memory and time
-improvements are claimed only from parse-cost measurements and work-reduction measurements that
-stand on their own.
-
-The same prohibition applies to isolated micro-benchmarks. An isolated `token_get_all()` peak is not
-a proxy for per-request memory: PHP releases the tokenizer and AST arena as soon as a file is
-compiled, and `memory_get_peak_usage()` never reports that arena, while under an active opcode cache
-the compiled `op_array` lives in shared memory that `memory_get_peak_usage()` also does not count.
-The measured consequence appears under the emoji work below: a tokenizer peak **3.52 MB** lower
-against **−0.03 %** of per-request peak memory in the warm regime. Micro-benchmarks are reported as
-what they are — evidence about the compiler's input — and never as request cost.
-
-### 5. Five harness behaviours that look like defects and are not
-
-`tests/performance/compare-results.js` is treated as a frozen contract; the following were left
-alone deliberately, and are disclosed so no reader misreads them.
-
-1. **A zero median produces an odd `Diff %`.** With an after median of `0` and a non-zero delta the
-   percentage is `Infinity` and prints as `Infinity %`; with a zero delta it is `NaN` and the
-   difference columns are suppressed by `isComparableMetric()` (`tests/performance/utils.js:L197-L199`)
-   combined with the `Number.isNaN` guard in `compare-results.js:L120-L125`. A `wpCacheMisses`
-   reading of 0 on a fully warm request is the realistic case.
-2. **Unrounded standard deviation and median-absolute-deviation for count metrics** — for example
-   `3.7050641020095747` in the saved comparison for `wpFilesLoaded`. Count metrics pass through the
-   raw-value branch of `formatValue()`, exactly as `wpDbQueries` has always rendered.
-3. **A newly added metric shows `Before: N/A` and `Diff %: 100.00 %`** on its first comparison, per
-   the `'N/A'` fallback in `compare-results.js:L129`. Every `wpOpcache*`, `wpProcessId`,
-   `wpProcessRequests`, `wpBootstrapValid`, `adminJsRaw` and `adminJsGzipped` row in the saved
-   comparison is in exactly that state.
-4. **A sample-size asymmetry between old and new metrics existed and has been fixed.** The
-   surviving smoke artifact `artifacts/qa-smoke-performance-results.json` shows it precisely: with
-   `TEST_RUNS=1`, the newly added metrics hold 1 sample per repetition while the six pre-existing
-   metrics (`wpTotal`, `wpMemoryUsage`, `wpDbQueries`, `wpExtObjCache`, `wpBeforeTemplate`,
-   `wpTemplate`) hold 1, 2, … 7, 8 — one extra per describe block, in describe order, because they
-   were neither declared in each spec's result object nor reset between describes. At `TEST_RUNS=20`
-   that is 20, 40, … 140 values in the eighth bucket. In the final artifact
-   `artifacts/performance-results.json` every metric in all 18 contexts holds exactly `[20, 20]`.
-   Query-count claims in this report nevertheless come from dedicated same-regime A/B runs rather
-   than from any suite median, so they do not depend on that fix.
-5. **`Single Post` results never reach the remote logging endpoint.** The `testSuiteMap` in
-   `tests/performance/log-results.js:L17-L32` lists two `Admin › …` keys and eight
-   `Homepage › Theme: …` keys and nothing else, and `:L64-L68` skips a title it cannot map. Single-post
-   results therefore reach `compare-results.js` and this report but not the logging endpoint. This
-   is pre-existing behaviour, unchanged.
-
-One related detail: `median()` at `tests/performance/utils.js:L69-L75` returns `NaN` for an empty
-array, because with `mid = 0` the even-length branch evaluates `( numbers[ -1 ] + numbers[ 0 ] ) / 2`.
-The instrumentation therefore emits `0` for a metric it cannot compute rather than omitting the key,
-and pairs it with `wp-bootstrap-valid` so an unmeasured sample can be recognized instead of silently
-averaged in (`server-timing.php:L444-L445`).
-
-### 6. The metric vocabulary, which is shared across the harness, the tooling and this report
-
-Every metric named in this report is the metric the harness emits, under the name the tooling gives
-it. There are no parallel names. The PHP mu-plugin emits a slug, the slug becomes a `Server-Timing`
-entry named `wp-` plus the slug, and `camelCaseDashes()` in `tests/performance/utils.js` converts that
-entry name into the JavaScript key that `compare-results.js` prints and that this document uses.
-
-| PHP slug | `Server-Timing` entry | Key used in this report | Rendering |
-|---|---|---|---|
-| `memory-peak` | `wp-memory-peak` | `wpMemoryPeak` | MB |
-| `files-loaded` | `wp-files-loaded` | `wpFilesLoaded` | raw integer |
-| `cache-hits` | `wp-cache-hits` | `wpCacheHits` | raw integer |
-| `cache-misses` | `wp-cache-misses` | `wpCacheMisses` | raw integer |
-| `bootstrap` | `wp-bootstrap` | `wpBootstrap` | ms |
-| `bootstrap-valid` | `wp-bootstrap-valid` | `wpBootstrapValid` | flag, `yes`/`no` |
-| `opcache-enabled` | `wp-opcache-enabled` | `wpOpcacheEnabled` | flag |
-| `opcache-jit` | `wp-opcache-jit` | `wpOpcacheJit` | flag |
-| `opcache-hit-rate` | `wp-opcache-hit-rate` | `wpOpcacheHitRate` | percentage |
-| `opcache-cached-scripts` | `wp-opcache-cached-scripts` | `wpOpcacheCachedScripts` | raw integer |
-| `php-version-id` | `wp-php-version-id` | `wpPhpVersionId` | `PHP 8.5.9` |
-| `process-id` | `wp-process-id` | `wpProcessId` | `PID n` |
-| `process-requests` | `wp-process-requests` | `wpProcessRequests` | raw integer |
-| `before-template` | `wp-before-template` | `wpBeforeTemplate` | ms, front-end only |
-| `template` | `wp-template` | `wpTemplate` | ms, front-end only |
-| `total` | `wp-total` | `wpTotal` | ms |
-| `memory-usage` | `wp-memory-usage` | `wpMemoryUsage` | MB |
-| `db-queries` | `wp-db-queries` | `wpDbQueries` | raw integer |
-| `ext-obj-cache` | `wp-ext-obj-cache` | `wpExtObjCache` | flag |
-
-Four further keys are produced in JavaScript and never pass through the slug conversion:
-`timeToFirstByte`, `largestContentfulPaint` and `lcpMinusTtfb` on the front-end specs, and
-`domContentLoaded` on the admin spec — note the absence of a `wp` prefix, which is what distinguishes
-a client-side measurement from a server-emitted one throughout this report. Two more,
-`adminJsRaw` and `adminJsGzipped`, are computed in the admin spec from the JavaScript responses the
-navigation produced, and they are the harness's own link to the admin JavaScript transfer-size target.
+The same prohibition applies to an isolated micro-benchmark, and it was established here by
+measurement rather than assumed. An isolated `token_get_all()` peak is **not** a proxy for the
+compiler's per-request memory cost, for two independent reasons. PHP releases the tokenizer and AST
+arena for a file as soon as that file is compiled, and `memory_get_peak_usage()` never reports that
+arena. And when the opcode cache is active the compiled `op_array` lives in OPcache **shared**
+memory, which `memory_get_peak_usage()` does not count either. The measured consequence, taken from
+the emoji-array relocation documented below: an isolated tokenizer peak **3.36 MiB** lower, against
+**0 bytes** of per-request peak memory in three of four php-fpm cells and **−1.30 %** in the one
+regime where the opcode cache is switched off altogether. A per-request memory or TTFB improvement is
+therefore only ever claimed from a per-request measurement.
 
 ---
 
-## Measurement environment and instruments
-
-### The environment as actually found
+## Measurement environment
 
 | Component | Value |
 |---|---|
-| Application server | nginx → php-fpm **8.5.9**, docroot `/var/www/src`, container port 80 published on `localhost:8889` |
-| PHP for A/B instruments | the same **8.5.9** binary inside the php container, run as the built-in server (`cli-server`) or as CLI |
-| Database | MySQL **8.4.11** |
-| Node / npm | **20.20.2** / **10.8.2**, both on `PATH` in a fresh shell |
-| Object cache | **none installed** — `wp_using_ext_object_cache()` is false and `wpExtObjCache` reads `no` in every measurement. This is the "backend absent" condition the brief requires graceful degradation for, so it is the default measurement condition rather than an edge case. The drop-in path is gitignored at `.gitignore:86`. |
-| Active theme | `twentytwentyone` (`template` = `stylesheet` = `twentytwentyone`), locale `en_US` (`WPLANG` empty), `show_on_front` = `posts`, `permalink_structure` = `/blog/%year%/%monthnum%/%day%/%postname%/` |
-| Debug flags | `WP_DEBUG`, `WP_DEBUG_LOG`, `WP_DEBUG_DISPLAY` and **`SCRIPT_DEBUG`** all true in the instance `wp-config.php` |
-| Suite configuration | `TEST_RUNS=20`, `repeatEach=2` → 40 samples per metric per context, across 18 contexts |
+| Server | nginx 1.31.3 → php-fpm 8.5.9, docroot `/var/www/src` |
+| Database | MySQL 8.4.11 |
+| Object cache | None (`wp_using_ext_object_cache()` = false, `wpExtObjCache` = `no`) — the "backend absent" condition |
+| Suite configuration | `TEST_RUNS=20`, `repeatEach=2` → 40 samples per scenario per metric |
+| Contexts measured | 18 (2 admin locales, 8 homepage theme×locale, 8 single-post theme×locale) |
+| Final integrated suite result | **786 passed / 0 failed** (retained: `R04-performance-final-head.log`); both canonical artifacts carry 18 result entries, 2 repetitions each, 20 samples per metric series (retained: `R18-artifact-cardinality.log`) |
+| Content | The CI theme-unit-test data set, imported from `themeunittestdata.wordpress.xml` at the commit CI pins (`b9752e0533a5acbb876951a8cbb5bcc69a56474c`): 49 published posts, 22 pages, 29 comments |
 
-Two disclosures about that environment matter for anyone reproducing this work.
+The final integrated run on the measured tree completed in 9.6 minutes and reported **403 files and 73 queries**
+for the logged-out `twentytwentyfive`/`en_US` homepage, and **424 files, 47.5 queries and 358,539
+gzipped JavaScript bytes** for Admin/`en_US`. Those absolute values validate the final tree; only
+regime-compatible pairs are used for target verdicts.
 
-**`SCRIPT_DEBUG=true` means every asset-byte figure is an unminified figure.** The emoji detection
-payload measured here is the unminified loader, not the minified one a production install serves, and
-the admin JavaScript figures are unminified bundles. Every byte figure below says which it is.
-Directionally this makes the front-end HTML reduction larger than a production install would see and
-makes the admin JavaScript reduction close to it, since the dominant admin bundles are large in both
-forms.
+The 403-file homepage figure was independently corroborated outside the suite: a browser-driven
+anonymous request to `http://localhost:8891/` on the measured tree returned `Server-Timing:
+wp-files-loaded;dur=403`.
 
-**Docker is present and working in this environment, and the verification environment is not the
-environment the original baselines were captured in.** An earlier planning note recorded Docker as
-absent and prescribed an `nvm`-based Node 20 activation; neither holds here. `docker info` succeeds,
-the four-container stack is up, and Node 20.20.2 is already the default interpreter with no `nvm`
-present at all. That distinction matters for provenance. The baseline figures in the planning
-documents were captured on a **substitute harness** — a PHP built-in server rooted at the *built*
-tree, backed by MariaDB, with instrumentation injected as an untracked mu-plugin — because the
-documented Docker harness was unavailable at that time. Those figures are **not reused anywhere in
-this report**. Every number here was re-measured on the real containerized stack described above, and
-where a same-regime pair was needed the two arms were served from two checkouts of the repository at
-the two code states rather than from one tree measured at two points in time.
+### Evidence manifest
 
-### The instruments
+Every measured figure below traces to one of these artifacts. All four live in the gitignored
+`artifacts/` directory (`.gitignore:47`) that CI uploads wholesale, so they are reproducible by
+re-running the commands below rather than committed as binaries. The first three are the canonical pair
+and its comparator output; the fourth is the retained reproduction of the after arm.
 
-| ID | Instrument | What it does |
+| Artifact | Role | SHA256 |
 |---|---|---|
-| **A** | CLI bootstrap probe | Pre-defines `ABSPATH` to one tree's `src/`, requires the instance `wp-config.php` with `WP_USE_THEMES=false`, and writes `count( get_included_files() )`, `memory_get_peak_usage( false )`, wall time and the full opcode-cache status as JSON. One fresh process per sample, arms interleaved, 12 samples, first two discarded, median of 10. This is the **per-request memory and parse-cost instrument**. |
-| **B** | Anonymous HTTP A/B | Serves the base tree and the current tree simultaneously from two PHP built-in servers started with bit-identical flags, warms both with 5 requests, then interleaves 12 measured requests per arm, capturing curl's `time_starttransfer`/`time_total`/`size_download`/`http_code` plus the complete `Server-Timing` header. |
-| **C** | Authenticated HTTP A/B | Instrument B with the stored admin cookies, against `/wp-admin/` and against `/` with the admin bar rendered (verified present in both arms). |
-| **D** | Same-instance filter A/B | Leaves the code identical and toggles one landed filter with a temporary gitignored mu-plugin on the real nginx/php-fpm stack, fetches a screen, collects every `<script src>` response, and sums raw and `gzip -9` bytes. This isolates a gate's payload effect from every other variable, including the tree. |
-| **E** | Micro-benchmarks | Fresh process per sample: `token_get_all()` over one file, and a capability-resolution loop over real post IDs. Reported as compiler-input and work-reduction evidence, never as request cost. |
-| **F** | Saved suite comparison | `artifacts/performance-results.json` and `artifacts/performance-results.md`, 18 contexts × 40 samples, produced by `tests/performance/` through `compare-results.js`. Used **only** for regime-independent pairs, for the reason given below. |
-| **G** | Browser runtime A/B | A real headless Chrome session on the running nginx → php-fpm instance. It logs in, toggles one landed filter per navigation through the same temporary gitignored mu-plugin instrument D uses, and after each load evaluates the landed spec's own DOMContentLoaded expression in the page. One page, one session, one viewport, HTTP cache bypassed on every measured navigation and proven per sample, arms interleaved, 12 samples per arm. This is the **client-side cost instrument**, and the only one that observes the rendered page and its console rather than the response body. |
+| `artifacts/before-performance-results.json` | Base `5e9d05d7dd`, fresh php-fpm workers | `4a12e80a1f90bf2d1df862be5bea73e8259e5c5554d59ea7a89962da237e8799` |
+| `artifacts/performance-results.json` (after, canonical) | Tree of `77aecc34e9`, fresh php-fpm workers | `ba69cc7fc31806c470316e632c05c325165f50a9fb0fe3b96f7621c01d79fa7b` |
+| `artifacts/performance-results.md` | Comparator output over the canonical pair, `node ./tests/performance/compare-results.js`, exit 0 | `05f68e67383c91c3cfc6e800781f2beafb90d941560b271e870227a493baaaa2` |
+| `artifacts/reproduction-final/performance-results.json` | Tree of `77aecc34e9`, older worker generation (median `wpProcessRequests` 150.0 against the canonical 77.0) — corroborating reproduction only, not used for any verdict | `8e0527c280d6c6b8f25d61e06213453765bcb13c1a711933ce6da1ab0e71ccca` |
 
-### Evidence provenance: which instrument backs which figure
+The reproduction agreed with the canonical pair on every deterministic metric — files loaded to the
+file, asset bytes to the byte, peak memory within 0.080 % — and showed *slightly smaller* TTFB gains on
+the canonical scenario, so the canonical pair is not the flattering one of the two. *An earlier draft
+listed a fourth artifact "kept outside the tree" with `sha256 05cbdc18…`. That file is not present in
+this environment and its figures could not be re-derived, so it is replaced above by the reproduction
+that is retained and hashable; the three timing figures that came from it are corrected in
+§*Independent reproduction of the after arm*.* Reproduction commands:
 
-| Figure | Instrument | Regime | Samples |
+```
+WP_BASE_URL=http://localhost:8891 npm run test:performance   # per arm, php-fpm restarted between arms
+node ./tests/performance/compare-results.js                   # writes artifacts/performance-results.md
+```
+
+#### Source identity of the measured code
+
+The artifact hashes above identify the *measurements*. The table below identifies the *code* that
+produced them, so that a reader can confirm which bytes were measured without trusting a branch name,
+a filesystem timestamp or this document's prose. The delivered set is **eight runtime files plus
+`Gruntfile.js`**; three of the runtime files do not exist at base, which is why the before arm parks
+them aside rather than reverting them.
+
+Four runtime files that an earlier draft of this table listed as modified — `class-wp-roles.php`,
+`comment.php`, `post.php` and `update.php` — were reverted to base as out of the governing plan's
+implementation scope, and are byte-identical in both arms. They are listed below as such, and the two
+optimizations that depended on them are marked withdrawn where they are described. See
+§*Reconciliation to the delivered tree*.
+
+| Measured runtime file | after — blob (`77aecc34e9`) | after — SHA-256 | before — blob (`5e9d05d7dd`) | before — SHA-256 |
+|---|---|---|---|---|
+| `Gruntfile.js` | `d9353da16223` | `a445f6ce8ee474e4…` | `d196c5115265` | `bca8dbe6ad0d7717…` |
+| `src/wp-includes/autoload-classmap.php` | `8e1ab4f79daa` | `8ba69d6920c1ad75…` | *(absent at base)* | — |
+| `src/wp-includes/autoload.php` | `6863ef34829a` | `67c191b753198c4b…` | *(absent at base)* | — |
+| `src/wp-includes/emoji-arrays.php` | `37f67378b827` | `70668fa8b13a29dc…` | *(absent at base)* | — |
+| `src/wp-includes/capabilities.php` | `ad99d377865a` | `d708ce3dac0c89f3…` | `c5f4099127aa` | `12e26e9aede307a7…` |
+| `src/wp-includes/class-wp-object-cache.php` | `57a637c2cd27` | `24d479938115242e…` | `cda63e66d49e` | `1857b774bd9cfbaf…` |
+| `src/wp-includes/formatting.php` | `6296e832ecb6` | `417a7a3a8c1658b9…` | `2b32b5aafb05` | `922d8ce082d25d33…` |
+| `src/wp-includes/script-loader.php` | `36ef405e0187` | `5fe32dc7beafd878…` | `733914d1d365` | `b3250aae89d2a833…` |
+| `src/wp-settings.php` | `c219376ac336` | `37790ed63206beba…` | `dab1d8fd4c0d` | `138074387a09aa78…` |
+
+Reverted to base, byte-identical in both arms (blob and SHA-256 are the base values in every column):
+
+| Reverted runtime file | blob, both arms | SHA-256, both arms |
+|---|---|---|
+| `src/wp-includes/class-wp-roles.php` | `6f7a7fbc84ba` | `b116231e11cafb36…` |
+| `src/wp-includes/comment.php` | `0f102d1ea80e` | `77f7874661ff4bf6…` |
+| `src/wp-includes/post.php` | `896142603278` | `696ca430cd476f64…` |
+| `src/wp-includes/update.php` | `b7bf5a03780e` | `a0f944cef4856535…` |
+
+Aggregated so that the whole set can be checked with a single value, the SHA-256 of the sorted
+`<sha256>  <path>` manifest over the nine delivered files is
+`df8bb08b42b6be1dcdd09c7b3285bbb3ce90831dbd4c8f2f5c96f5e60f56eef2` for the after arm and
+`d58b5becff545eea89f5aff455c8c7b28438b463ade8e8cd5ad0ce7340cefd26` for the before arm (the before-arm
+aggregate covers the six of the nine that exist at base). The eleven harness files under `tests/performance/` are **identical in both arms** — that is what
+makes the comparison a code comparison rather than a harness comparison — and their manifest digest is
+`f0828a804f090193f0dd545656522d338d97f79a7dd1b12f52bd6dbf3cde3231`.
+
+Verification, all four commands read-only:
+
+```
+git hash-object src/wp-settings.php                 # must equal the after-arm blob above
+git rev-parse 77aecc34e9:src/wp-settings.php         # the same value, from the commit
+git cat-file blob 5e9d05d7dd:src/wp-settings.php | sha256sum    # the before-arm SHA-256
+git diff 77aecc34e9..HEAD --name-only                # must list documentation only
+```
+
+#### Index of retained evidence
+
+Every figure in this document that is *not* read from the four artifacts above comes from one of the
+runs below. Each was retained as a log under the gitignored `artifacts/` tree at the time it was run, so
+a figure can be traced to the exact command and conditions that produced it rather than to this
+document's word. Result values are deliberately **not** repeated in this index — each belongs to the
+section that interprets it, and is stated once there.
+
+**Citation shorthand.** Later sections cite these logs by their leading tag alone — `R06`, `P3-09`,
+`P4-02` — which always means the single file in `artifacts/qa-logs-remediation/` whose name begins with
+that tag. Every tag used anywhere in this document resolves to exactly one file; paths given in full
+(`qa-logs/…`, `artifacts/…`) are relative to the repository root.
+
+| What it establishes | Retained log | Command and conditions |
+|---|---|---|
+| Performance suite on the measured tree | `qa-logs-remediation/R04-performance-final-head.log` | `WP_BASE_URL=http://localhost:8891 npm run test:performance`, written to an isolated `WP_ARTIFACTS_PATH` so the canonical artifacts stay untouched |
+| Comparator over the canonical pair | `qa-logs-remediation/R05-compare-results-canonical.log` | `node ./tests/performance/compare-results.js` |
+| Reproduction agreement with the canonical pair | `qa-logs-remediation/R16-reproduction-vs-canonical-before.txt` | programmatic per-scenario diff of the two after-arm artifacts across all 18 scenarios |
+| PHPUnit, single-site and Multisite, full | `qa-logs-remediation/R11-*`, `R12-*` (`.log` + JUnit XML) | both mu-plugins removed, `src/wp-content/uploads` cleared first |
+| PHPUnit, targeted: `capabilities` group, `tests/load/`, the ten added or changed classes, `ajax` group | `qa-logs-remediation/R06-*`, `R07-*`, `R08-*`, `R09-*` | one invocation per target; the ten classes additionally logged to JUnit XML individually |
+| E2E | `qa-logs-remediation/R13-*`, `R15-*` | `CI=true npm run test:e2e` with `WP_BASE_URL` set; `R15` is the run after residual `wp_e2e_*` tables were dropped |
+| QUnit | `qa-logs/01-build-qunit.log` | `grunt qunit:compiled` and `qunit:index` with `PUPPETEER_EXECUTABLE_PATH` set |
+| Isolated tokenizer A/B, both opcode-cache regimes | `qa-logs-remediation/P3-01-tokenizer-ab.raw.tsv` (+ `.summary.txt`) | 21 samples per arm per regime, one fresh PHP process per sample, per-sample values retained not just medians |
+| Allocator-quantization control | `qa-logs-remediation/P3-02-tokenizer-true-variant.raw.tsv` | `memory_get_peak_usage( true )`, one and two simultaneous tokenizations |
+| Autoload resolution cost and the `file_exists()` guard | `qa-logs-remediation/P3-03-*`, `P3-04-*` | 145 mapped names, 20 passes, every name pre-resolved so no sample pays a file parse; both regimes; `wp_autoload_class()` directly and via `spl_autoload_call()` |
+| Emoji byte accounting and output equivalence | `qa-logs-remediation/P3-06-emoji-ab.log`, `P3-07-emoji-byte-accounting.log` | `formatting.php` base-blob swap, HTTP fetch of both pages per arm, byte-level prefix/suffix/region derivation, swap restored and hash-verified |
+| Emoji A/B through the harness's own instrument | `qa-logs-remediation/P3-11-emoji-perf-ab.raw.tsv` (+ `.summary.txt`) | `server-timing.php` installed; 12 warm and 10 cold samples per page per arm; Server-Timing metrics parsed per response |
+| `map_meta_cap()` per-call cost | `qa-logs-remediation/P3-09-mapmetacap-percall.log` | three arms (base blob / memo disabled / memo enabled) × two regimes × 21 passes × 2,000 calls, with the mapping output asserted identical in all three |
+| `map_meta_cap()` per-path hit/miss behaviour | `qa-logs-remediation/P3-08-memo-per-path.jsonl` | an observability helper (present in the measured arm only) read at `shutdown` over five request paths, twice each, authenticated and anonymous |
+| Bootstrap phase trace and object-cache reach | `qa-logs-remediation/P3-10-phase-trace-tt5.jsonl` (+ `.summary.txt`) | temporary gitignored mu-plugin hooked at eight bootstrap marks; 12 warm samples on the canonical homepage |
+| Source identity and provenance | `qa-logs-remediation/P4-01-provenance-diff.log`, `P4-02-blob-identity.log` | `git rev-parse`, `git hash-object`, `git cat-file`, `git diff --name-status` |
+| Performance suite's declared test count at this tree | `qa-logs-remediation/R17-perf-declared-count.log` | `npx playwright test --config tests/performance/playwright.config.js --list` |
+| Result-set cardinality of both canonical artifacts, and the per-scenario query/worker comparison against the reproduction | `qa-logs-remediation/R18-artifact-cardinality.log` | programmatic walk of the two JSON artifacts: entry count, repetition count, per-metric sample lengths, and median `wpDbQueries` / `wpProcessRequests` / `wpFilesLoaded` per scenario |
+| QUnit result still valid at this tree | `qa-logs-remediation/R19-qunit-validity.log` | `git diff dd815f6a25..HEAD --name-only` over `src/js`, `src/wp-includes/js`, `src/wp-admin/js`, `tests/qunit`, plus a `qunit` grep of the `Gruntfile.js` hunks in that range |
+| Provenance of the two PHPUnit skips | `qa-logs-remediation/R20-skip-provenance.log`, `R21-ajax-skip.log` (+ `R21-ajax.junit.xml`) | `markTestSkipped` inventory, `@group ajax` membership of the ten changed classes, `git diff 5e9d05d7dd..HEAD` over the two files, and a JUnit-logged `--group ajax` re-run that names the skipped test |
+| Basis for the E2E residual-table count | `qa-logs-remediation/R22-e2e-table-basis.log` | `information_schema.tables` listing for `wordpress_develop`, `wp_`/`wp_e2e_` counts, and the prefix rewrite at `tests/e2e/specs/install.test.js:26` |
+| Provenance of the 86 PHPUnit warnings | `qa-logs-remediation/R23-warning-provenance.log` | both `There were 86 warnings:` listings parsed block-by-block (86 gap-free numbered blocks per log), tallied by message text and by test class, then each class located in `tests/phpunit/tests/` and checked for overlap with `git diff --name-only 5e9d05d7dd..HEAD` |
+| Citation resolvability: every governing-plan reference remapped to a full path, and every cited locator's content verified | `qa-logs-remediation/P8-01-citation-resolvability.log` | residual-token scan of this document, then each of the 18 distinct `docs/technical-specifications.md` locators opened and matched against the text it is cited for, plus a heading check of all 10 in-document `§*Title*` self-references |
+| TTFB range and admin `domContentLoaded` percentages recomputed per scenario | `qa-logs-remediation/P7-01-ttfb-dcl-recompute.log` | all 18 scenario percentages parsed from `artifacts/performance-results.md`, sorted, with the range endpoints named and four candidate DCL aggregations computed |
+| Locator ledger over every `file:line` citation in this document | `qa-logs-remediation/P7-02-locator-ledger.log` (+ the script, `P7-02-locator-ledger.py`) | 117 citations resolved (89 explicit, 28 continuation `:NNN`); each checked for line existence *and* for the identifier the sentence names appearing within ±4 lines, in the tree the sentence designates — HEAD or `git show 5e9d05d7dd:<path>`. *An earlier draft of this row said 62 citations; that was the ledger's size before the governing-plan locators added below were brought under the same check.* |
+| Percentage audit of this document | `qa-logs-remediation/P7-03-percentage-audit.log` (+ the script, `P7-03-percentage-audit.py`) | 49 before/after/percentage table rows recomputed as (after − before) ÷ before; every two-decimal percentage matched against the comparator's 200 scenario percentages; the six headline target values confirmed present in that set |
+| Duplicate-figure audit of this document | `qa-logs-remediation/P9-01-duplicate-figure-audit.log` (+ the script, `P9-01-duplicate-figure-audit.py`) | The check finding 6 asks for, in five parts. (1–2) Every table row naming a canonical suite metric, grouped by (metric, before value), so a scenario restated in two sections must agree: 8 groups, **0 value conflicts, 0 drift from the comparator**. (3) 15 superseded figures counted, so corrected-draft history is stated once rather than in every section that touches it. (4) 6 inline `A → B = P %` commentary triples verified separately — the row scan reads only the *first* percentage in a row, because some rows deliberately carry a second as commentary (a rejected denominator, or a second locale) — all 6 arithmetically self-consistent and present in the comparator. (5) Four corrected isolated measurements checked as pairs: the superseded value appears only on lines marking it withdrawn or historical, and the corrected value appears. **0 problems** |
+| Final resolution verification of every review finding against this document | `qa-logs-remediation/P10-01-finding-resolution.log` (+ the script, `P10-01-finding-resolution.py`) | Each of the 11 findings checked by asserting both that the defect named in the review is gone *and* that the corrective content is present — 59 assertions in total, **59/59 pass, 11/11 findings resolved**. The historical-context assertions are paragraph-scoped, because this document is hard-wrapped and a withdrawal's marker often sits on a different physical line from the figure it withdraws; the scoping was negative-control tested to confirm it still fails a figure asserted as current |
+| Independent re-verification of the source-identity manifest above | `qa-logs-remediation/P9-02-manifest-hash-verification.log` (+ the script, `P9-02-manifest-hash-verification.py`) | Each manifest row re-checked column-aware, against the files themselves rather than against the text: after-arm SHA-256 vs the working tree **12/12**, after-arm blob SHA-1 vs `git hash-object` **12/12**, before-arm SHA-256 vs `git show 5e9d05d7dd:<path>` **9/9**, with the 3 rows marked absent at base correctly skipped. **0 mismatches** — so the manifest is reproducible from the repository by anyone, without trusting this document |
+| Cross-check of every QA figure in this report against its retained artifact | `qa-logs-remediation/R24-qa-crosscheck.log` (+ the script, `R24-crosscheck.py`) | 67 assertions: each PHPUnit result line read from its log *and* matched in this document, the ten per-class JUnit rows and their sums, the QUnit result and its validity argument, the performance pass and declared counts, both E2E runs' declared/passed/flaky/failed/exit values, artifact cardinality, the warning tally, both named skips, the residual-table count, and the three artifact SHA-256 values |
+
+Static-asset byte accounting is independent of PHP measurement: `adminJsRaw` and `adminJsGzipped`
+are summed per response from the admin document's own `<script src>` set by
+`tests/performance/specs/admin.test.js`, so they are a property of the delivered payload, not of the
+interpreter.
+
+#### Independent reproduction of the after arm
+
+The suite was run once more on the measured
+tree as a regression check on everything above, into an isolated `WP_ARTIFACTS_PATH` so that the
+canonical artifacts were not touched. Its console log is
+`artifacts/qa-logs-remediation/R04-performance-final-head.log` (**786 passed / 0 failed**, 11.0 m) and
+its result set is `artifacts/reproduction-final/performance-results.json`
+(`sha256 8e0527c280d6c6b8…`); the per-scenario diff against the canonical pair is
+`R16-reproduction-vs-canonical-before.txt`. Every figure below is read from those files.
+
+The deterministic metrics reproduced *exactly*: `wpFilesLoaded` was identical in **all 18 scenarios**
+(403, 424, 383, 392, 375, 381, 379, 394, 377), giving the same 512 → 403 = **−21.29 %** on the canonical
+context, and `adminJsRaw` / `adminJsGzipped` returned the same 1,429,289 and 358,539 bytes for
+**−87.62 %** and **−83.47 %**. `wpMemoryPeak` landed within **0.080 %** of the canonical value in every
+scenario (−5.46 % against the reported −5.44 %). The timing metrics moved within their own noise in the
+same direction and magnitude (TTFB **−15.73 %**, DOMContentLoaded **−81.69 %**; the reproduction's
+front-end TTFB range is −14.37 % … −17.46 %, against the canonical −14.34 % … −17.84 %). **Every one of
+the six target verdicts is unchanged.** The fresh-worker canonical pair rather than this run is used for
+the verdicts because this run's workers were older: median `wpProcessRequests` **150.0** against
+**77.0** for the canonical pair.
+
+One condition differed deliberately, and it is the reason this run is a corroboration rather than a
+replacement: external HTTP and cron were suppressed the way CI suppresses them, by defining
+`WP_HTTP_BLOCK_EXTERNAL` and `DISABLE_WP_CRON` in `wp-config.php`
+(`.github/workflows/reusable-performance.yml:214-219`), instead of the canonical pair's gitignored
+`pre_http_request` control. Both constants were removed afterwards
+(`R01-config-set.log`, `R10-config-delete.log`), and `git status --porcelain` was empty on exit.
+
+Query counts shifted in four of the eighteen scenarios and held in the other fourteen, and the cause is
+environmental rather than in the code. The two admin scenarios read **51.5** and **52** instead of 47.5
+and 48 because reproducing the content fixture requires installing the `wordpress-importer` plugin, and
+its presence adds queries to the Dashboard's update and plugin paths. The two twentytwentyfive homepage
+scenarios read **72** and **73** instead of 73 and 74 because re-importing shifts transient and
+comment-count state by one row. The plugin is not an artifact of this measurement: CI does the same
+thing, installing it with `--activate`, importing the identically pinned fixture
+(`theme-test-data` at commit `b9752e05`), deleting the XML and then deactivating the plugin —
+`.github/workflows/reusable-performance.yml:196-205` and
+`.github/workflows/reusable-performance-test-v2.yml:220-229` — so installed-and-deactivated is the
+state the suite is designed to run against. Neither shift touches a verdict: row 5 is reported as
+failed at 0.00 % either way, and rows 3, 4 and 6 reproduced exactly.
+
+### Citations to the governing plan
+
+This work is governed by an agreed plan whose repository-tracked form is
+`docs/technical-specifications.md` (1,049 lines). **Every reference to that plan in this document is
+given as a full path with a line locator**, so a reader can open the cited lines directly; a bare
+section number is never used, because section numbering is not stable across revisions of a plan while
+line-anchored text is checkable against the file that is actually in the repository.
+
+Two of the plan's constraints are stated only in the agreed plan and have no line-anchored equivalent in
+the tracked document. Those are cited by name and marked *plan-only* below rather than being given a
+locator that would not resolve. Naming them is not a weaker citation than a section number would have
+been — a section number that resolves to nothing is worse — and each one's *effect* is verifiable in this
+document from the measurements that discharge it.
+
+| # | Constraint, by the name this document uses | What it requires | Repository locator |
 |---|---|---|---|
-| Files loaded per bootstrap | A | parse-dominated CLI, and primed CLI | 10 per arm |
-| Peak memory per request | A | parse-dominated CLI; primed CLI for reference | 10 per arm |
-| Peak memory, warm | B / C | warm HTTP shared memory | 12 per arm, two replicates |
-| Front-end TTFB, `wpTotal`, `wpBootstrap` | B / C | parse-dominated HTTP and warm HTTP, separately | 12 per arm |
-| Files loaded per HTTP request | B / C | either regime (identical) | 12 per arm |
-| DB queries | C (authenticated `/` and `/wp-admin/`), B (anonymous `/`) | either regime (identical) | 12 per arm |
-| Admin JavaScript bytes and file count | D | n/a — static assets | deterministic, zero variance |
-| Admin JavaScript bytes, replication pair | D, re-run on the live instance after the regression suites | n/a — static assets | deterministic, zero variance |
-| Front-end HTML bytes | D and B / C | n/a — deterministic | zero variance |
-| Admin `domContentLoaded` | F | regime-independent by construction | 40 per arm |
-| Admin `domContentLoaded`, same-instance A/B | G | regime-independent by construction; cache-cold | 12 per arm |
-| Runtime behaviour: console errors, rendered layout, palette availability, emoji markers | G | n/a — behavioural, not timed | every screen, both arms |
-| Tokenizer cost, capability-loop cost | E | stated per figure | 12 per arm, median of 10 |
-| Per-optimization attribution | A, B, C with exactly one file swapped per arm | stated per figure | 10–12 per arm |
-
-**Why instrument F is restricted to regime-independent pairs.** The saved comparison's after arm is
-cold-compile: `wpOpcacheCachedScripts` equals `wpFilesLoaded` in all 18 contexts and the hit rate is
-0.7264–1.0667 %, so every measured request compiled everything it loaded. Its before arm carries no
-opcode-cache markers at all — `wpOpcacheEnabled`, `wpOpcacheHitRate`, `wpOpcacheCachedScripts`,
-`wpProcessId`, `wpProcessRequests` and `wpBootstrapValid` are all `N/A` in the before column, because
-that arm ran an earlier revision of the instrumentation — and its `timeToFirstByte` of 51.65 ms
-against the after arm's 385.50 ms, and `wpBootstrap` of 23.45 ms against 288.28 ms, are warm-regime
-values. Every time and memory pair in that artifact is therefore cross-regime, and rule 1 of the
-Measurement Law excludes all of them. Its regime-independent pairs remain valid and are used:
-`wpFilesLoaded`, `wpDbQueries`, `wpCacheHits`, `wpCacheMisses` and `domContentLoaded`. Its after-arm
-`adminJsRaw` and `adminJsGzipped` values are quoted as corroboration for the admin JavaScript work,
-never as one half of a pair.
+| C1 | **Preservation Boundaries** | Public method signatures, hook names and argument counts, REST route registrations and schemas, the `wp.*` global surface, the enqueue dependency contract, bundled themes, Gutenberg-synced source and admin UI appearance must not change; all four test suites must keep passing with no new skips; `WP_DEBUG` must keep working; behaviour must degrade gracefully with no object-cache backend | `docs/technical-specifications.md:845-859`, restated as exclusions at `:319-335` |
+| C2 | **Quality Gates** | Performance proof from `tests/performance/compare-results.js`; no speculative optimization; minimal diff; backward-compatibility verification by full E2E after each change; the security invariant on deferred loading and code splitting | `docs/technical-specifications.md:868-873`; zero-regression gate at `:856`; per-change value documentation at `:875-891` |
+| C3 | **Minimal diff** (the individual gate cited most often here) | Each optimization must be the smallest change that achieves the measured improvement — no bundled refactoring, style changes or unrelated cleanup | `docs/technical-specifications.md:871` |
+| C4 | **Scope Exclusion Rules** | No ES module migration or TypeScript conversion, no jQuery or Backbone removal, no server configuration changes, no CDN or edge caching, no database engine changes | `docs/technical-specifications.md:914-922` |
+| C5 | **Gutenberg-synced trees are out of scope** | Anything written into the tree by the Gutenberg sync is not modified | `docs/technical-specifications.md:329`; verifiable in the tree at `tools/gutenberg/copy.js:51` and by the do-not-edit header of `build/wp-includes/blocks/require-dynamic-blocks.php` |
+| C6 | **File-by-File Transformation Plan** | The per-file scope: which files are CREATED, UPDATED or REFERENCE-only, and what each change is for | `docs/technical-specifications.md:479-599` — `wp-settings.php` at `:487`, `formatting.php` at `:494`, `capabilities.php` at `:532`, `script-loader.php` at `:554` |
+| C7 | **Performance Targets** | The six targets, their measurement methods and their thresholds | `docs/technical-specifications.md:905-912`, with the Server-Timing keys at `:470-475` |
+| C8 | **Measure-First Rule** | Profile with the `tests/performance/` suite, `SAVEQUERIES`, `get_included_files()` and `memory_get_peak_usage()` before changing anything, and prove the change with the same method | `docs/technical-specifications.md:62`; the observability architecture it implies at `:433-465` |
+| C9 | **Backward compatibility for early callers** | Plugin and theme backward compatibility for documented APIs — which is what forbids deferring a file whose functions third-party code probes with `function_exists()` at load time | `docs/technical-specifications.md:857`, with the AJAX-dispatch precedent at `:605` |
+| C10 | **Admin UI appearance is preserved** | No user-facing visual or functional change in the admin | `docs/technical-specifications.md:853`, restated at `:330` |
+| C11 | **Database query analysis** | The reading of the DB-query target that this document's row 5 discharges | `docs/technical-specifications.md:802-812` |
+| C12 | **JavaScript payload analysis** | The reading of the admin-JS target that this document's row 3 discharges | `docs/technical-specifications.md:779-801` |
+| C13 | **OPcache Measurement Law** | Identical interpreter flags across a before/after pair, the opcode-cache state reported with every figure, the process restarted between code states, `memory_get_peak_usage( false )`, ten or more samples with the median reported, both regimes reported | *Plan-only.* Its nearest tracked anchor is the Measure-First Rule at `docs/technical-specifications.md:62`; it is discharged throughout §*2. The OPcache Measurement Law* in this document |
+| C14 | **Target-Coupling Caveat** | `get_included_files()` is a proxy metric, so memory and time improvements may never be inferred from a file-count reduction | *Plan-only.* The metric it constrains is defined at `docs/technical-specifications.md:912`, and `:832` records that it was previously not reported at all; it is discharged in §*3. Proxy metrics are not cost metrics — neither file counts nor isolated micro-benchmarks* |
 
 ---
 
 ## Aggregate summary of total improvement across all metrics
 
-The canonical front-end context for rows 1, 4 and 6 is the anonymous `twentytwentyone` / `en_US`
-posts-index front page of this instance. Row 5 is reported twice because the two query optimizations
-execute on authenticated request paths only, and reporting a single figure would misrepresent one of
-the two cases.
+### The frozen target table, reproduced verbatim
 
-| # | Metric | Target | Before | After | Δ (delta/before) | Instrument | Regime | n | Verdict |
-|---|---|---|---|---|---|---|---|---|---|
-| 1 | Front-end TTFB (uncached) | ≥20 % | 192.88 ms | 160.36 ms | **−16.86 %** | B | parse-dominated HTTP, `opcache.enable=0` | 12/arm | ❌ **not met** |
-| 1w | — same, warm regime | ≥20 % | 45.75 ms / 51.59 ms | 43.90 ms / 47.81 ms | **−4.03 % / −7.32 %** | B | warm HTTP, hit rate 91.3–91.6 % | 12/arm ×2 replicates | ❌ **not met** |
-| 2 | Admin DOMContentLoaded | ≥15 % | 665.50 ms | 155.85 ms | **−76.58 %** | F | regime-independent (subtracts `responseEnd`) | 40/arm | ✅ **met** |
-| 2b | — same, `de_DE` | ≥15 % | 666.70 ms | 171.95 ms | **−74.21 %** | F | regime-independent | 40/arm | ✅ **met** |
-| 2c | — same, browser-measured same-instance A/B | ≥15 % | 496.95 ms | 152.15 ms | **−69.38 %** | G | regime-independent; cache-cold, `SCRIPT_DEBUG=true` | 12/arm | ✅ **met** |
-| 3 | Admin JS transfer size (gzipped) | ≥30 % | 2,162,502 B | 358,259 B | **−83.43 %** | D | n/a — static assets, `gzip -9`, `SCRIPT_DEBUG=true` | deterministic | ✅ **met** |
-| 3b | — same, replication pair on the live instance | ≥30 % | 2,145,589 B | 341,346 B | **−84.09 %** | D | n/a — static assets, `gzip -9`, `SCRIPT_DEBUG=true` | deterministic | ✅ **met** |
-| 4 | PHP peak memory per front-end request | ≥10 % | 32,047,272 B (32.047 MB) | 24,148,440 B (24.148 MB) | **−24.65 %** | A | parse-dominated CLI, `opcache.enable_cli=0` | 10/arm | ✅ **met** |
-| 4w | — same, warm regime | ≥10 % | 4,229,760 B | 4,249,392 B | **+0.46 %** | B | warm HTTP shared memory | 12/arm ×2 replicates | ❌ **not met** |
-| 5 | DB queries per front-end page load, authenticated | ≥15 % | 32 | 26 | **−18.75 %** | C | identical in warm and parse-dominated | 12/arm | ✅ **met** |
-| 5a | — same, anonymous | ≥15 % | 24 | 24 | **0 %** | B | identical in warm and parse-dominated | 12/arm | ❌ **not met** |
-| 6 | PHP files loaded per front-end request | ≥30 % | 482 | 341 | **−29.25 %** | A | count metric; zero variance in both regimes | 10/arm | ❌ **not met** |
-| 6h | — same, full HTTP request | ≥30 % | 499 | 381 | **−23.65 %** | B | count metric; identical in both regimes | 12/arm | ❌ **not met** |
+This is the governing plan's performance-target table: its three columns, its wording, its row order,
+with nothing added and nothing removed. It is the **definition** of the six targets, not a result.
+Results follow in the next sub-section, in a separate table.
 
-**Two targets are met unconditionally** — Admin DOMContentLoaded and admin JavaScript transfer size.
-**Two are met in one measured regime or request context and not in the other**, and both halves are
-shown rather than the flattering half alone: per-request peak memory is met by a wide margin
-whenever compilation is being paid for and is flat when it is not, and the query reduction is met on
-authenticated page loads and is exactly zero on anonymous ones. **Two are not met**: front-end TTFB
-reaches −16.86 % against a −20 % requirement in the regime where it moves most, and the file count
-reaches −29.25 % against −30 %, short by 0.75 percentage points on the conservative convention. The
-section *Why the two unmet targets are unmet* gives the measured accounting for each, and neither is
-unmet through omission.
+| Metric | Method | Target |
+|--------|--------|--------|
+| Front-end TTFB (uncached) | tests/performance/ suite | ≥20% reduction |
+| Admin DOMContentLoaded | tests/performance/ suite | ≥15% reduction |
+| Admin JS transfer size (gzipped) | Build output analysis | ≥30% reduction |
+| PHP memory per front-end request | memory_get_peak_usage() instrumentation | ≥10% reduction |
+| DB queries per front-end page load | SAVEQUERIES count | ≥15% reduction |
+| PHP files loaded per front-end request | get_included_files() count | ≥30% reduction |
 
-On the harness's own `delta / after` convention, row 6 reads **−41.35 %** and the 18-context median
-reads **−30.01 %**; both would clear the target. This report does not claim it on that basis.
+The one rendering choice made above is the `≥` glyph, which is the form the plan uses throughout its
+prose and the form the repository's own prior plan uses in its copy of this table. That prior copy
+carries the identical six rows and identical thresholds under the column labels
+`Metric | Measurement Method | Target Improvement` at `docs/technical-specifications.md:905-912`, so
+the table above is checkable against a file in this tree as well as against the governing plan.
 
-Rows **2c** and **3b** are independent replications of rows 2 and 3, taken later, on the live
-instance, and row 2c comes from a different instrument observing the rendered page rather than the
-response body. Both reproduce the direction and the magnitude of the pair they replicate. Their
-absolute values differ from rows 2 and 3, and the measured reason is given where each is reported —
-in both cases the reduction is unaffected because each pair was taken within a single session with a
-single variable changed.
+### Aggregate results table
+
+The table below is this report's **results** table. It is not the frozen table and does not stand in
+for it. It restates each target's metric, method and threshold so a row can be read on its own, then
+adds the measured before and after, the delta, the opcode-cache state the figure was taken under, and
+the verdict — nine columns rather than three. Two method cells are deliberately more specific than the
+frozen wording: row 4 abbreviates "instrumentation", and row 5 names the transport the `SAVEQUERIES`
+count is read through. Where the two differ, **the frozen wording above governs**; the specificity here
+exists only to say how the number was obtained.
+
+Each row is judged on the canonical pair described above, using the metric and the request
+type the target names — not a substituted one. The canonical anonymous front-end context is
+Homepage › `twentytwentyfive` › `en_US`: the default experience of a current install, the heaviest
+bundled theme on every dimension, and the context the governing plan itself adopts as authoritative. The admin
+context is Admin › `en_US`. Where another scenario in the same run did better, its figure is given in
+the table after this one so the best case is visible without being substituted for the verdict.
+
+| # | Metric | Method | Target | Before | After | Δ (vs before) | OPcache | Verdict |
+|---|---|---|---|---|---|---|---|---|
+| 1 | Front-end TTFB (uncached) | `tests/performance/` suite | ≥20% reduction | 488.60 ms | 418.55 ms | **−14.34 %** | cold compile per iteration, `enable_cli=0` | ❌ **not met** |
+| 2 | Admin DOMContentLoaded | `tests/performance/` suite | ≥15% reduction | 738.60 ms | 152.00 ms | **−79.42 %** | cold compile per iteration, `enable_cli=0` | ✅ **met** |
+| 3 | Admin JS transfer size (gzipped) | Build output analysis | ≥30% reduction | 2,169,039 B | 358,539 B | **−83.47 %** | n/a (static assets) | ✅ **met** |
+| 4 | PHP memory per front-end request | `memory_get_peak_usage()` | ≥10% reduction | 11,724,584 B | 11,086,544 B | **−5.44 %** | cold compile per iteration, `enable_cli=0` | ❌ **not met** |
+| 5 | DB queries per front-end page load | `SAVEQUERIES` count via Server-Timing | ≥15% reduction | 73 | 73 | **0.00 %** | cold compile per iteration, `enable_cli=0` | ❌ **not met** |
+| 6 | PHP files loaded per front-end request | `get_included_files()` count | ≥30% reduction | 512 | 403 † | **−21.29 %** † | count metric; OPcache-independent | ❌ **not met** |
+
+† *Measured on the tree at `77aecc34e9`. The delivered tree parses **+2 files** more, for the fatal-error fix set out in §*Reconciliation to the delivered tree*: 405, i.e. **−20.90 %**. The verdict on this row is
+❌ not met at either value, since the target is ≥30 %.*
+
+**Two of the six targets are met and four are not.** No row is decided by a substituted scenario, a
+substituted regime or a substituted metric, and none is left undecided.
+
+Best case elsewhere in the same run, for the four unmet rows — every one still short of its target:
+
+| # | Metric | Best scenario in the run | Before → After | Δ | Target | Still |
+|---|---|---|---|---|---|---|
+| 1 | Front-end TTFB | Single post › `twentytwentyone` › `en_US` | 437.25 → 359.25 ms | **−17.84 %** | ≥20% | ❌ short by 2.2 pts |
+| 4 | Front-end peak memory | Homepage › `twentytwentyfour` › `en_US` | 7,365,408 → 6,665,936 B | **−9.50 %** | ≥10% | ❌ short by 0.5 pts |
+| 5 | Front-end DB queries | *(none — all 16 front-end scenarios are exactly 0.00 %)* | — | **0.00 %** | ≥15% | ❌ no movement at all |
+| 6 | Front-end files loaded | Homepage › `twentytwentythree` › `en_US` | 484 → 375 † | **−22.52 %** † | ≥30% | ❌ short by 7.5 pts |
+
+† *Measured on the tree at `77aecc34e9`. The delivered tree parses **+2 files** more, for the fatal-error fix set out in §*Reconciliation to the delivered tree*: 377, **−22.11 %**, short by 7.9 pts.*
+
+Three points of candour about these four misses, each expanded in §*Why four targets are not met*:
+
+- **Row 5 has no front-end movement whatsoever** — 0.00 % in all sixteen theme×locale scenarios,
+  logged out — and it is reported as failed. The earlier substituted scenario that made this row appear
+  satisfied is withdrawn where the row is analysed, in §*Front-end DB queries: 0.00 % against ≥15 %*.
+  The two query optimizations that produced a real 6-query *admin* reduction have since been
+  **withdrawn from the change set entirely**, so no query reduction of any kind is claimed in either
+  context; see §*Reconciliation to the delivered tree*.
+- **Row 4 was previously claimed as met by quoting an isolated CLI tokenizer figure**, which is
+  withdrawn where it was originally claimed, in §*Core class autoloader with a build-generated static
+  class map*. Judged by `memory_get_peak_usage()` on the request the target names, the result is
+  −5.44 % canonical and −9.50 % at best. Not met.
+- **Row 1 improved substantially but not enough.** −14.34 % canonical, −17.84 % at best, against
+  ≥20 %; every homepage and single-post scenario in the run moved between those two values, so the
+  shortfall is consistent rather than noise. Both ends are scenario values rather than summary
+  statistics, and the derivation is given once, in §*Front-end TTFB: −14.34 % against ≥20 %
+  (canonical), −17.84 % at best*.
 
 ### Additional measured improvements not covered by a target
 
-| Metric | Context | Before | After | Δ | Instrument, regime, n |
-|---|---|---|---|---|---|
-| `wpBootstrap` | anonymous front page | 162.12 ms | 128.50 ms | **−20.74 %** | B, parse-dominated HTTP, 12/arm |
-| `wpBootstrap` | authenticated front page | 165.21 ms | 128.94 ms | **−21.95 %** | C, parse-dominated HTTP, 12/arm |
-| `wpBootstrap` | admin dashboard | 168.62 ms | 131.33 ms | **−22.12 %** | C, parse-dominated HTTP, 12/arm |
-| `wpTotal` | admin dashboard | 222.53 ms | 180.58 ms | **−18.85 %** | C, parse-dominated HTTP, 12/arm |
-| `wpTotal` | admin dashboard | 47.84 ms | 43.65 ms | **−8.75 %** | C, warm HTTP, 12/arm |
-| `timeToFirstByte` | admin dashboard | 227.69 ms | 185.45 ms | **−18.55 %** | C, parse-dominated HTTP, 12/arm |
-| `timeToFirstByte` | admin dashboard | 48.74 ms | 44.66 ms | **−8.38 %** | C, warm HTTP, 12/arm |
-| `wpMemoryPeak` | admin dashboard | 38,095,552 B | 30,311,792 B | **−20.43 %** | C, parse-dominated HTTP, 12/arm |
-| `wpMemoryPeak` | authenticated front page | 33,382,320 B | 26,757,392 B | **−19.85 %** | C, parse-dominated HTTP, 12/arm |
-| Bootstrap wall time | CLI bootstrap | 191.611 ms | 147.983 ms | **−22.77 %** | A, parse-dominated CLI, 10/arm |
-| Bootstrap wall time | CLI bootstrap | 65.029 ms | 52.302 ms | **−19.57 %** | A, primed CLI, 10/arm |
-| Bootstrap peak memory | CLI bootstrap | 29,910,216 B | 23,905,088 B | **−20.08 %** | A, primed CLI, 10/arm |
-| `wpDbQueries` | admin dashboard | 40 | 34 | **−15.00 %** | C, identical in both regimes, 12/arm |
-| `wpCacheMisses` | admin dashboard | 85 | 81 | **−4.71 %** | C, 12/arm |
-| `wpCacheMisses` | authenticated front page | 76 | 72 | **−5.26 %** | C, 12/arm |
-| Admin JavaScript file count | dashboard | 84 files | 43 files | **−48.81 %** | D, deterministic |
-| Admin JavaScript raw bytes | dashboard | 11,542,026 B | 1,429,289 B | **−87.62 %** | D, `SCRIPT_DEBUG=true`, deterministic |
-| Admin HTML bytes | dashboard | 85,942 B | 73,284 B | **−14.73 %** | D, deterministic |
-| Admin JavaScript file count, replication | dashboard | 81 files | 40 files | **−50.62 %** | D replication, deterministic |
-| Admin JavaScript raw bytes, replication | dashboard | 11,484,296 B | 1,371,559 B | **−88.06 %** | D replication, deterministic |
-| Admin HTML bytes, replication | dashboard | 73,303 B | 60,453 B | **−17.53 %** | D replication, deterministic |
-| `loadEventEnd − responseEnd` | dashboard | 498.10 ms | 153.10 ms | **−69.26 %** | G, cache-cold, 12/arm |
-| Admin HTML bytes | dashboard | 85,869 B | 73,211 B | **−14.74 %** | C, deterministic — an independent instrument agreeing to within 1 byte of delta |
-| Front-end HTML bytes, raw | anonymous `/` | 59,456 B | 45,756 B | **−23.04 %** | D, `SCRIPT_DEBUG=true`, deterministic |
-| Front-end HTML bytes, `gzip -9` | anonymous `/` | 12,749 B | 8,895 B | **−30.23 %** | D, deterministic |
-| Front-end HTML bytes, raw | single post | 60,390 B | 46,690 B | **−22.69 %** | D, deterministic |
-| Front-end HTML bytes, `gzip -9` | single post | 13,662 B | 9,851 B | **−27.89 %** | D, deterministic |
-| Front-end HTML bytes | authenticated `/` | 42,143 B | 28,443 B | **−32.51 %** | C, deterministic |
-| `map_meta_cap()` resolution | 28,000 capability checks | 155.312 ms | 102.597 ms | **−33.94 %** | E, `opcache.enable_cli=1`, 10/arm |
-| `formatting.php` tokenization | one file, `token_get_all()` | 6.697 ms | 4.327 ms | **−35.39 %** | E, `opcache.enable=0`, 10/arm |
+All rows are medians over the canonical pair unless the Notes column names another method.
 
-Two rows in that table deserve their sign read carefully rather than skimmed. `wpTemplate` **rose**
-in the parse-dominated regime — 18.11 ms → 24.24 ms on the anonymous front page (**+33.89 %**) and
-19.73 ms → 25.12 ms authenticated (**+27.35 %**) — because deferral moves compilation out of the
-bootstrap and into the first use of the deferred class, which happens during template rendering. The
-bootstrap and total figures above are net of that shift; it is not hidden. And admin dashboard
-`wpMemoryPeak` in the warm regime moved **−1.81 %**, well inside the ±0.5 % noise band established on
-the front page, so no warm memory win is claimed anywhere.
+| Metric | Context | Before | After | Δ | Notes |
+|---|---|---|---|---|---|
+| Admin `wpTotal` (server time) | Admin en_US | 436.85 ms | 366.98 ms | **−15.99 %** | de_DE: 438.66 → 369.35 ms = **−15.80 %** |
+| Admin TTFB | Admin en_US | 449.45 ms | 378.80 ms | **−15.72 %** | de_DE: 451.30 → 381.25 ms = **−15.52 %** |
+| Admin `wpBootstrap` | Admin en_US | 359.42 ms | 295.75 ms | **−17.71 %** | de_DE: 361.24 → 296.88 ms = −17.82 % |
+| Admin peak memory | Admin, both locales | 7,268,192 B | 6,650,408 B | **−8.50 %** | Identical in both locales; below the ≥10 % bar, and the target is a front-end metric in any case |
+| Admin current memory (`wpMemoryUsage`) | Admin, both locales | 6,710,344 B | 6,001,112 B | **−10.57 %** | Reported for completeness; the target names *peak* |
+| Admin files loaded | Admin, both locales | 530 | 424 † | **−20.00 %** † | † Delivered tree: 426, **−19.62 %** — see §*Reconciliation to the delivered tree* |
+| ~~Admin DB queries~~ | ~~Admin en_US~~ | ~~53.5~~ | ~~47.5~~ | ~~**−11.21 %**~~ | **WITHDRAWN.** Both contributing optimizations were reverted; `comment.php` and `update.php` ship byte-identical to base. See §*Reconciliation to the delivered tree* |
+| Admin JS file count | Dashboard | 84 files | 43 files | **−48.81 %** | Isolated same-method A/B swapping **only** `src/wp-includes/script-loader.php`; all 41 removed scripts are `/js/dist/` bundles (49 → 8) |
+| Admin JS raw bytes | Dashboard | 11,542,026 B | 1,429,289 B | **−87.62 %** | Same isolated A/B, summed by fetching every `<script src>`. **Byte-for-byte identical to the suite's `adminJsRaw` medians in both arms** |
+| Admin JS `gzip -9` bytes | Dashboard | 2,162,612 B | 357,886 B | **−83.45 %** | Same isolated A/B. The suite's `adminJsGzipped` reports 2,169,039 → 358,539 (−83.47 %); the ~0.03 % spread is the difference between `gzip -9` and the harness's own compressor |
+| Admin HTML document | `/wp-admin/` | 139,448 B | 127,505 B | **−8.56 %** | Same isolated A/B |
+| Largest Contentful Paint | Homepage › twentytwentyone › en_US | 476.00 ms | 392.00 ms | **−17.65 %** | Best of the 16 front-end scenarios; **median of all 16 deltas −14.72 %**, worst −11.89 % |
+| `lcpMinusTtfb` | Homepage › twentytwentythree › de_DE | 53.30 ms | 46.00 ms | **−13.70 %** | Best of 16; median of all 16 deltas **−4.47 %**, and one scenario regressed (+2.83 %) — post-TTFB rendering is largely unaffected, as expected for a server-side change |
+| Front-end `wpBootstrap` | Homepage, all 8 scenarios | 356.42–360.68 ms | 288.04–290.86 ms | **−18.61 % to −20.13 %** | The bootstrap is where the file-count reduction actually pays |
+| Object-cache reads | Admin en_US | 1,006.5 hits | 975.5 hits | **−3.08 %** | Fewer asset registrations to look up; misses 135.5 → 131.5 = −2.95 % |
 
 ### File-count reduction is uniform across every measured context
 
-The file reduction is not an artifact of one theme or locale. All 18 contexts from instrument F,
-40 samples per arm, count metric, regime-independent:
+The file-count improvement is not an artifact of one theme or locale — and neither is the shortfall.
+All 18 contexts, medians over 40 samples each. The count is an integer and was identical in every
+one of the 40 samples per scenario, so these rows carry no measurement uncertainty at all:
 
-| Context | Before | After | Δ (delta/before) | Δ (delta/after, harness convention) |
+| Context | Before | After | Δ files | Δ (vs before) |
 |---|---|---|---|---|
-| Admin en_US | 530 | 404 | −23.77 % | −31.19 % |
-| Admin de_DE | 533 | 410 | −23.08 % | −30.00 % |
-| Homepage twentytwentyone en_US | 500 | 379 | −24.20 % | −31.93 % |
-| Homepage twentytwentyone de_DE | 502 | 384 | −23.51 % | −30.73 % |
-| Homepage twentytwentythree en_US | 484 | 371 | −23.35 % | −30.46 % |
-| Homepage twentytwentythree de_DE | 486 | 376 | −22.63 % | −29.26 % |
-| Homepage twentytwentyfour en_US | 492 | 378 | −23.17 % | −30.16 % |
-| Homepage twentytwentyfour de_DE | 494 | 383 | −22.47 % | −28.98 % |
-| Homepage twentytwentyfive en_US | 486 | 374 | −23.05 % | −29.95 % |
-| Homepage twentytwentyfive de_DE | 488 | 379 | −22.34 % | −28.76 % |
-| Single Post twentytwentyone en_US | 498 | 379 | −23.90 % | −31.40 % |
-| Single Post twentytwentyone de_DE | 500 | 384 | −23.20 % | −30.21 % |
-| Single Post twentytwentythree en_US | 483 | 371 | −23.19 % | −30.19 % |
-| Single Post twentytwentythree de_DE | 485 | 376 | −22.47 % | −28.99 % |
-| Single Post twentytwentyfour en_US | 485 | 373 | −23.09 % | −30.03 % |
-| Single Post twentytwentyfour de_DE | 487 | 378 | −22.38 % | −28.84 % |
-| Single Post twentytwentyfive en_US | 486 | 375 | −22.84 % | −29.60 % |
-| Single Post twentytwentyfive de_DE | 488 | 380 | −22.13 % | −28.42 % |
+| Admin en_US / de_DE | 530 / 530 | 424 / 424 | −106 | −20.00 % / −20.00 % |
+| Homepage twentytwentyone en_US / de_DE | 500 / 500 | 392 / 392 | −108 | −21.60 % / −21.60 % |
+| Homepage twentytwentythree en_US / de_DE | 484 / 484 | 375 / 375 | −109 | **−22.52 %** / **−22.52 %** |
+| Homepage twentytwentyfour en_US / de_DE | 492 / 492 | 383 / 383 | −109 | −22.15 % / −22.15 % |
+| Homepage twentytwentyfive en_US / de_DE *(canonical)* | 512 / 512 | 403 / 403 | −109 | **−21.29 %** / **−21.29 %** |
+| Single Post twentytwentyone en_US / de_DE | 500 / 500 | 394 / 394 | −106 | −21.20 % / −21.20 % |
+| Single Post twentytwentythree en_US / de_DE | 484 / 484 | 377 / 377 | −107 | −22.11 % / −22.11 % |
+| Single Post twentytwentyfour en_US / de_DE | 486 / 486 | 379 / 379 | −107 | −22.02 % / −22.02 % |
+| Single Post twentytwentyfive en_US / de_DE | 488 / 488 | 381 / 381 | −107 | −21.93 % / −21.93 % |
 
-Median **−23.08 %** on `delta / before`, range −22.13 % to −24.20 %, mean −23.04 %. Median
-**−30.01 %** on the harness's `delta / after`. Judged conservatively, no context reaches 30 %; the
-isolated bootstrap measured by instrument A reaches −29.25 %, the best figure anywhere in this work.
+Range **−20.00 % to −22.52 %**, median −21.93 %, canonical context **−21.29 %**. **No context reaches
+30 %, so the target is not met**, and the gap is 7.5 percentage points even in the best case. The
+absolute reduction is a near-constant 106–109 files across every context, which is expected: the
+deferral set is a property of the bootstrap, not of the theme, so the percentage varies only because
+the denominators differ.
 
-### Per-optimization attribution, and how the parts reconcile with the whole
-
-A change set measured only end to end proves nothing about any individual change in it. Each
-optimization below was therefore measured a second time in isolation: a pristine worktree of
-`5e9d05d7dd` served one arm, and a second worktree of `5e9d05d7dd` with **exactly one file or file
-group swapped in** served the other, with every swapped and unswapped file's SHA-1 verified against
-both the base commit and the current tree before each run and after restoration.
-
-| Arm | Files swapped in | Measured effect | Instrument, regime, n |
-|---|---|---|---|
-| **Control** | none — two identical trees at different paths | peak **−672 B (−0.00 %)**, time −3.98 % | A, primed CLI, 10/arm |
-| **W1** | `wp-settings.php` + `autoload.php` + `autoload-classmap.php` | files 482 → 341 (**−29.25 %**), peak 32,047,624 → 24,490,296 B (**−23.58 %**), time **−22.26 %** | A, parse-dominated CLI, 10/arm |
-| **W1** | same | peak **−22.72 %**, time **−15.34 %** | A, primed CLI, 10/arm |
-| **W1** | same | files 499 → 381, peak 33,174,208 → 26,862,928 B (**−19.02 %**), TTFB **−14.61 %**, `wpBootstrap` **−22.53 %**, `wpTemplate` **+45.75 %**, queries 0 %, HTML byte-identical at 33,517 B | B, parse-dominated HTTP, 12/arm |
-| **W4** | `formatting.php` + `emoji-arrays.php` | files **0 %**, peak −394,432 B (**−1.23 %**), time −1.57 % | A, parse-dominated CLI, 10/arm |
-| **W4** | same | HTML 33,517 → 19,817 B (**−40.87 %**), peak −395,840 B (**−1.19 %**) | B, parse-dominated HTTP, 12/arm |
-| **W4** | same | HTML **−40.87 %**, peak **−0.03 %**, time within instrument spread | B, warm HTTP, 12/arm |
-| **W3** | `capabilities.php` + `class-wp-roles.php` + `post.php` | TTFB 49.63 → 48.34 ms (**−2.61 %**), `wpTotal` **−2.58 %**, peak **+34,840 B (+0.84 %)**, queries 0, files 0, HTML byte-identical | C, warm HTTP admin, 12/arm |
-| **C1** | `comment.php` | authenticated `/`: queries 32 → 28 (**−4**), misses 76 → 72; dashboard: queries 40 → 36 (**−4**), misses 85 → 81; HTML byte-identical in both | C, warm HTTP, 12/arm |
-| **U1** | `update.php` | authenticated `/`: queries 32 → 30 (**−2**), hits 1,108 → 1,113; dashboard: queries 40 → 38 (**−2**), hits 827 → 837; HTML byte-identical in both | C, warm HTTP, 12/arm |
-
-The parts reconcile with the whole, which is the check that validates the attribution:
-
-| Quantity | Sum of parts | Whole change set | Residual |
-|---|---|---|---|
-| Files loaded, parse-dominated HTTP | W1 −118 + W4 0 = **−118** | **−118** | **exact** |
-| Peak memory, parse-dominated CLI | W1 −6,311,280 B + W4 −395,840 B = **−6,707,120 B** | **−6,599,056 B** | 108,064 B = 1.64 % |
-| Front-end HTML bytes | W1 0 + W4 −13,700 B = **−13,700 B** | **−13,700 B** | **exact** |
-| DB queries, authenticated `/` | C1 −4 + U1 −2 = **−6** | **−6** | **exact** |
-| DB queries, admin dashboard | C1 −4 + U1 −2 = **−6** | **−6** | **exact** |
-| Cache misses, both contexts | C1 −4 + U1 0 = **−4** | **−4** | **exact** |
+An independent out-of-suite confirmation of the after value: a browser-driven anonymous request to
+`http://localhost:8891/` on the measured tree returned `Server-Timing: wp-files-loaded;dur=403`, matching
+the canonical homepage median exactly.
 
 ### Request-flow change
 
 ```mermaid
 graph TD
-    subgraph BEFORE["BEFORE — base commit 5e9d05d7dd"]
-        B1["wp-settings.php: 306 file-scope require statements<br/>323 include-family constructs in total"] --> B2["482 PHP files parsed at bootstrap<br/>before any hook fires"]
-        B2 --> B3["admin_enqueue_scripts:<br/>command palette enqueued on EVERY admin screen"]
-        B3 --> B4["84 admin scripts, 2,162,502 gzipped bytes<br/>DOMContentLoaded 665.50 ms"]
-        B2 --> B5["wp_head: emoji detection inline script<br/>printed on every request"]
-        B5 --> B6["59,456-byte anonymous front-end HTML<br/>12,749 bytes at gzip -9"]
+    subgraph BEFORE["BEFORE — base 5e9d05d7dd"]
+        B1["wp-settings.php<br/>323 include-family constructs, all eager"] --> B2["512 PHP files parsed<br/>before any hook fires<br/>(canonical: homepage, twentytwentyfive, en_US)"]
+        B2 --> B3["admin_enqueue_scripts<br/>command palette enqueued on EVERY admin screen"]
+        B3 --> B4["84 admin scripts<br/>2,162,612 gzipped bytes<br/>DOMContentLoaded 738.60 ms"]
+        B2 --> B5["wp_head<br/>emoji detection inline script always printed"]
+        B5 --> B6["formatting.php carries a 140,933-byte<br/>emoji array literal on every request"]
     end
     subgraph AFTER["AFTER — this change set"]
-        A1["wp-settings.php: 114 file-scope require statements<br/>autoloader registered at line 65"] --> A2["341 PHP files parsed at bootstrap<br/>228-entry static class map resolves the rest on first use"]
-        A2 --> A3["admin_enqueue_scripts:<br/>wp_should_load_command_palette_assets() gate"]
-        A3 --> A4["43 admin scripts, 358,259 gzipped bytes<br/>DOMContentLoaded 155.85 ms"]
-        A2 --> A5["wp_head: emoji script behind a filter, default off<br/>140,933-byte array literal relocated"]
-        A5 --> A6["45,756-byte anonymous front-end HTML<br/>8,895 bytes at gzip -9"]
+        A1["wp-settings.php<br/>216 include-family constructs<br/>+ registered autoloader"] --> A2["405 PHP files parsed<br/>143-entry static class map resolves<br/>108 deferred classes on first use"]
+        A2 --> A3["admin_enqueue_scripts<br/>wp_should_load_command_palette_assets() gate"]
+        A3 --> A4["43 admin scripts<br/>357,886 gzipped bytes<br/>DOMContentLoaded 152.00 ms"]
+        A2 --> A5["wp_head<br/>emoji detection script gated off by default"]
+        A5 --> A6["array literal relocated to emoji-arrays.php<br/>required only by _wp_emoji_list()"]
     end
+%% Legend: each AFTER node is the measured counterpart of the BEFORE node in the same row.
+%% PHP file counts and DOMContentLoaded are medians over 40 samples from tests/performance/.
+%% Admin script counts and gzipped bytes come from the isolated script-loader.php A/B.
 ```
-
-**Figure 1 — Request flow before and after, with the measured quantity at each stage.**
-*Legend.* Each `AFTER` node is the measured counterpart of the `BEFORE` node in the same row. File
-counts and bootstrap figures are medians over 10 samples per arm from instrument A in the
-parse-dominated CLI regime; script counts and byte figures are deterministic same-instance
-measurements from instrument D with `SCRIPT_DEBUG=true` and `gzip -9`; `DOMContentLoaded` figures are
-medians over 40 samples per arm from instrument F and are regime-independent because the spec
-subtracts `responseEnd`. Both states are shown because a target-state-only diagram cannot be checked
-against anything. The two containers are labelled `BEFORE` and `AFTER`; a Mermaid renderer may place
-them in either horizontal order, so read the labels rather than the positions. This block was
-render-verified in a browser — see *Diagram render verification* — rather than assumed to parse.
 
 ---
 
 ## Observability: emit the metrics the targets are expressed in
 
-**Bottleneck**: Four of the six target metrics were not emitted anywhere, and a fifth had no baseline
-at all, so no change could have been proven even if it worked. At base commit `5e9d05d7dd` the
-performance mu-plugin was **93 lines** and emitted **6 metrics** on a front-end request
-(`before-template`, `template`, `total`, `memory-usage`, `db-queries`, `ext-obj-cache`) and **4** on an
-admin request (`total`, `memory-usage`, `db-queries`, `ext-obj-cache`). Peak memory was not among
-them — the plugin reported `memory_get_usage()`, which is current usage, not the
-`memory_get_peak_usage()` the target names. There was no files-loaded metric, no cache hit or miss
-metric, and no bootstrap-duration metric. The reporting layer matched: `formatValue()` in
-`tests/performance/utils.js` recognized only `wpMemoryUsage`, `wpExtObjCache` and `wpDbQueries`. And
-`tests/performance/specs/admin.test.js` declared exactly one result array, `timeToFirstByte`, so the
-Admin DOMContentLoaded target had no before-value in existence. The cost of this gap is not a
-millisecond figure; it is that four of six targets were unfalsifiable.
+**Bottleneck**: Four of the six targets could not be measured at all, so no change could be admitted
+under a measurement-first rule. `tests/performance/wp-content/mu-plugins/server-timing.php` reported
+`memory_get_usage()` — *current*, not peak — and emitted no files-loaded, no object-cache, and no
+bootstrap metric. `tests/performance/utils.js` recognised only `wpMemoryUsage`, `wpExtObjCache` and
+`wpDbQueries` in `formatValue()`. Worst of all, `tests/performance/specs/admin.test.js` recorded only
+`timeToFirstByte`, so the "Admin DOMContentLoaded ≥15%" target had **no baseline whatsoever** — the
+one target for which no before-value existed anywhere in the repository.
 
-**Root Cause**: The harness was built to answer time-to-first-byte and largest-contentful-paint
-questions. Peak memory, file count, object-cache behaviour and bootstrap duration were never in its
-scope, and DOM readiness was never captured because the fixture helper that would have supplied it
-dereferences paint-timing entries unconditionally and throws on an admin screen that has not painted
-by the load event — the reason is recorded in the spec at
-`tests/performance/specs/admin.test.js:L305-L312`.
+**Root Cause**: The harness was built to answer questions about wall time and query counts. Memory
+*peak*, file counts, cache behaviour and DOM-ready timing were simply never in its vocabulary, at
+either the producing end (PHP) or the reporting end (JavaScript).
 
-**Change**: `tests/performance/wp-content/mu-plugins/server-timing.php` grew from 93 to **540 lines**
-and now emits **19 metrics** on a front-end request and **17** on an admin request. The four the
-targets need are `memory-peak` from `memory_get_peak_usage( false )` (`:L416` front-end, `:L488`
-admin), `files-loaded` from `count( get_included_files() )` (`:L441`, `:L513`), `cache-hits` and
-`cache-misses` read through a guarded property map at `:L79-L80`, and `bootstrap` with a companion
-`bootstrap-valid` flag so an unmeasured sample can be recognized rather than averaged in
-(`:L444-L445`). Seven further metrics exist purely to make the Measurement Law enforceable rather than
-aspirational: `opcache-enabled`, `opcache-jit`, `opcache-hit-rate`, `opcache-cached-scripts`,
-`php-version-id`, `process-id` and `process-requests`, assembled at `:L138-L172` and `:L338-L344`.
-Both closures emit through the same `sprintf( 'wp-%1$s;dur=%2$s', $slug, $value )` shape as before
-(`:L458` front-end, `:L530` admin), so the entry-name-to-JavaScript-key conversion in
-`utils.js:camelCaseDashes()` is unchanged and the new keys are `wpMemoryPeak`, `wpFilesLoaded`,
-`wpCacheHits`, `wpCacheMisses`, `wpBootstrap`, `wpBootstrapValid`, `wpOpcacheEnabled`,
-`wpOpcacheJit`, `wpOpcacheHitRate`, `wpOpcacheCachedScripts`, `wpPhpVersionId`, `wpProcessId` and
-`wpProcessRequests`. `utils.js` gained the formatters for them — peak memory joins `wpMemoryUsage` in
-the megabyte branch, `adminJsRaw` and `adminJsGzipped` render as kilobytes, `wpPhpVersionId` renders
-as `PHP 8.5.9`, `wpProcessId` as `PID n`, `wpOpcacheHitRate` as a percentage — plus
-`isComparableMetric()` at `:L197-L199`, which keeps flags and identifiers out of the arithmetic
-columns instead of printing `PHP 0.0.0` as a difference. `admin.test.js` gained the
-DOMContentLoaded capture at `:L313-L321`, quoted verbatim below, and the admin-only byte accounting
-`adminJsRaw` / `adminJsGzipped` fed by `getJavaScriptResponseByteSizes()` in `utils.js`. The two
-front-end specs gained the same server metrics, and every spec now declares all of its metrics in one
-result object per scenario so the accumulation defect described above cannot recur. A new unit spec
-`tests/performance/specs/utils.test.js` covers the reporting helpers directly.
+**Change**: `tests/performance/wp-content/mu-plugins/server-timing.php` now emits `memory-peak`
+(via `memory_get_peak_usage( false )`), `files-loaded`, `cache-hits`, `cache-misses`, `bootstrap` and
+`bootstrap-valid`, plus a two-metric regime block — `opcache-enabled` and `opcache-jit`.
+The delivered harness declares **8 helper functions** and emits **14 metrics** in total; five metric
+names that an earlier arm of this work also emitted — `php-version-id`, `process-id`,
+`process-requests`, `opcache-cached-scripts` and `opcache-hit-rate` — were withdrawn, and
+`tests/phpunit/tests/performance/serverTimingMetrics.php` now asserts their **absence**. The reasoning
+is in §*Reconciliation to the delivered tree*. `tests/performance/utils.js` learned
+the matching keys in `formatValue()`. `tests/performance/specs/admin.test.js` gained a
+DOMContentLoaded capture; `home.test.js` and `single-post.test.js` record the new front-end metrics
+and assert that the three regime metrics are immutable within a measured scenario.
+`tests/performance/compare-results.js` refuses to print a single figure unless the regime metrics
+match across the pair, which is how the OPcache Measurement Law is enforced mechanically rather than
+by discipline.
 
-One harness gap was closed in the same pass, and it invalidated measurement rather than merely
-under-reporting it. At base commit `5e9d05d7dd` no workflow installed `clear-cache.php` — a search of
-`.github/workflows/` at that commit returns no reference to it — so the `/?clear_cache` navigation the
-specs issue was an ordinary page load and the `opcache_reset()` that file performs never ran. Every
-CI measurement therefore had an *unknown and unrecorded* opcode-cache state, which is exactly the
-condition rule 2 of the Measurement Law forbids. Both performance workflows now install it alongside
-`server-timing.php` — `.github/workflows/reusable-performance.yml:L234` and
-`.github/workflows/reusable-performance-test-v2.yml:L258`, each with the reasoning recorded inline at
-`:L224` and `:L248` — and the admin spec requires HTTP **202** from that request rather than accepting
-any response, so a reset that did not happen fails the run instead of silently producing a warm
-sample. The regime is now both controlled and reported, through `wpOpcacheEnabled`,
-`wpOpcacheHitRate` and `wpOpcacheCachedScripts`.
+The cache counters are read through one validated snapshot that tolerates a replacement object
+cache, so the metric degrades to core's own `$cache_hits` / `$cache_misses` integers when no drop-in
+is present and never emits a notice. **These two metrics are the object cache's existing *global*
+counters — they are not the new per-group counters described later in this report, which are opt-in
+and are never read by the harness.**
 
-The DOMContentLoaded capture method, recorded exactly as landed, because a before/after pair measured
-by two different methods is not evidence:
+**Measurement**: Before, the response carried `wp-before-template`, `wp-template`, `wp-total`,
+`wp-memory-usage`, `wp-db-queries`, `wp-ext-obj-cache`. After, it additionally carries the
+metrics below. Captured live on the measured tree from the canonical context — anonymous
+`http://localhost:8891/`, `twentytwentyfive`, immediately after a successful `/?clear_cache`:
 
-```js
-const domContentLoaded = await page.evaluate( () => {
-        const [ navigation ] =
-                performance.getEntriesByType( 'navigation' );
-
-        return (
-                navigation.domContentLoadedEventEnd -
-                navigation.responseEnd
-        );
-} );
+```
+wp-before-template;dur=305.71, wp-template;dur=108.74, wp-total;dur=414.45,
+wp-memory-usage;dur=8948080, wp-db-queries;dur=74, wp-ext-obj-cache;dur=0,
+wp-memory-peak;dur=11119912, wp-files-loaded;dur=403, wp-cache-hits;dur=2531,
+wp-cache-misses;dur=371, wp-bootstrap;dur=293.83, wp-bootstrap-valid;dur=1,
+wp-opcache-enabled;dur=1, wp-opcache-jit;dur=0, wp-php-version-id;dur=80509,
+wp-process-id;dur=18, wp-process-requests;dur=2,
+wp-opcache-cached-scripts;dur=403, wp-opcache-hit-rate;dur=0.9828
 ```
 
-The origin subtracted is **`responseEnd`**, not `startTime` and not `responseStart`. That choice is
-what makes the metric regime-independent in this environment: the document's own server time is
-excluded by construction.
+*The last five metrics in that capture — `wp-php-version-id`, `wp-process-id`,
+`wp-process-requests`, `wp-opcache-cached-scripts` and `wp-opcache-hit-rate` — were withdrawn from the
+harness after this capture was taken. The capture is retained verbatim because the figures in this
+section were measured through it; it is a historical record, not a description of what the delivered
+harness emits. The delivered vocabulary is the 14 metrics shown in the live capture below.*
 
-**Measurement**: Metric coverage before and after, counted from the emitting source: front-end
-requests **6 → 19** metrics, admin requests **4 → 17**. Peak memory before: not emitted. Files
-loaded before: not emitted. Cache hits and misses before: not emitted. Bootstrap duration before: not
-emitted. Admin DOMContentLoaded before: not emitted. The saved comparison
-`artifacts/performance-results.json` now carries all of them across 18 contexts with exactly
-`[20, 20]` samples per metric per context, against the earlier smoke artifact
-`artifacts/qa-smoke-performance-results.json` in which the six legacy metrics accumulated 1, 2, … 8
-samples per repetition while the new ones held 1.
+The same canonical context on the **delivered** tree, 10 samples, medians (anonymous
+`http://localhost:8889/`, `twentytwentyone`, `?clear_cache` first — which returned **HTTP 202**,
+exercising the folded reset responder):
 
-**Value**: This change is what makes every other entry in this report checkable. Four of the six
-targets — peak memory, files loaded, DOM readiness and, through the cache counters, the query and
-cache work — could not previously be stated as numbers at all, and one of them had no before-value in
-existence. Its diagnostic value was demonstrated immediately and concretely: the `wpOpcacheEnabled`
-and `wpOpcacheHitRate` metrics caught a "parse-dominated" measurement run of this very project that
-was silently warm, because `opcache.enable_cli=0` does not gate the built-in server's `cli-server`
-SAPI. Without those two metrics that run would have been published as a valid regime pair, and its
-figures would have been wrong by roughly a factor of four on time and seven on memory. Estimated
-global impact: any WordPress contributor or host running this suite now gets peak memory, file count,
-cache hit ratio, bootstrap duration and the full opcode-cache state on every measured request, which
-converts three of the six historically unmeasurable core performance questions into routine
-regression checks. The cost is bounded and paid only where the mu-plugin is installed: it is a
-gitignored test-harness plugin, not shipped code.
+```
+wp-before-template;dur=26.705, wp-template;dur=12.490, wp-total;dur=38.565,
+wp-memory-usage;dur=3885184, wp-memory-peak;dur=4034048, wp-db-queries;dur=14,
+wp-ext-obj-cache;dur=0, wp-files-loaded;dur=396, wp-cache-hits;dur=623,
+wp-cache-misses;dur=38, wp-bootstrap;dur=25.945, wp-bootstrap-valid;dur=1,
+wp-opcache-enabled;dur=1, wp-opcache-jit;dur=0
+```
+
+*Exactly 14 metrics, no more. These absolute values are **not** comparable with the measured-arm
+figures above — a different host, theme and OPcache regime — and no percentage in this report is
+derived from them. They are shown only to evidence the delivered metric vocabulary and that the reset
+responder answers.*
+
+Two things in that historical header are worth reading closely, because together they certify the
+regime every figure in this report was taken in: `wp-opcache-cached-scripts` equalled
+`wp-files-loaded` exactly (403 = 403), and `wp-opcache-hit-rate` was **0.98 %**. The measured request
+compiled essentially every file it loaded. This is the parse-dominated regime, demonstrated rather
+than assumed. *Because those two diagnostics were subsequently withdrawn, this certification is a
+retained record of the measured arm and cannot be re-derived from the delivered harness. What the
+delivered harness gates on instead is the configuration-derived pair `opcache-enabled` /
+`opcache-jit`, which is the stronger source for the purpose — it reports what the interpreter is
+configured to do rather than what one request observed — and it is the pair the comparator refuses to
+print across.*
+
+The same two metrics, read across all eighteen scenarios in the canonical after-artifact, also settled
+the regime question for each scenario individually — and they did it without any external reasoning,
+because `wpOpcacheCachedScripts` equalled `wpFilesLoaded` exactly in every one of the eighteen. *This
+table, too, is a record of the measured arm; the delivered harness no longer emits the two metrics it
+is built from.*
+
+| Scenario group | OPcache hit rate (median) | Regime |
+|---|---|---|
+| Homepage, twentytwentyfive | 0.98 % | cold compile — parse-dominated |
+| Homepage, twentytwentyfour | 1.03 % | cold compile — parse-dominated |
+| Homepage, twentytwentythree | 1.06 % | cold compile — parse-dominated |
+| Homepage, twentytwentyone | 7.76 % | cold compile — parse-dominated |
+| Admin | 0.70 % | cold compile — parse-dominated |
+| Single Post, all four themes | **49.42 % – 50.07 %** | **two requests, second one warm** |
+
+The single-post band sitting on 50 % is not noise and not a coincidence: it is the arithmetic
+signature of exactly two requests per iteration where the first compiles cold and the second finds
+everything already cached. That is the 301 redirect described in the verification-coverage gaps below,
+visible directly in the instrument rather than inferred. It is the reason this report treats the four
+single-post scenarios as a warm-regime control and draws its cold-regime conclusions from the ten
+homepage and admin scenarios.
+
+Admin DOMContentLoaded acquired its first baseline: **738.60 ms** (en_US) and **752.70 ms** (de_DE).
+
+**Value**: This is what makes every other entry in this report checkable rather than asserted, and it
+is what allows four of the six rows in the summary table to be reported as failures on evidence
+instead of being quietly reframed. It also converted the single unmeasurable target into the largest
+confirmed win in the change set: the `domContentLoaded` metric that did not exist before now reads
+**−79.42 %** (en_US) and **−80.17 %** (de_DE). Instrumentation was not a by-product of the work; it
+was the precondition for it.
+
+**A defect this instrumentation had, and how it was fixed.** The first implementation derived
+`opcache-enabled` from `opcache_get_status()['opcache_enabled']`. That field reports the *per-request
+activation state* of the accelerator, not the interpreter's configuration. `opcache_reset()` — which
+`clear-cache.php` calls before every measured navigation — sets `restart_pending` and leaves the
+accelerator inactive until some later request can take the restart lock while no other worker is
+running; under the concurrency a real browser generates, that moment does not arrive during the
+measured request. The field therefore read `false` on a heavily loaded page while the cache still
+held its scripts. The effect was quantified rather than guessed: the transient appeared in **0 of 40**
+serial reset-then-request cycles, and in **56 of 60** of the same cycles run against six concurrent
+front-page loads, with the interpreter configuration provably identical in all 100 samples. Since the
+comparator treats a regime mismatch as fatal, this made the heaviest scenario unmeasurable.
+
+The fix reads the regime from `opcache_get_configuration()['directives']` — falling back to
+`ini_get()`, which `opcache.restrict_api` never refuses. The delivered harness derives the regime from
+**configuration only**, through `wp_perf_opcache_directive()` and `wp_perf_opcache_flag()`; the
+statistics-sourced `opcache-cached-scripts` and `opcache-hit-rate` diagnostics were withdrawn with the
+other three metrics named above, so no emitted metric depends on the accelerator's per-request
+activation state any more. The JIT flag additionally
+requires a non-disabling `opcache.jit` mode *and* a non-zero `jit_buffer_size`, and on CLI/phpdbg the
+enabled flag additionally requires `opcache.enable_cli`. Re-running the exact experiment that broke
+it — six concurrent loaders, 60 reset-then-measure cycles — produced `wp-opcache-enabled;dur=1` in
+**60 of 60** samples where 56 of 60 had previously reported `0`. Coverage lives in
+`tests/phpunit/tests/performance/serverTimingMetrics.php`, which asserts that an inactive accelerator
+changes nothing about the regime values, that a directive resolves from the snapshot before `ini_get()`,
+and that all sixteen boolean spellings normalize correctly.
 
 ---
 
 ## Core class autoloader with a build-generated static class map
 
-**Bottleneck**: A front-end request parsed **482 PHP files** before any hook fired, with a peak memory
-of **32,047,272 B (32.047 MB)** and a bootstrap wall time of **191.611 ms** — instrument A,
-parse-dominated CLI regime, median of 10 samples per arm, zero variance on the file count. Over HTTP
-the same request parsed **499 files** with a peak of **33,174,216 B** and a `wpBootstrap` of
-**162.12 ms** (instrument B, parse-dominated HTTP, 12 samples). The loader responsible is
-`src/wp-settings.php`, which at base was **797 lines** containing **323** resolved include-family
-constructs — 311 `T_REQUIRE`, 7 `T_REQUIRE_ONCE`, 2 `T_INCLUDE`, 3 `T_INCLUDE_ONCE` — of which
-**306** were at file scope and **316** were literal `require ABSPATH …` statements. A bootstrap
-query probe on the same tree confirms how little of that work is database-bound: the entire bootstrap
-issues **3 queries**, so the 191.6 ms is compilation and execution, not I/O wait.
+**Bottleneck**: A front-end request parsed **512 PHP files** before a single hook fired (canonical
+context: homepage, `twentytwentyfive`, `en_US`). `src/wp-settings.php` contained **323 include-family
+constructs** — 311 `require`, 7 `require_once`, 2 `include`, 3 `include_once` — and every one of them
+executed before the earliest hook (`muplugins_loaded`), so no amount of hook-relocation could reduce
+the count; only genuine lazy loading could. The most legible sub-case: 57 files under
+`wp-includes/rest-api/` were parsed on every request, declaring 57 classes, on a request that
+instantiates no REST server at all. An in-request probe over three identical front-end requests
+confirmed `rest_files_included=57`, `wp_rest_classes_decl=57`, `server_instantiated=NO`,
+`rest_api_init_fired=0`.
 
-The largest single cluster was the REST API. `src/wp-settings.php` eagerly required 57 files under
-`wp-includes/rest-api/` on every request, and none of them is used unless a REST route is dispatched:
-`rest_api_init` fires at exactly one place, inside `rest_get_server()`, which is itself reached only
-from `rest_api_loaded()` on `parse_request` when a `rest_route` query var is present. On a front-end
-request the REST server was never instantiated and `rest_api_init` never fired, yet 57 files were
-parsed and 57 classes declared.
+**Root Cause**: WordPress core has no autoloader. The only autoloaders in the tree are vendored
+(`wp-includes/php-ai-client/autoload.php`, `wp-includes/SimplePie/autoloader.php`). With no
+class-loading mechanism, the only way to guarantee a class is available is to `require` its file
+during bootstrap, so the bootstrap grew to require everything that might be needed by anything.
 
-**Root Cause**: WordPress core has no autoloader. The only two in the tree are vendored —
-`src/wp-includes/php-ai-client/autoload.php` and SimplePie's — so there was no mechanism by which a
-class could be made available without its file having already been parsed. Compounding that, every
-`require` in `wp-settings.php` executes before every hook: the earliest hook in the file fires after
-the require region ends, so relocating a `require` to `plugins_loaded` priority 0 reduces the file
-count by exactly zero. Only genuine load-on-first-use removes the work.
+**Change**: Added `src/wp-includes/autoload.php`, a single `spl_autoload_register()` handler, and
+`src/wp-includes/autoload-classmap.php`, a build-generated class ⇒ file map, registered early in
+`src/wp-settings.php`. `src/wp-settings.php` now holds **216 include-family constructs** (204
+`require`, 7 `require_once`, 2 `include`, 3 `include_once`) — **107 fewer than base** — and the class
+map holds **143 entries**, of which **108** correspond to a require that was removed. The remaining
+**87** removable requires were deliberately **restored**, for a reason given below.
 
-**Change**: Three files land together, because any one of them alone breaks class resolution.
-`src/wp-includes/autoload.php` (194 lines) defines `wp_autoload_class()` at `:L77`, reads the class
-map from `ABSPATH . WPINC . '/autoload-classmap.php'` at `:L137`, validates each mapped path into
-canonical form before use, `require_once`s the resolved file at `:L191`, and registers itself with
-`spl_autoload_register( 'wp_autoload_class' )` at `:L194`. Names absent from the map are ignored
-without error, so third-party autoloaders are unaffected.
-`src/wp-includes/autoload-classmap.php` is the generated map, **228 entries**, produced by the
-`build:autoload-classmap` Grunt task at `Gruntfile.js:L2156`, which writes
-`${ SOURCE_DIR }wp-includes/autoload-classmap.php` (`:L2159`) by running
-`tools/build/generate-autoload-classmap.php` (`:L2176`) and is wired into the build at `:L2401` and
-`:L2414`; it is never hand-maintained. `src/wp-settings.php` requires the autoloader at **`:L65`**,
-before the class bootstrap it replaces, with a docblock at `:L40-L63` recording the four conditions
-under which a file is **not** eligible for deferral: it declares functions, it is probed for with
-autoloading disabled, it must be present before a second autoloader could answer, or its name is
-checked with `class_exists( $name, false )`. The net effect on the loader is **193 require statements
-removed and 1 added**, taking the file from 797 to **713 lines** and from **306** file-scope
-require-family statements — 300 `require` plus 6 `require_once`, counted at column 1 — to **114**,
-which is 111 plus 3. A static map was chosen over filesystem probing on measurement: a probing prototype that
-tried candidate paths with `is_readable()` cost **+4.53 ms** in the warm regime and issued roughly
-228 stat syscalls on a single request, where a map lookup is O(1) with none. The pattern is core's
-own: `src/wp-includes/blocks/index.php:L55` and `:L165` both `require` a generated file that returns
-an array.
+Four design decisions carry this optimization, each measured rather than assumed:
 
-One conditional require is a deliberate exception rather than an oversight, and it is documented as
-such at `src/wp-settings.php:L647-L674`: the `WP_Site_Health` branch is guarded by
-`class_exists( 'WP_Site_Health' )` at `:L671`, which autoloading answers first, so the eager
-`require_once` at `:L672` runs only if no autoloader resolved the name.
+- **A generated static map, not filesystem probing.** A probing prototype trying up to four
+  candidate paths per class with `is_readable()` measured **+4.53 ms** in the warm regime and issued
+  roughly 228 stat syscalls on a single REST request. *That prototype was discarded rather than
+  committed, so unlike every other figure in this document those two numbers cannot be re-run from
+  this tree; they are recorded as the design-time observation that selected the static map, not as a
+  reproducible result.* What **is** reproducible is the cost of the mechanism that was kept, priced
+  below at ≈1.4 µs per resolution. The static map derives **no path from the
+  requested name at all**, so the candidate probing disappears entirely: a resolution costs one
+  case-fold, up to six `strncmp()` prefix tests, an `isset()`, one `preg_match()` shape check, and
+  one `file_exists()` before the `require_once`. The claim is *no path derivation and no probing*,
+  **not** "zero stat calls" — the mapped file is still checked once and the map itself is checked
+  once per request. Core already ships this generated-manifest pattern in
+  `wp-includes/blocks/index.php:55` and `:165`, which both `require` a generated file returning an
+  array.
+- **The map is generated, never hand-edited.** `tools/build/generate-autoload-classmap.php` derives
+  it, wired into `Gruntfile.js` as `build:autoload-classmap` and run first in *both* branches of
+  `grunt build`. It writes only when content differs, so it is idempotent, and it is deterministic:
+  identical output from a bare CLI process and from a process that has already loaded
+  `class-wp-customize-setting.php` and `class-IXR.php`. The generated file is **13,195 bytes** holding
+  **143 entries**, sha256
+  `8ba69d6920c1ad75ab319029fc8da50761aceae2fed34c72c249d6d47e5c5c98`, reproduced byte for byte on a
+  second consecutive run and again by `grunt build`.
+- **The map is coupled to the require set by construction.** The generator reads
+  `src/wp-settings.php` and refuses to map any name whose file the bootstrap still reaches through
+  its own top-level requires. This is not a stylistic preference: the bootstrap uses plain `require`,
+  so a name that were both mapped and eagerly required could be autoloaded first and then fatally
+  redeclared. The practical consequence is a maintenance rule — **the map must be regenerated
+  whenever a require is added to or removed from `wp-settings.php`** — and it is recorded in
+  `autoload.php`'s own header so it cannot be lost.
+- **Lookup is normalised.** PHP class names are case-insensitive, so an exact-match `isset()` lookup
+  would make `class_exists()` return `false` for a case variant of a deferred name. The handler
+  strips exactly one leading namespace separator and folds ASCII case with `strtr()` rather than
+  `strtolower()`, which only became locale-independent in PHP 8.2 and would fold `I` outside ASCII
+  under `tr_TR` on the supported 7.4 floor.
 
-**Measurement**: Instrument A, one fresh process per sample, arms interleaved, 12 samples with the
-first two discarded, median of 10. The arm is the base tree with **only** `wp-settings.php`,
-`autoload.php` and `autoload-classmap.php` swapped in, SHA-1-verified before the run and after
-restoration.
+**Why 87 removable requires were put back.** The first implementation deferred everything the safety
+rules allowed, leaving 129 include constructs in `wp-settings.php`. Measurement then showed the
+deferral had gone too far. An autoload resolution costs **≈1.4 µs**, measured in-request in the
+php-fpm SAPI over 12 warm samples on the canonical homepage, with every mapped name resolved once
+beforehand so that no sample pays a one-time file parse. The same measurement in a bare CLI process
+gives **1.69 µs** (`opcache.enable_cli=0`) and **1.37 µs** (`=1`) for `wp_autoload_class()` called
+directly, or **1.89 µs** and **1.54 µs** through `spl_autoload_call()` including PHP's own dispatch —
+145 mapped names as the map then stood, 20 passes, medians. For any class that a canonical front-end request ends up loading
+anyway, deferring its `require` therefore *adds* that ≈1.4 µs and removes nothing, because the file is
+parsed either way. Restoring the 85 requires whose classes load on a canonical request removes
+**≈162 µs** of resolution work from the hot path — 85 × the pessimistic ≈1.9 µs dispatch-inclusive
+figure — while leaving the measured file count for that request **unchanged at 403**. The deferral set
+kept is the one that actually pays: 108 classes that a canonical request never touches.
 
-| Regime | Metric | Before | After | Δ |
+Two further requires were restored afterwards for a correctness reason rather than a cost one, taking
+the restored total to **87**. Unlike the 85, those two classes are *not* loaded by a canonical
+front-end request, so restoring them does add **+2 files** to that request — 403 → **405**. The reason
+that price is worth paying is that the alternative is a fatal, and it is set out in
+§*Reconciliation to the delivered tree*.
+
+An earlier draft priced this at ≈5.4 µs per resolution and, on that basis, valued the restoration at
+roughly 459 µs. That figure timed the resolution *together with the one-time execution of the file it
+loads*, which eager loading pays regardless, so it overstated the avoidable cost by about 3.8×. The
+re-measurement isolates the resolution path itself — which is the only part restoring a `require`
+actually removes. **The decision is unchanged and its direction is unchanged; only its magnitude is
+smaller.** Note also that `wp_autoload_class()` has no early `class_exists()` short-circuit, so the
+full resolution path runs on every call and the figure above is not an artefact of an early return.
+
+**Measurement**: canonical pair, medians over 40 samples, php-fpm restarted between code states, one
+`opcache_reset()` per measured request. Every row below is read from the canonical artifact pair named
+in §*Evidence manifest* — the same measurement the aggregate results table reports, restated here per
+scenario as the deliverable template requires, not measured a second time.
+
+| Metric | Context | Before | After | Δ |
 |---|---|---|---|---|
-| Parse-dominated CLI, `opcache.enable_cli=0` | files loaded | 482 | 341 | **−141 (−29.25 %)**, zero variance |
-| Parse-dominated CLI, `opcache.enable_cli=0` | peak memory | 32,047,624 B | 24,490,296 B | **−7,557,328 B (−23.58 %)** |
-| Parse-dominated CLI, `opcache.enable_cli=0` | bootstrap wall time | 188.344 ms | 146.426 ms | **−22.26 %** |
-| Primed CLI | peak memory | 29,910,568 B | 23,116,128 B | **−22.72 %** |
-| Primed CLI | bootstrap wall time | 64.157 ms | 54.316 ms | **−15.34 %** |
-| Parse-dominated HTTP, `opcache.enable=0` | files loaded | 499 | 381 | **−118 (−23.65 %)** |
-| Parse-dominated HTTP, `opcache.enable=0` | `wpMemoryPeak` | 33,174,208 B | 26,862,928 B | **−19.02 %** |
-| Parse-dominated HTTP, `opcache.enable=0` | `timeToFirstByte` | 197.67 ms | 168.78 ms | **−14.61 %** |
-| Parse-dominated HTTP, `opcache.enable=0` | `wpBootstrap` | 170.98 ms | 132.45 ms | **−22.53 %** |
-| Parse-dominated HTTP, `opcache.enable=0` | `wpTemplate` | — | — | **+45.75 %** — compilation moves to first use |
-| Warm HTTP shared memory | `wpMemoryPeak` | 4,229,752 B | 4,225,944 B | **−0.09 %**, i.e. nil |
-| Warm HTTP shared memory | `timeToFirstByte` | — | — | **−2.30 %** |
+| `wpFilesLoaded` | Homepage tt5 en_US *(canonical)* | 512 | 403 | **−21.29 %** (−109 files) |
+| `wpFilesLoaded` | Admin en_US | 530 | 424 | **−20.00 %** (−106 files) |
+| `wpBootstrap` | Homepage tt5 en_US | 357.82 ms | 289.35 ms | **−19.14 %** |
+| `wpBootstrap` | Admin en_US | 359.42 ms | 295.75 ms | **−17.71 %** |
+| `timeToFirstByte` | Homepage tt5 en_US | 488.60 ms | 418.55 ms | **−14.34 %** |
+| `wpMemoryPeak` | Homepage tt5 en_US | 11,724,584 B | 11,086,544 B | **−5.44 %** |
+| `wpMemoryPeak` | Homepage tt4 en_US (best) | 7,365,408 B | 6,665,936 B | **−9.50 %** |
+| `wpMemoryPeak` | Single Post tt1 en_US (warm leg) | 4,390,912 B | 4,425,184 B | **+0.78 %** |
+| `wpDbQueries` | every front-end scenario | unchanged | unchanged | **0.00 %** |
+| Front-page HTML | canonical | byte-identical | byte-identical | **0 B** |
 
-Where the 141 files went, from the same probe with the loaded-file list grouped by directory. This
-also settles which part of the bootstrap is reachable at all: the two Gutenberg-synced groups account
-for **96 of the 482 base files** and neither moves, by design.
+The reduction holds in every one of 13 bootstrap modes tested (front page, single post, REST index,
+admin, admin-ajax, wp-cron, xmlrpc, wp-login, feed, sitemap, 404, SHORTINIT, WP-CLI). `/wp/v2`
+continues to register **108 routes**, unchanged, verified again on the measured tree both by HTTP and by
+parsing the JSON server-side.
 
-| Group | Base | After | Δ |
-|---|---|---|---|
-| `wp-includes/` top level | 180 | 136 | −44 |
-| `wp-includes/blocks` | 89 | 89 | **0 — Gutenberg-synced, out of scope** |
-| `wp-includes/rest-api` | 57 | **0** | **−57** |
-| `wp-includes/block-supports` | 22 | 22 | 0 |
-| `wp-includes/widgets` | 20 | 20 | 0 |
-| `wp-includes/html-api` | 14 | 2 | −12 |
-| `wp-includes/php-ai-client` | 13 | 11 | −2 |
-| `wp-includes/block-patterns` | 11 | 11 | 0 |
-| `wp-content` | 10 | 10 | 0 |
-| `wp-includes/sitemaps` | 9 | 8 | −1 |
-| `wp-includes/build` | 7 | 7 | **0 — Gutenberg-synced, out of scope** |
-| `wp-includes/ai-client` | 6 | 3 | −3 |
-| `wp-includes/Requests` | 5 | 3 | −2 |
-| `wp-includes/l10n` | 5 | 1 | −4 |
-| `wp-includes/fonts` | 5 | 3 | −2 |
-| `wp-includes/pomo` | 5 | 5 | 0 |
-| `wp-includes/style-engine` | 5 | **0** | −5 |
-| `wp-includes/block-bindings` | 4 | 4 | 0 |
-| `wp-includes/abilities-api` | 4 | **0** | −4 |
-| `wp-includes/collaboration` | 3 | **0** | −3 |
-| `wp-includes/interactivity-api` | 3 | 2 | −1 |
-| `wp-admin/includes` | 2 | 1 | −1 |
-| other (`wp-settings.php`, entry files) | 3 | 3 | 0 |
-| **Total** | **482** | **341** | **−141** |
+**Value**: 109 fewer files opened, read and tokenized on every canonical front-end request, and 106
+fewer in the admin — a reduction of a fixed 106–109 files across all 18 measured contexts. In the
+parse-dominated regime this is worth **−19.14 % of bootstrap time** and **−14.34 % of TTFB** on the
+canonical page, and it is the dominant contributor to both. It is worth restating what it is *not*
+worth: **the ≥30 % file-count target is not met at −21.29 %**, and **the ≥10 % peak-memory target is
+not met at −5.44 %** (best case −9.50 %). On the warm single-post leg the same change moves peak
+memory by **+0.78 %** — the wrong way, and within noise. The honest claim is a substantial
+cold-start and bootstrap-time improvement, a large reduction in filesystem and opcode-cache pressure,
+byte-identical output, and two targets approached but missed.
 
-The REST cluster going to exactly **zero** is the single largest contribution — 57 of the 141 files,
-or 40 % of the reduction — and it is the cleanest, because those 57 classes were provably unused on a
-request that never dispatches a REST route.
+An earlier draft of this report claimed the ≥10 % memory target as met, citing an isolated CLI
+measurement of 33.832 MB → 28.877 MB (−14.65 %) taken with `opcache.enable_cli=0`. That figure is
+withdrawn as evidence for the target: it was produced by a different method and a different SAPI than
+the target names, and §*Proxy metrics are not cost metrics* explains why an isolated peak is not a
+proxy for the per-request cost. It remains a true statement about that CLI scenario and nothing more.
 
-The instrument was validated before those numbers were trusted: two trees with **identical** content
-at different filesystem paths, measured in the primed regime with per-arm opcode caches, differed by
-**−672 B (−0.00 %)** of peak memory. Correctness was measured alongside performance — the front-end
-HTML was **byte-identical at 33,517 B** in both arms, the query count was unchanged, and the cache
-hit and miss counts were unchanged.
+### Safety contract: why the map holds 143 entries and not 290
 
-**Value**: On any request that pays for compilation, this removes **141 file parses, 7.56 MB of peak
-allocation and 41.9 ms of bootstrap wall time** (parse-dominated CLI, 10 samples per arm). That regime
-is not a laboratory curiosity: it is what every php-fpm worker pays on its first request after a
-deploy or an opcode-cache flush, and what every install running without an opcode cache pays on
-**every** request. For a pool of 32 workers recycled on a deploy, the change removes 4,512 file parses
-and about 1.34 seconds of aggregate compile time from the recovery window, and it lowers each
-worker's high-water mark by 7.56 MB, which is what `memory_limit` has to accommodate. In the warm
-regime the change is deliberately neutral on memory and time — measured at −0.09 % and −2.30 % — and
-this report claims nothing there. What it does claim in the warm regime is the file count itself,
-which is the metric the target names, and the architectural consequence: 228 core classes are now
-reachable without their files being parsed first, which is the mechanism every future deferral will
-use.
+A class map that merely lists single-class files is not safe, and this was established by
+reproduction rather than by review. Autoloading each mapped class standalone in an isolated
+subprocess found **16 entries that could not be loaded on their own**: seven
+`WP_Customize_*_Control` leaves crashed php-fpm with **SIGSEGV** (HTTP 502, empty log), and nine
+classes with vendored or bundled parents raised uncaught fatals.
+
+The SIGSEGV mechanism is worth recording because it is non-obvious:
+`src/wp-includes/class-wp-customize-control.php` carries a **file-tail block that `require_once`s 21
+of its own subclasses**. Autoloading a leaf control makes PHP autoload its parent; parsing the parent's
+file reaches that tail; the tail loads siblings that extend the class still being declared; the
+recursion is unbounded and the process dies without writing a log line.
+
+The generator therefore admits a file only when **all** of the following hold:
+
+1. it declares exactly one class, interface, trait or enum;
+2. it runs **nothing** at file scope — the top-level allow-list is only open/close tags, whitespace,
+   comments, `declare`, `namespace`, `use`, attributes, modifiers, declarations and `;`. A
+   `require`, a function call, a `return`, a variable assignment, or even an
+   `if ( ! defined( 'ABSPATH' ) )` guard disqualifies the file;
+3. every compile-time relative — parent, interfaces, enum backing type, traits — is itself a
+   candidate, or is in the eager bootstrap closure, or lives under an already-autoloaded namespace
+   prefix, or is PHP-internal. Pruning iterates to a **fixpoint**, so dropping a parent invalidates
+   every child;
+4. the name is not one a drop-in may declare instead of core. `WP_Object_Cache` is the case that
+   matters: `wp-content/object-cache.php` is loaded before the autoloader could answer for it, so a
+   map entry for that name is either never consulted or, if it ever were, would load core's class
+   over a drop-in's;
+5. its file is not still reachable through the bootstrap's own top-level requires. A file the
+   bootstrap already parses on every request gains nothing from being mapped — and because
+   `wp-settings.php` includes with plain `require` rather than `require_once`, an autoload that got
+   there first would turn that require into a fatal `Cannot redeclare`. This is the largest exclusion
+   rule by far. The bootstrap's transitive top-level closure is **214 files**, composed of 118 that
+   declare no symbol at all, 1 that declares two or more, 2 with file-scope side effects, and
+   **93 that declare exactly one clean symbol and are excluded on this rule alone** — among them
+   `wp`, `wp_user`, `wp_error`, `wp_block`, `_wp_dependency`, `walker_nav_menu`,
+   `wp_widget_factory`, `wp_block_parser_block`, `wp_block_parser_frame`,
+   `wp_block_bindings_registry`, `wp_translation_controller` and `wp_url_pattern_prefixer`. A
+   verification pass confirms the invariant holds with no exceptions: **no name is both present in
+   the map and reachable in the bootstrap closure**. The two admin Site Health files are the one
+   deliberate opt-in, admitted by name: only a conditional branch of the bootstrap reaches them, and
+   every include of either one in the whole tree is a `require_once`.
+
+The 87 requires that were restored (see above) are covered by exactly this rule: once
+a require is put back, the generator stops mapping that name, and regenerating the map after the first
+85 restorations moved it from 143 entries to **145** — 143 minus the names that became
+bootstrap-reachable, plus the entries the restoration unblocked further down the inheritance chain —
+after which the final two restorations took it to the delivered **143**.
+The count moving *up* while requires were being *added* is the fixpoint at work, and it is why the map
+is generated rather than maintained.
+
+**A defect this rule caught, which review had not.** After the restoration, `tests/phpunit/tests/load`
+failed: 24 mapped names could not be loaded standalone — four `Walker_*` subclasses whose parent
+`Walker` had become eagerly required, and twenty `WP_Widget_*` subclasses whose parent `WP_Widget`
+had likewise. A conflict audit isolated exactly two offending require lines, which were removed; the
+regenerated map then passed the whole directory. On the measured tree that suite reads
+`Tests: 270, Assertions: 2001, Skipped: 1` (`artifacts/qa-logs-remediation/R07-load-directory.log`);
+on the delivered tree it reads `Tests: 293, Assertions: 2160, Skipped: 1`, the same single pre-existing
+skip.
+*An earlier draft quoted `OK (249 tests, 1981 assertions)` — the console line from the moment the
+defect was fixed, on a tree that predates later test additions. It is withdrawn in favour of the
+figure above, which is the one that reproduces.* The structural constraint this
+exposed is worth recording, because it is not obvious: **for any parent → child pair where the child
+is mapped, only two configurations are valid — both mapped, or both eager.** `WP_Widget` cannot be
+made eager, because its twenty mapped children are required by `default-widgets.php` (loaded from
+inside `wp_widgets_init()` on `init`), not by `wp-settings.php`, so making the parent eager would
+mean adding requires that never existed at base.
+
+**Twenty-one map entries are inert, and are not claimed as a saving.** The twenty default-widget
+classes and `WP_Nav_Menu_Widget` are mapped, but `wp-includes/functions.php:5453` `require_once`s
+`default-widgets.php` from inside `wp_widgets_init()`, which runs on `init` on every request. Those
+files are therefore loaded on every request regardless of the map, their entries are never consulted
+in practice, and they contribute nothing to the −109 file reduction. They are present because the
+inheritance-chain rule requires a mapped child's parent to be mapped too, and removing them would
+re-break the standalone-loadability contract.
+
+The rule set removed all 16 unsafe entries plus every chain-blocked, side-effecting,
+replacement-owned or bootstrap-reachable name, and added two (`wp_site_health`,
+`wp_site_health_auto_updates`). Critically, **no removed entry corresponds to a deferred `require`**:
+every one is still loaded exactly as it was at base, so shrinking the map cost nothing at runtime. A
+per-entry standalone-autoloadability sweep runs over all **143** entries in isolated subprocesses, and
+a hostile-name sweep of 28 inputs — path traversal, null bytes, `php://` and `data://` wrappers, SQL
+and XSS payloads, doubled separators, case variants — produces zero crashes. A whole-tree scan
+confirms the fifth rule holds in the other direction too: where the shipped tree still includes a
+mapped file, it does so with `require_once`, except for three plain `require`s of
+`class-wp-editor.php` guarded by `class_exists( '_WP_Editors', false )`, and `wp-admin/load-styles.php`,
+an entry point that defines its own `ABSPATH`, never loads `wp-settings.php`, and therefore never has
+the autoloader registered at all.
+
+**One consequence of the prefix pre-filter, stated because it is easy to get wrong.** The handler
+returns before reading the map for any name that does not begin with `wp`, `_wp`, `walker`, `pop3`,
+`passwordhash` or `requests`. The bundled `WpOrg\Requests\*` namespace folds to `wporg\requests\…`,
+which begins with `wp`, so **the map file is in fact parsed on a canonical front-end request** — the
+pre-filter reduces the number of resolutions that reach the map, not the number of requests that read
+it. Any claim that the map is never read on a front-end request would be false.
+
+`tests/phpunit/tests/load/wpAutoloadClass.php` encodes this contract, including a
+file-scope-side-effect check written as an **independent** tokenizer implementation rather than by
+reusing the generator, so two implementations must agree for the suite to pass, and an assertion that
+the generator's prefix list and the handler's prefix list cannot drift apart.
 
 ---
 
 ## Conditional loading of Command Palette assets
 
-**Bottleneck**: The admin dashboard delivered **84 JavaScript responses totalling 11,542,026 raw bytes
-and 2,162,502 bytes at `gzip -9`** (instrument D, same-instance measurement on the real nginx/php-fpm
-stack, `SCRIPT_DEBUG=true`, deterministic with zero variance). The dominant contributors are the
-`wp-commands` and `wp-core-commands` bundles and their dependency closure, which pull in the block
-editor and component libraries. Two other screens measured the same way: `/wp-admin/users.php`
-delivered **59 responses / 10,968,033 raw / 2,011,500 gzipped**, and
-`/wp-admin/options-general.php` delivered **83 responses / 12,368,837 raw / 2,348,230 gzipped**. The
-admin `domContentLoaded` cost of that payload was **665.50 ms** for `en_US` and **666.70 ms** for
-`de_DE` (instrument F, 40 samples per arm, regime-independent).
+**Bottleneck**: The admin dashboard loaded **84 script files, 11,542,026 raw bytes, 2,162,612 bytes
+at `gzip -9`** (the suite's own compressor reports 2,169,039 for the same payload). Byte accounting
+over the built assets attributed **91.2 %** of the gzipped payload to `js/dist/*`, with
+`block-editor.min.js` and `components.min.js` alone accounting for 56.7 %. Of the 84 scripts, **49
+were `/js/dist/` bundles**.
 
-The measurement inverted the stated hypothesis, and correcting the aim is part of the value delivered
-here. The brief named `common.js` as the suspected culprit. Measured, its built form is **7,820
-gzipped bytes — 0.75 % of the admin payload**, and the file is 2,358 lines. Optimizing it could not
-have moved a 30 % target under any circumstances. The command palette closure is **91.2 %** of the
-payload. Acting on the hypothesis instead of the measurement would have produced a diff with no
-measurable effect.
+This measurement inverted the stated hypothesis. `common.min.js`, the file named as the suspected
+culprit, is **7,820 gzipped bytes — 0.75 % of the payload**. Optimizing it could not have moved the
+metric.
 
-**Root Cause**: `src/wp-includes/default-filters.php:L605` registers
-`add_action( 'admin_enqueue_scripts', 'wp_enqueue_command_palette_assets' );` unconditionally, and the
-callback performed no screen check and no capability gate. Every admin screen therefore received the
-palette bundle set and its inline initializer, including screens on which the palette is never opened.
+**Root Cause**: `src/wp-includes/default-filters.php:605` registers
+`add_action( 'admin_enqueue_scripts', 'wp_enqueue_command_palette_assets' )`, and the callback
+performed **no screen check and no capability gate**. It enqueued `wp-commands`, the `wp-commands`
+style and `wp-core-commands` on every admin screen. Those handles depend on `wp-components` and
+`wp-block-editor`, so the default hook delivery dragged the entire editor dependency chain onto the
+Users list, General Settings and the Dashboard even though those screens do not expose the palette.
 
-**Change**: Two edits, both minimal, and no change to the registration.
-`src/wp-includes/script-loader.php` gains `wp_should_load_command_palette_assets()` at **`:L2778`**,
-placed with core's existing gate family — `wp_should_load_block_editor_scripts_and_styles()` at
-`:L2660`, `wp_should_load_separate_core_block_assets()` at `:L2694`,
-`wp_should_load_block_assets_on_demand()` at `:L2729` — and returning through a filter,
-`apply_filters( 'should_load_command_palette_assets', $should_load )` at `:L2803`, so the decision is
-overridable rather than hard-coded. `wp_enqueue_command_palette_assets()` at `:L3551` consults it in
-an early return at **`:L3565`**:
+**Change**: Added `wp_should_load_command_palette_assets()` to
+`src/wp-includes/script-loader.php:2778` and consulted it *inside*
+`wp_enqueue_command_palette_assets()` (`:3551`, early return at `:3565`). The predicate returns
+`false` outside the admin, otherwise `$current_screen instanceof WP_Screen && $current_screen->is_block_editor()`,
+then passes through a `should_load_command_palette_assets` filter so a screen can opt back in.
+
+Two deliberate constraints: the decision lives **inside the callback**, not in the `add_action`, so
+any existing `remove_action( 'admin_enqueue_scripts', 'wp_enqueue_command_palette_assets' )` keeps
+working and no hook name or argument count changes; and the gate only ever *declines to enqueue*, so
+it touches no part of the `WP_Scripts` dependency system. The screen test mirrors
+`wp_should_load_block_editor_scripts_and_styles()`, which reads `global $current_screen` the same way.
+
+The integrated implementation also distinguishes default hook delivery from an explicit direct
+call. Some admin documents do not fire `admin_enqueue_scripts`; they call
+`wp_enqueue_command_palette_assets()` from their own render path. The screen gate is therefore
+applied only while `doing_action( 'admin_enqueue_scripts' )`; a direct call remains an explicit
+request for the palette. A non-filterable `! is_admin()` guard still prevents any front-end
+delivery. `tests/phpunit/tests/dependencies/commandPalette.php` proves all three contracts: the
+Dashboard hook stays gated, a direct call on a non-block-editor admin screen enqueues the assets,
+and a direct call outside the admin does nothing.
+
+**Measurement**:
+
+Two independent sources are reported. The **suite** rows are medians over 40 samples from the
+canonical pair — the same values the aggregate results table carries, restated here rather than
+re-measured. The **isolated A/B** rows are a second, independent measurement: they come from swapping *only*
+`src/wp-includes/script-loader.php` between base and final, restarting php-fpm between states, and
+summing every `<script src>` on the authenticated Dashboard by fetching each one — so they attribute
+the byte reduction to this change alone and to no other.
+
+| Metric | Source | Before | After | Δ |
+|---|---|---|---|---|
+| `adminJsGzipped`, en_US and de_DE | suite | 2,169,039 B | 358,539 B | **−83.47 %** |
+| `adminJsRaw`, en_US and de_DE | suite | 11,542,026 B | 1,429,289 B | **−87.62 %** |
+| Admin `domContentLoaded`, en_US | suite | 738.60 ms | 152.00 ms | **−79.42 %** |
+| Admin `domContentLoaded`, de_DE | suite | 752.70 ms | 149.25 ms | **−80.17 %** |
+| Admin object-cache reads, en_US | suite | 1,006.5 hits | 975.5 hits | −3.08 % |
+| Admin JS, `gzip -9` bytes | isolated A/B | 2,162,612 B | 357,886 B | **−83.45 %** |
+| Admin JS, raw bytes | isolated A/B | 11,542,026 B | 1,429,289 B | **−87.62 %** |
+| Admin JS, file count | isolated A/B | 84 | 43 | **−48.81 %** |
+| Admin JS, `/js/dist/` bundles | isolated A/B | 49 | 8 | **−83.67 %** |
+| Admin HTML document | isolated A/B | 139,448 B | 127,505 B | −8.56 % |
+
+The two sources agree to the byte on `adminJsRaw` in **both** arms — 11,542,026 and 1,429,289 — which
+independently validates the suite's byte accounting. The 0.03-percentage-point spread on the gzipped
+figure is the difference between `gzip -9` and the harness's own compressor, not a difference in what
+was measured. All 41 removed scripts are `/js/dist/` bundles: the non-`js/dist` admin scripts are
+untouched at 35 files in both arms.
+
+Confirmed independently for the absence and for the presence, on the measured tree, in a real browser and in
+raw authenticated server HTML — the latter proving the gate acts at enqueue time and not merely in the
+browser. Dashboard, measured twice (live DOM and a fresh re-fetch of the served bytes, both agreeing
+on every number): 43 `<script src>` tags, 8 of them `/js/dist/`, and **zero** matching any of
+`commands`, `core-commands`, `block-editor`, `components`, `block-library`, `edit-post`, `rich-text`
+or `data-controls`. In the whole 127,505-byte document the strings `wp-commands`, `core-commands`,
+`wp-core-commands` and even the bare substring `commands` occur **0 times**, and `typeof
+window.wp.commands` is `"undefined"`.
+
+| Screen | `<script src>` tags | of those, `/js/dist/` | `wp-commands` occurrences | `core-commands` | `typeof wp.commands` |
+|---|---|---|---|---|---|
+| `/wp-admin/` (Dashboard) | 43 | 8 | 0 | 0 | `undefined` |
+| `users.php` | 14 | — | 0 | 0 | `undefined` |
+| `options-general.php` | 38 | — | 0 | 0 | `undefined` |
+| `post.php?post=…&action=edit` | 105 | 62 | 2 | 4 | `object` |
+| `post-new.php` | 103 | — | 2 | 4 | `object` |
+| `site-editor.php` | 96 | — | 2 | 4 | `object` |
+
+One methodological warning for anyone re-deriving this: **the literal string `wp.commands` occurs 0
+times on *both* screens**, because the inline initializer calls
+`wp.coreCommands.initializeCommandPalette(...)`. Counting that string alone cannot distinguish the two
+states. The durable discriminators are the script URLs, the `wp-commands`/`core-commands` handle
+strings, and the runtime `typeof window.wp.commands`.
+
+**Backward-compatibility verification**: the palette still opens on the first `Ctrl+K` on
+`post-new.php` (11 command suggestions for the query `settings`, plus live REST searches against
+`/wp/v2/pages` and `/wp/v2/posts`, both 200) and on `site-editor.php` (9 suggestions), and closes
+cleanly on Escape with no residual overlay or trapped focus. On screens where it is intentionally
+absent, `Ctrl+K` is a **silent no-op with zero console output** — the bundles were never delivered, so
+no listener exists to throw. Nothing is half-initialised.
+
+**Value**: **1,810,500 gzipped bytes and 10,112,737 raw bytes removed from every non-editor admin page
+load** (1,804,726 gzipped by the isolated `gzip -9` accounting), and admin DOM-ready time cut by
+**586.60 ms** in en_US and **603.45 ms** in de_DE. This is one of the two targets that is met, and it
+is met with a very large margin: −83.47 % against a ≥30 % requirement.
+
+*Estimate — real-world impact.* On a 4 Mbps connection, 1.81 MB of avoided transfer is on the order of
+3.6 seconds per uncached non-editor admin page. This figure is an arithmetic projection from the
+measured byte delta, not a measurement: no network-throttled page load was timed, and real-world
+savings depend on connection speed, HTTP caching, and how often a given admin visits non-editor
+screens. It is offered as an order-of-magnitude illustration only. What *is* measured is the byte
+delta and the −79.42 % DOM-ready improvement on this hardware.
+
+The palette remains fully functional on block-editor screens and on the special admin documents that
+explicitly request it — verified on the measured tree by opening `post.php?post=1789&action=edit`, pressing
+`Ctrl+K`, and observing the dialog `components-modal__frame commands-command-menu` with
+`aria-label="Command palette"` at rect (440, 154, 400 × 113), its `"Search commands and settings"`
+combobox auto-focused, and a live command suggestion rendered.
+
+### Accepted user-visible change: the admin-bar `Ctrl+K` trigger
+
+This optimization has one user-visible consequence, and it is recorded here as an explicit decision
+rather than left as an unexplained snapshot difference. **On the 21 admin screens that are not
+block-editor screens, the admin-bar item showing the `Ctrl+K` / `⌘K` shortcut is no longer
+rendered.** The decision is to **accept** it. The reasoning, the measured scope and the escape hatch
+follow.
+
+**Why it happens — and who designed the coupling.** The trigger is not removed by anything in this
+change set. `wp_admin_bar_command_palette_menu()` returns early unless the palette bundle is
+actually present:
 
 ```php
-if ( doing_action( 'admin_enqueue_scripts' ) && ! wp_should_load_command_palette_assets() ) {
+if ( ! is_admin() || ! wp_script_is( 'wp-core-commands', 'enqueued' ) ) {
+	return;
+}
 ```
 
-The `doing_action()` guard is the backward-compatibility mechanism: the gate applies to the hooked
-invocation, while a direct call to the function still enqueues unconditionally, which is stated in
-the function's own documentation at `:L3538-L3546`. The `add_action` at
-`default-filters.php:L605` is untouched, so any site or plugin that calls
-`remove_action( 'admin_enqueue_scripts', 'wp_enqueue_command_palette_assets' )` keeps working exactly
-as before. No `WP_Scripts` or `WP_Dependencies` behaviour changes: the gate declines to enqueue, it
-does not alter the dependency system. No bundler change is possible or needed — the `js/dist` tree is
-copied in by `tools/gutenberg/copy.js:L51` rather than built by the core webpack config, so splitting
-those bundles is structurally unavailable; the entire reduction comes from not shipping them where
-they are not used.
+That condition is **pre-existing upstream code**, authored in commit `019eeb8e3a` ("Toolbar: Show
+command palette admin bar item on mobile.", Weston Ruter, 12 Mar 2026), which is an ancestor of this
+branch's base `5e9d05d7dd`. Upstream core therefore already defines the trigger's visibility as a
+function of whether `wp-core-commands` is enqueued — precisely so the admin bar can never advertise
+a shortcut that has no code behind it. `src/wp-includes/admin-bar.php` is **unmodified** by this
+branch (constraint C6 lists it REFERENCE-only, `docs/technical-specifications.md:479-599`), and the change set alters only *when the assets are
+enqueued*, which is the whole point of the optimization. The trigger disappearing is upstream's own
+designed response to that condition, not a defect and not an incidental side effect.
 
-**Measurement**: Instrument D holds the code identical and toggles only the new filter with a
-temporary gitignored mu-plugin, on the same running instance, fetching the same authenticated screen
-and summing every `<script src>` response. This isolates the gate from every other variable,
-including the source tree.
+**Exactly what changes, measured two ways.** The QA visual comparison measured **exactly 484
+differing pixels on each of 21 screens** (reported diff ratio 0.01) at the visual-regression
+harness's 960×700 viewport, with the 22nd screen **pixel-identical** — a 22/22 correlation. An
+independent browser measurement at 1280×900 localized the change precisely:
 
-| Screen | Arm | Responses | Raw bytes | `gzip -9` bytes | HTML bytes |
-|---|---|---|---|---|---|
-| `/wp-admin/` | filter opted in | 84 | 11,542,026 | 2,162,502 | 85,942 |
-| `/wp-admin/` | gate active (default) | 43 | 1,429,289 | **358,259** | 73,284 |
-| `/wp-admin/` | **Δ** | **−48.81 %** | **−87.62 %** | **−1,804,243 B = −83.43 %** | **−14.73 %** |
-| `/wp-admin/users.php` | opted in → gated | 59 → 14 | 10,968,033 → 471,119 | 2,011,500 → 136,358 = **−93.22 %** | 61,200 → 46,496 |
-| `/wp-admin/options-general.php` | opted in → gated | 83 → 38 | 12,368,837 → 1,871,923 | 2,348,230 → 473,088 = **−79.85 %** | 163,196 → 148,452 |
+| Measurement | Harness | Viewport | Differing pixels | Bounding box |
+|---|---|---|---|---|
+| QA visual comparison | Playwright `toHaveScreenshot` | 960×700 | 484 per screen | not reported |
+| Independent verification | headless Chrome + pixel diff | 1280×900 | 999 (0.0867 % of frame) | (251, 9)–(403, 25) |
 
-The absolute gzipped delta on `users.php` and `options-general.php` is identical to the byte —
-**−1,875,142 B** in both — which is the signature of a fixed bundle set being removed rather than a
-per-screen coincidence. A cross-control run that toggled the *emoji* filter instead reproduced the
-gated admin figures exactly (43 responses / 358,259 gzipped / 73,284 HTML bytes), confirming the two
-gates are independent. Independently, the harness's own byte accounting reports the gated state at
-**`adminJsRaw` = 1,371,559 B and `adminJsGzipped` = 341,639 B** with zero variance across 40 samples
-in both admin locales, and the client-side effect is
-**`domContentLoaded` 665.50 → 155.85 ms (−76.58 %)** for `en_US` and **666.70 → 171.95 ms (−74.21 %)**
-for `de_DE` (instrument F, 40 samples per arm). Two further same-instance figures come from a
-different instrument and agree: admin HTML **85,869 → 73,211 B** measured over HTTP with the two
-trees (instrument C), against **85,942 → 73,284 B** measured by toggling the filter on one tree — the
-same **−12,658 B** delta from both.
+The two counts describe the same change under different tolerances. Playwright's comparison applies
+a per-pixel colour threshold that discards antialiasing-level differences; the independent diff
+counted every non-zero difference. Applying an increasing colour tolerance to the independent diff
+walks the count monotonically down straight through QA's figure:
 
-Instrument D was then **re-run on the same live instance after the regression suites had executed**,
-as an independent replication of the pair above. Opted in: **81 responses / 11,484,296 raw /
-2,145,589 gzipped / 73,303 HTML bytes**. Gated: **40 responses / 1,371,559 raw / 341,346 gzipped /
-60,453 HTML bytes** — a reduction of **−84.09 % gzipped** and **−88.06 % raw**, against −83.43 % and
-−87.62 % in the first pair. The three JavaScript deltas are **identical to the byte across both
-pairs** — 41 responses, 10,112,737 raw bytes and 1,804,243 gzipped bytes — the same fixed-bundle-set
-signature the two other screens showed. The absolute counts moved by three responses in each arm
-because the dashboard's own state changed between the two sessions: the pending-update count went
-from 15 to 16, an additional published post and an editor auto-draft existed, and the dashboard's
-widget scripts follow that state. The HTML delta moved with it, from −12,658 B to −12,850 B, because
-the palette's inline initializer serialises the current admin menu and therefore tracks that state
-too. Neither drift touches either reduction, because each pair was captured within one session with
-one variable changed — which is precisely why only same-session pairs are compared anywhere in this
-report. The replication also produces the strongest cross-instrument agreement in this document: its
-gated raw figure of **1,371,559 B is an exact match, to the byte**, for the `adminJsRaw` median the
-harness itself recorded across 40 samples in both admin locales, and its gated **341,346 B** sits
-**0.09 %** from the harness's `adminJsGzipped` median of 341,639 B — a residual between two gzip
-implementations at the same level, not a difference in payload.
+| Max-channel delta > | 0 | 8 | 32 | 64 | 128 | **160** | **192** |
+|---|---|---|---|---|---|---|---|
+| Pixels | 999 | 980 | 882 | 777 | 650 | **570** | **414** |
 
-The client-side cost of that payload was finally measured **in a browser, on the same instance, in one
-session, with the filter as the only variable** (instrument G). Arm A was `/wp-admin/` with the gate
-active; arm B was the same screen with the filter opted in. Twelve navigations per arm, strictly
-interleaved so drift spreads evenly, the HTTP cache bypassed on every measured navigation and proven
-per sample, and the metric read with the landed spec's own expression,
-`navigation.domContentLoadedEventEnd - navigation.responseEnd`:
+484 falls between the 570 and 414 rows. Both measurements therefore report the same event, and both
+confine it to a **16-pixel-tall band inside the admin toolbar** (y = 9…24). Every pixel outside that
+band is identical.
 
-| Arm | n | min | median | max | stdev | `script[src]` |
-|---|---|---|---|---|---|---|
-| Gate active (shipped) | 12 | 126.60 ms | **152.15 ms** | 177.60 ms | 14.92 ms | 40, constant |
-| Filter opted in (previous behaviour) | 12 | 465.60 ms | **496.95 ms** | 527.50 ms | 16.85 ms | 81, constant |
+**The change is the glyph plus a shift of its two neighbours, and nothing else.** Measured element
+geometry, gated state versus opted-in state:
 
-**−344.80 ms, or −69.38 % of the opted-in median.** The two distributions do not overlap at all: the
-slowest gated sample, 177.60 ms, is still **288.00 ms faster** than the fastest opted-in sample,
-465.60 ms. The attribution control is the TTFB captured in the very same samples —
-`responseStart − startTime` medians of **39.05 ms gated against 38.45 ms opted in**, 0.60 ms apart,
-inside the gated arm's own 5.12 ms spread, and with the gated arm nominally the *slower* of the two —
-so no part of the DOMContentLoaded difference is server-side, which is also what the metric's
-subtraction of `responseEnd` guarantees by construction. An independent timeline boundary agrees:
-`loadEventEnd − responseEnd` reads 498.10 → 153.10 ms, **−69.26 %**. These are cache-cold figures
-with `SCRIPT_DEBUG=true`, so the absolute milliseconds are development-mode values on a first visit;
-a returning administrator with a warm cache would see a smaller absolute delta, because the fetch
-component disappears while parse, compile and execute remain. The measured navigations were hard
-reloads rather than fresh navigations, because that is the only mechanism available for guaranteeing
-cache bypass in this harness; each is still a full document navigation with every script re-fetched
-and re-executed, the treatment was identical in both arms, and it matches the shape of the project's
-own harness, where each Playwright test runs against an empty browser cache.
+| Admin-bar item | `x` when opted in | `x` when gated | Shift |
+|---|---|---|---|
+| `wp-admin-bar-updates` | 188.72 | 188.72 | none |
+| **`wp-admin-bar-command-palette`** (50.83 × 32 px) | **244.34** | *not rendered* | — |
+| `wp-admin-bar-comments` | 295.17 | 244.34 | **−50.83** |
+| `wp-admin-bar-new-content` | 343.48 | 292.66 | **−50.83** |
+| `wp-admin-bar-new-content`, right edge | 410.42 | **359.59** *(measured)* | **−50.83** |
 
-**Value**: **1.80 MB of gzipped JavaScript, 10.1 MB raw, and 41 HTTP requests removed from every
-admin page view** on which the palette is not used — a delta reproduced to the byte in two
-independent same-instance pairs taken hours apart. The client-side saving is **509.65 ms** of admin
-DOMContentLoaded measured by the harness across 40 samples per arm, and **344.80 ms** measured in a
-browser on one instance with the filter as the only variable. Per 1,000 admin page views that is
-**1.80 GB of gzipped transfer and 41,000 requests** that no longer leave the server. On a metered or
-high-latency connection the request-count reduction matters as much as the bytes: 41 fewer round
-trips on a screen that previously blocked DOM readiness for two thirds of a second. What those 41
-files and that third of a second bought on the dashboard, verified in the browser, was exactly one
-visible affordance: a `Ctrl+K` hint in the admin toolbar. The gate is filterable, so a site that wants the palette
-everywhere restores the previous behaviour with one filter and no code change. Security is narrowed
-rather than widened: the gate only ever declines to deliver privileged administrative JavaScript, and
-it derives its decision from the current screen, so no unauthenticated or lower-privilege context can
-receive more than it did before.
+The items are exactly contiguous — `updates.right === palette.x`, `palette.right === comments.x` and
+`comments.right === newContent.x` all hold exactly — and the palette `<li>` occupies **50.83 px ×
+32 px**. Removing it therefore shifts *Comments* and *New* left by precisely its own width, which the
+independently measured right edge confirms: 410.42 − 359.59 = 50.83. That is the entire visual delta.
+No page content, heading, notice, metabox, admin menu, form control or layout box moves anywhere on
+any screen; the diff bounding box proves it.
+
+**Why the visual-regression guard registers this at all.** `tests/visual-regression/specs/visual-snapshots.test.js`
+lists `#wp-admin-bar-root-default` in its `elementsToHide` mask array, which would appear to cover
+the toolbar. It does not: that `<ul>` is float-collapsed and measures **1280 × 0** at runtime, so the
+mask rectangle has zero area and paints nothing. The toolbar band is compared normally. This is a
+pre-existing property of the spec, not a consequence of this change set, and it is routed to the
+backlog below.
+
+**What is *not* affected.** The 22nd screen, `/widgets.php`, is pixel-identical because it *is* a
+block-editor screen — the block widgets editor — so `is_block_editor()` returns true, the gate
+returns true, and the palette is delivered exactly as before. That single exception is what makes the
+22/22 correlation mechanistic rather than coincidental. Probing all 22 visual-regression paths in
+authenticated server HTML reproduces the split exactly:
+
+| Visual-regression screens | Gate result | Admin-bar item | `core-commands` | `initializeCommandPalette` |
+|---|---|---|---|---|
+| 21 screens (`edit.php`, `edit-tags.php` ×2, `upload.php`, `media-new.php`, `edit.php?post_type=page`, `edit-comments.php`, `nav-menus.php`, `plugins.php`, `users.php`, `user-new.php`, `profile.php`, `tools.php`, `import.php`, `export.php`, `export-personal-data.php`, `erase-personal-data.php`, `options-reading.php`, `options-discussion.php`, `options-media.php`, `options-privacy.php`) | `false` | 0 | 0 | 0 |
+| 1 screen (`widgets.php`) | `true` | 1 | 3 | 1 |
+
+On the gated screens the shortcut is not merely hidden — it is genuinely inert and genuinely clean.
+`Ctrl+K` and `⌘K` on the Dashboard leave `body.innerHTML` byte-identical (**80,118 characters** before
+and after, with the first differing character index reported as −1), the element count unchanged at
+**1,002**, `document.body.childElementCount` unchanged at 8, focus still on `BODY`, and a
+`MutationObserver` on `document.documentElement` recording **zero** added nodes of any type. All four
+keydown events reach the window **uncancelled** — `defaultPrevented` read asynchronously after
+propagation completed, and `cancelable` was `true` on every one, so they *were* preventable and simply
+had no listener to prevent them. The before/after screenshots are byte-identical (**0 of 1,152,000
+pixels differ**, identical SHA-256). Console output for the whole session is a single unrelated jQuery
+Migrate notice: **zero errors, zero warnings**. Every figure here reproduced on a second independent
+page load. Nothing is half-initialised and nothing advertises a capability it lacks.
+
+**The decision, and the requirement it satisfies.** Accept the change. The governing plan states the
+boundary — constraint C10 (`docs/technical-specifications.md:853`) — and its one concession
+explicitly, in a passage that is plan-only: the only user-visible surface this plan touches is "the
+command palette's *availability on screens where it is not used*", with
+`tests/visual-regression/specs/visual-snapshots.test.js` as the guard proving nothing else moved.
+That is an explicit exception to the general "admin UI visual appearance" boundary, constraint C10 (`docs/technical-specifications.md:853`), and
+an explicit exception takes precedence over the general rule. The plan's JavaScript payload analysis, constraint C12 (`docs/technical-specifications.md:779-801`), additionally makes this gate
+the **sole** mechanism available for the ≥30 % admin-JS target, since `js/dist` is copied in by
+`tools/gutenberg/copy.js` and cannot be code-split. The gate delivers −84.22 %. Weakening or
+reverting it forfeits the target outright, and the evidence above shows the cost of keeping it is
+50.83 px of toolbar on screens where the feature is not available.
+
+**Escape hatch, verified end to end.** The predicate is filtered, so any site, plugin or screen can
+opt back in with one line:
+
+```php
+add_filter( 'should_load_command_palette_assets', '__return_true' );
+```
+
+With that filter active, the Dashboard was verified to restore the complete feature: the admin-bar
+item returns at the identical rect (x 244.34, 50.83 × 32 px), `core-commands.js` and `commands.js`
+load (200, **29,401 B** and **155,380 B** encoded, alongside the `wp-commands` stylesheet at
+`css/dist/commands/style.css`, 200, **6,357 B** — 191,138 bytes for the three), the
+`initializeCommandPalette` payload carries **44 menu commands** in a 4,251-byte inline script,
+`Ctrl+K` opens a working palette (`aria-label="Command palette"`, focus in the
+`"Search commands and settings"` combobox), the query `settings` returns **9** live results with the
+matched term wrapped in `<mark>` on every row, and Escape tears the palette down completely —
+restoring the page **byte-identically**, with **zero console errors and zero warnings** and **every
+request returning HTTP 200**. The non-filterable `! is_admin()` guard is unaffected, verified with the
+filter live: the front end stays clean either way.
+
+Three of those figures need their method stated, because two of them are not portable and one was
+previously wrong.
+
+- **The 44 commands are counted, not estimated**: the argument to `initializeCommandPalette` is JSON,
+  and `JSON.parse` of it yields `{ is_network_admin: false, menu_commands: [ … ] }` with
+  `menu_commands.length === 44`, running `Dashboard` … `Settings > Privacy`. *An earlier draft said 49.*
+  The count is a property of the current admin menu, so it moves with the menu — which is precisely why
+  it is reported with the parse that produces it rather than as a constant.
+- **"Byte-identically" is the claim; a hash is not.** The landing and post-Escape `body.innerHTML` were
+  compared as full strings and matched, at 92,640 characters, and the two full-page screenshots are
+  byte-identical PNGs (0 of 1,152,000 pixels differ, identical SHA-256). *An earlier draft quoted a
+  specific md5 as if it were durable. It is not: the digest changes with post count, active theme and
+  per-request nonces, so it identified one instance at one moment rather than the behaviour.* The
+  equality is the finding; the digest was never the finding.
+- **The request count is window-dependent, so only the status invariant is stated.** The Dashboard
+  navigation issued 123 requests with **zero non-200**, and a second independent session issued 205,
+  again with zero non-200 — the count climbs for as long as the page stays open, because Heartbeat and
+  the polling described below keep adding to it. *An earlier draft stated a fixed "320 requests", which
+  is not a reproducible quantity.* Five opaque cross-origin avatar requests report `responseStatus: 0`
+  through the Resource Timing API for want of `Timing-Allow-Origin`; DevTools reports all five as 200,
+  and they are counted as such here.
+
+**Alternatives considered and rejected on measurement.**
+
+| Alternative | Why rejected |
+|---|---|
+| Revert the gate | Forfeits the ≥30 % admin-JS target entirely, and with it the admin `domContentLoaded` improvement of **−79.42 %** (en_US) and **−80.17 %** (de_DE). |
+| Enqueue only `wp-commands` to keep the trigger visible | **Costs more than the entire post-gate payload.** The `wp-commands` closure is 24 files / **374,729 gzipped bytes** per non-editor admin page, against a total post-gate admin payload of **341,639**. It would also produce a trigger with **no commands registered**, because the `initializeCommandPalette` inline payload attaches to `wp-core-commands` — a shortcut that opens an empty palette is worse than no shortcut. Rejected on measurement *and* on functionality. |
+| Lazy-load the bundle on first `Ctrl+K` | No precedent anywhere in core; requires inventing a new client-side loading mechanism, violating the minimal-diff gate, constraint C3 (`docs/technical-specifications.md:871`). |
+| Change `wp_admin_bar_command_palette_menu()` to render regardless | `src/wp-includes/admin-bar.php` is REFERENCE-only under constraint C6 (`docs/technical-specifications.md:479-599`), and the guard is deliberate upstream design (`019eeb8e3a`). Rendering a shortcut with no code behind it is the exact failure mode that guard exists to prevent. |
+
+A further measured cost of opting non-editor screens back in, beyond transfer size: delivering the
+`js/dist` chain to the Dashboard also starts a **continuous `POST /wp-json/wp-sync/v1/updates` poll** —
+**57 requests in a strictly-timed 60-second idle window**, every one HTTP 200, 604 bytes each, at a mean
+interval of 1,046.6 ms (median 1,044; min 1,039; max 1,121), i.e. **≈0.956 Hz, on the order of 3,400
+requests per hour per open tab**. Instrumentation was triple-redundant — a `PerformanceObserver` on
+`resource`, a `fetch` hook and `XMLHttpRequest` hooks, all installed before the window opened — so the
+count is not subject to Chrome's 250-entry Resource Timing buffer.
+
+Two details matter more than the count, and both correct an earlier draft that attributed the polling to
+script load and reported a single window-dependent total:
+
+- **It starts when the palette is first opened, not when the scripts finish loading.** The first poll
+  lands in the same second as the palette's own bootstrap REST calls, roughly 633 s into one session and
+  23.9 s into another — in both cases the moment `Ctrl+K` was pressed.
+- **It survives closing the palette.** The DOM teardown is hash-clean, yet polling continued unbroken
+  through both post-Escape idle windows. The DOM is torn down; the sync client is not.
+
+The mechanism is a dependency chain rather than anything the palette does directly: `core-commands.js`
+declares `wp-core-data` among its dependencies, `core-data` depends on `wp-sync`, and
+`src/wp-includes/js/dist/sync.js` self-schedules on `POLLING_INTERVAL_IN_MS = 1e3` — which is exactly
+the 1,000 ms the measured 1,046.6 ms mean reflects once round-trip time is added. Server-side the routes
+exist only because `get_option( 'wp_enable_real_time_collaboration' )` is truthy, which registers
+`WP_HTTP_Polling_Sync_Server::REST_NAMESPACE = 'wp-sync/v1'`
+(`src/wp-includes/collaboration/class-wp-http-polling-sync-server.php:21`, registered at
+`src/wp-includes/rest-api.php:435`).
+
+So the gate removes continuous background polling from non-editor screens as well as bytes — and it
+removes it from screens that had nothing to collaborate on in the first place. On a gated screen the
+`wp-sync/v1` request count is **zero**, confirmed in the same session that counted 123 requests with no
+match for `sync/v1` among them.
+
+**Evidence.** Browser screenshots and recordings were taken during verification but are deliberately
+**not** committed: they are transient runtime artifacts, not deliverables under constraint C6 (`docs/technical-specifications.md:479-599`), and adding
+~10 MB of binaries to core would violate the minimal-diff principle. Every claim above is instead
+recorded as a numeric finding that can be re-derived on demand, and the two committed sources of
+truth are `artifacts/performance-results.md` (regenerable) and the assertions in
+`tests/phpunit/tests/dependencies/commandPalette.php`.
+
+The admin-bar geometry above was re-verified independently on the measured tree in a real browser at
+1280×900, and it reproduces: `#wpadminbar` occupies exactly (0, 0, 1280 × 32); `#wp-admin-bar-root-default`
+contains **6** `<li>` items — `menu-toggle` (width 0, the responsive hamburger), `wp-logo` (x 0,
+w 35), `site-name` (x 35, w 154), `updates` (x 189, w 56), `comments` (x 244, w 48), `new-content`
+(x 293, w 67) — and `#wp-admin-bar-top-secondary` contains **1**, `my-account` (x 1160, w 120).
+Neither `#wp-admin-bar-command-palette` nor `#wp-admin-bar-wp-commands` exists, and **none of the 301
+id-bearing elements in the document contains the substring `command`** — nor does the substring appear
+anywhere in the 82,379 bytes of markup the server actually sent, confirmed by an out-of-browser `curl`
+that returned the identical byte count and the same zero. Two figures
+from the geometry table above fall out of this directly: `comments.x` is **244** when gated, exactly
+where the opted-in measurement puts the palette item's own left edge (244.34), and `new-content`'s
+right edge is **293 + 67 = 360**, matching the independently measured gated value of 359.59. The
+50.83 px shift is confirmed from a second, later measurement session.
+
+The strongest single piece of evidence that the gated shortcut is inert rather than merely invisible is
+not a screenshot at all: with a capture-phase `keydown` recorder installed, `Ctrl+K` and `Meta+K` on
+the Dashboard both reach `document` with **`defaultPrevented: false`**. A mounted palette registers a
+handler that consumes those keystrokes; nothing consumed them, because no palette code was delivered.
+The surrounding evidence — unchanged element count, unchanged body children, zero mutations, focus
+still on `BODY` — is the inertness paragraph above, reproduced on two independent fresh Dashboard loads
+and not restated here. A further root-cause check makes the reason unambiguous: `window.wp.data` is
+absent, `window.wp.commands` is absent, and `wp.data.select( 'core/commands' )` resolves to nothing —
+the `@wordpress/data` runtime and the `core/commands` store are not present on the page at all, so
+there is no palette to open rather than a palette that declines to open.
+
+One caveat for anyone writing an assertion against this: **`div[role="dialog"]` has a baseline count of
+1 on every admin screen**, before any keypress. That match is core's always-present hidden
+`#wp-link-wrap` modal (`display: none`, rect 0 × 0, `aria-labelledby="link-modal-title"`). An
+assertion that counts `[role=dialog]` elements will read a false positive; it must count *visible*
+dialogs, which are **0** on the Dashboard in all three states and **1** in the editor after `Ctrl+K`.
 
 ---
 
 ## Gating the emoji detection script and relocating the emoji arrays
 
-**Bottleneck**: Two distinct costs, measured separately.
+**Bottleneck**: Two distinct costs from one feature. First, an inline emoji-detection script was
+printed into **every** front-end response: 3,233 bytes of HTML and 1,268 gzipped bytes, 9.7 % of the
+gzipped document, on the baseline install profiled at the start of this work, the install whose
+emoji-on-every-page behaviour the governing plan records at `docs/technical-specifications.md:283` — and **exactly 13,700 raw bytes /
+3,878 gzipped bytes per page** when re-measured on the measured tree on this instance at `SCRIPT_DEBUG=true`,
+which is **10.26 %** of the gzipped home page and **17.94 %** of the gzipped single post. At
+`SCRIPT_DEBUG=false` the payload references the minified loader and is roughly 4× smaller, on the order
+of 3,300 raw / 1,300 gzipped. Second, `src/wp-includes/formatting.php` carried
+**140,933 bytes of emoji array literal on four physical lines**, tokenized on every request whether
+`wp_staticize_emoji()` was ever called or not.
 
-The first is transfer size. The emoji detection payload is printed inline into every front-end and
-admin response. Measured by instrument D on the running instance with `SCRIPT_DEBUG=true`, the
-anonymous front page carried **59,456 raw bytes / 12,749 bytes at `gzip -9`** with the payload and
-**45,756 / 8,895** without it: the payload is **13,700 raw bytes and 3,854 gzipped bytes of every
-anonymous page view**. On a single post the same delta appears: **60,390 → 46,690 raw**,
-**13,662 → 9,851 gzipped**. The `<script src>` count is identical in both arms, which confirms the
-payload never enters `WP_Scripts` at all.
+**Root Cause**: The detection script is registered from twelve hook sites and had no gate. The array
+data lived inline in a file that every request loads, so its parse cost was unconditional while its
+*use* was rare.
 
-The second is compile cost. `src/wp-includes/formatting.php` carried a **140,933-byte** emoji array
-literal on four physical lines, tokenized on every request that parsed the file whether or not any
-emoji function was ever called. Measured by instrument E with a fresh process per sample, 10 samples
-per arm, `opcache.enable=0`: the file was **354,690 bytes** producing **48,123 tokens** and taking
-**6.697 ms** to tokenize with a tokenizer peak of **10,324,576 B**; after relocation it is
-**216,363 bytes**, **32,016 tokens**, **4.327 ms** and **6,804,848 B**.
+**Change**: The function hooked as `print_emoji_detection_script` — `formatting.php:5901` in the base
+file, `formatting.php:5935` after the change — now consults a filterable predicate,
+`wp_should_load_emoji_detection_script()` at `formatting.php:5914`, before delegating to its private
+worker at `:5962`. The array region moved out to a new `src/wp-includes/emoji-arrays.php`, which
+`_wp_emoji_list()` (declared at `formatting.php:6239`, `:6194` in the base file) requires on demand and
+memoizes in a `static`.
 
-**Root Cause**: The detection script was registered unconditionally at three sites — `wp_head` at
-priority 7 (`src/wp-includes/default-filters.php:L354`), `embed_head` (`:L727`) and
-`admin_print_scripts` (`src/wp-admin/includes/admin-filters.php:L59`) — within a family of eleven
-emoji hook registrations across those two files, and the hooked function printed the payload with no
-way to decline it short of removing the action. Core
-itself already had to do exactly that on one screen —
-`src/wp-admin/edit-form-blocks.php:L42` calls
-`remove_action( 'admin_print_scripts', 'print_emoji_detection_script' )` — which is the precedent this
-change generalizes from one screen to a filterable default. The array literal lived inline because
-the build task that regenerates it from upstream emoji data located it by comment markers inside the
-file, and nothing required it to be in a file that every request parses.
+This change ships with a mandatory companion edit. `replace:emoji-regex`
+(`Gruntfile.js:1336`; the governing plan's anchor for it is `Gruntfile.js:1319-1388` in the base file) locates the arrays it
+regenerates by the literal `// START: emoji arrays` / `// END: emoji arrays` markers and re-emits them
+after fetching Twemoji data. It now reads and writes `EMOJI_ARRAYS_FILE` (`Gruntfile.js:17`) rather
+than `formatting.php`, matches through the shared `emojiArraysRegionRegExp()` helper
+(`Gruntfile.js:157`), and runs with `pedantic: true` so an unmatched marker pair fails the build
+instead of warning. A `verify:emoji-markers` guard — registered at `Gruntfile.js:1866`, with its fatal
+uniqueness check at `Gruntfile.js:1886-1892` — asserts exactly one region exists before the rewrite runs. Relocating the arrays without retargeting that task would leave a
+Grunt task matching nothing, and `git diff --exit-code` is enforced in **15** workflow files, so the
+two edits are atomic with each other.
 
-**Change**: `src/wp-includes/formatting.php` gains
-`wp_should_load_emoji_detection_script()` at **`:L5914`**, which returns through
-`apply_filters( 'should_load_emoji_detection_script', false )` at **`:L5926`** — default **off**,
-opt-in by filter. `print_emoji_detection_script()` at `:L5935` consults it in an early return at
-`:L5936` before delegating to the private worker `_print_emoji_detection_script()` at `:L5962`. The
-hook registrations are untouched, so `remove_action()` — including core's own at
-`edit-form-blocks.php:L42` — behaves exactly as before. Separately, `_wp_emoji_list()` at `:L6237`
-now loads its data on demand from `ABSPATH . WPINC . '/emoji-arrays.php'` at `:L6251`, and the new
-`src/wp-includes/emoji-arrays.php` (33 lines, 141,951 bytes) returns that data as an array, following
-the same generated-data-file shape as `src/wp-includes/blocks/index.php:L55`. Because the payload is
-inline rather than enqueued, gating it cannot touch the enqueue dependency system, and the public
-behaviour of `wp_staticize_emoji()` at `:L6066` and `wp_staticize_emoji_for_email()` at `:L6161` is
-unchanged — they resolve the same data, one file later.
+Gating an *inline* script cannot violate the "must not change the enqueue dependency system"
+boundary, because the payload never enters `WP_Scripts` at all. Core already opts a single screen out
+of this same script at `src/wp-admin/edit-form-blocks.php:42`, which this change generalises.
 
-The relocation carries a mandatory companion edit, and the two land together or not at all.
-`Gruntfile.js` defines the emoji-data regeneration task at **`:L1336`**; it locates the arrays by
-comment markers and would silently match nothing if the arrays moved out from under it. The task now
-targets the relocated file through the `EMOJI_ARRAYS_FILE` constant at **`:L17`**, and a guard at
-**`:L1880-L1890`** fails the build loudly when the marker region is not present exactly once, rather
-than emitting an empty replacement. Without that pairing the byte-for-byte build-output check
-enforced in 15 workflow files would fail, and the failure would look like a code defect rather than a
-missing build wiring.
+**Measurement**: every pair below swaps **only** `formatting.php` between its base state (354,690 B,
+sha256 `922d8ce082d25d33…`) and its current state (216,491 B, sha256 `417a7a3a8c1658b9…`), with
+bit-identical interpreter flags on each side of the pair, medians over the stated sample count, and
+php-fpm restarted between code states. Byte figures name their `SCRIPT_DEBUG` state, because that flag
+changes the size of the inline payload by roughly 4× and is therefore as load-bearing here as the
+opcode-cache state.
 
-**Measurement**: Two independent measurements, each in isolation.
+The HTTP rows were **re-measured on the same instance as every other figure in this report** —
+`http://localhost:8891`, nginx → php-fpm 8.5.9, MySQL 8.4.11, no object-cache drop-in,
+`SCRIPT_DEBUG=true`, active theme **`twentytwentyfive`**, one `opcache_reset()` before every measured
+request, and only `formatting.php` swapped between arms (base `sha256 922d8ce0…` against
+`sha256 417a7a3a…`, restored byte-identically afterwards with `git status` confirmed clean). The theme
+is named because it sets the absolute page sizes: the same pages measure 124,030 bytes under
+`twentytwentyfour`, 91,826 under `twentytwentythree` and 78,939 under `twentytwentyone`, so an absolute
+size quoted without its theme means nothing.
 
-Payload, instrument D, same instance, same code, only the filter toggled, deterministic:
+Earlier drafts quoted these rows from a different clone on a different port with a near-empty database;
+those absolute page sizes were not comparable to anything else here and have been replaced. **The byte
+delta is the portable figure, and it is a constant 13,700 bytes on every page that carried the
+payload** — identical on the home page and on a single post, which is what makes it a property of the
+payload rather than of the page, and it is the one figure in this table that has reproduced unchanged
+across every instance, theme and regime it has been measured on.
 
-| URL | Arm | Raw bytes | `gzip -9` bytes | `wpemoji` markers | `<script src>` count |
-|---|---|---|---|---|---|
-| `/` | filter opted in | 59,456 | 12,749 | 5 | 1 |
-| `/` | gate active (default) | 45,756 | 8,895 | 0 | 1 |
-| `/` | **Δ** | **−13,700 B (−23.04 %)** | **−3,854 B (−30.23 %)** | — | **unchanged** |
-| single post | opted in → gated | 60,390 → 46,690 | 13,662 → 9,851 (**−27.89 %**) | 5 → 0 | 2 → 2 |
-
-A cross-control run that toggled the *command palette* filter instead reproduced the gated front-end
-figures exactly, confirming the two gates are independent.
-
-Compile cost and per-request effect, arm W4 — the base tree with **only** `formatting.php` swapped in
-and `emoji-arrays.php` added, SHA-1-verified before and after:
-
-| Instrument, regime | Metric | Before | After | Δ |
+| Metric | Regime / conditions | Before | After | Δ |
 |---|---|---|---|---|
-| E, `opcache.enable=0`, 10 samples | file bytes tokenized | 354,690 | 216,363 | **−39.00 %** |
-| E, `opcache.enable=0`, 10 samples | tokens produced | 48,123 | 32,016 | **−33.47 %** |
-| E, `opcache.enable=0`, 10 samples | `token_get_all()` wall time | 6.697 ms | 4.327 ms | **−35.39 %** |
-| E, `opcache.enable=0`, 10 samples | tokenizer peak memory | 10,324,576 B | 6,804,848 B | **−34.09 %** |
-| A, parse-dominated CLI, 10 samples | files loaded at bootstrap | 482 | 482 | **0 %** — the relocated file is not loaded at bootstrap |
-| A, parse-dominated CLI, 10 samples | bootstrap peak memory | 32,047,624 B | 31,653,192 B | **−394,432 B (−1.23 %)** |
-| B, parse-dominated HTTP, 12 samples | `wpMemoryPeak` | 33,174,208 B | 32,778,368 B | **−395,840 B (−1.19 %)** |
-| B, parse-dominated HTTP, 12 samples | front-end HTML bytes | 33,517 | 19,817 | **−13,700 B (−40.87 %)** |
-| B, warm HTTP, 12 samples | `wpMemoryPeak` | — | — | **−1,376 B (−0.03 %)**, i.e. nil |
-| B, warm HTTP, 12 samples | wall time | — | — | within instrument spread; **no warm time effect claimed** |
+| `formatting.php` file size | static | 354,690 B | 216,491 B | **−138,199 B (−38.96 %)** |
+| Tokens in `formatting.php` | static, `token_get_all()` | 48,123 | 32,016 | **−16,107 (−33.47 %)** |
+| Isolated tokenizer peak | `enable_cli=0`, `memory_get_peak_usage( false )`, one tokenization per fresh process, 21 samples | 10,337,048 B | 6,817,512 B | **−3,519,536 B = −3.3565 MiB (−34.05 %)** |
+| Isolated tokenizer peak | `enable_cli=1`, otherwise identical, 21 samples | 10,294,088 B | 6,774,552 B | **−3,519,536 B = −3.3565 MiB (−34.19 %)** |
+| Isolated tokenizer wall time | `enable_cli=0`, 21 samples | 6.4881 ms (σ 0.48) | 4.1471 ms (σ 0.13) | **−36.08 %** |
+| Isolated tokenizer wall time | `enable_cli=1`, 21 samples | 6.3131 ms (σ 0.26) | 4.2579 ms (σ 0.19) | **−32.55 %** |
+| Home page HTML, raw | `SCRIPT_DEBUG=true`, `twentytwentyfive`, port 8891 | 256,329 B | 242,629 B | **−13,700 B (−5.34 %)** |
+| Home page HTML, `gzip -9` | as above | 37,652 B | 33,779 B | **−3,873 B (−10.29 %)** |
+| Single post HTML, raw | as above | 114,685 B | 100,985 B | **−13,700 B (−11.95 %)** |
+| Single post HTML, `gzip -9` | as above | 21,313 B | 17,468 B | **−3,845 B (−18.04 %)** |
+| Inline detection payload | the removed region itself, both pages | 13,700 B | 0 B | **−13,700 B (−100 %)** |
+| Per-request peak memory, `/` | warm php-fpm, 12 samples | 7,450,272 B | 7,450,272 B | **0 B — identical to the byte** |
+| Per-request peak memory, single post | warm php-fpm, 12 samples | 6,086,032 B | 6,023,792 B | −62,240 B (**−1.02 %**) |
+| Per-request peak memory, `/` | cold compile, HTTP 202 from `clear-cache.php` before every request, 10 samples | 11,076,992 B | 11,076,992 B | **0 B — identical to the byte** |
+| Per-request peak memory, single post | cold compile, 10 samples | 7,696,152 B | 7,633,912 B | −62,240 B (**−0.81 %**) |
+| TTFB, `/` | warm php-fpm, 12 samples | 128.996 ms (σ 5.33) | 126.247 ms (σ 4.95) | −2.13 %, **inside noise** |
+| TTFB, single post | warm php-fpm, 12 samples | 76.102 ms (σ 2.95) | 76.138 ms (σ 3.92) | **+0.05 %**, inside noise |
+| TTFB, `/` | cold compile, 10 samples | 436.560 ms (σ 9.89) | 441.950 ms (σ 12.56) | **+1.23 %**, inside noise |
+| TTFB, single post | cold compile, 10 samples | 357.054 ms (σ 7.20) | 362.910 ms (σ 7.09) | **+1.64 %**, inside noise |
+| `wp-total`, `/` | warm / cold php-fpm | 127.055 / 425.820 ms | 124.380 / 430.945 ms | −2.11 % / **+1.20 %**, inside noise |
+| `wp-total`, single post | warm / cold php-fpm | 74.355 / 346.045 ms | 74.365 / 351.885 ms | **+0.01 % / +1.69 %**, inside noise |
+| `wp-files-loaded`, `/` and single post | both regimes | 403 / 381 | 403 / 381 | **0** |
+| `wp-db-queries`, `/` and single post | both regimes | 72 / 42 | 72 / 42 | **0** |
+| `wp-cache-hits`, `/` and single post | both regimes | 2,527 / 1,112 | 2,524 / 1,109 | −3 each (**−0.12 % / −0.27 %**) |
+| `wp-cache-misses`, `/` and single post | both regimes | 369 / 120 | 369 / 120 | **0** |
+| `lcpMinusTtfb`, best of 16 contexts | canonical pair (all changes together) | 53.30 ms | 46.00 ms | **−13.70 %** |
+| `lcpMinusTtfb`, median of 16 contexts | canonical pair (all changes together) | — | — | **−4.47 %** |
+| `lcpMinusTtfb`, worst of 16 contexts | canonical pair (all changes together) | 45.90 ms | 47.20 ms | **+2.83 %** |
 
-The warm-regime time reading was **+4.29 %** on TTFB, which is why no warm time effect is claimed:
-the same base-versus-current pair read −4.01 % and −7.43 % on two consecutive replicates of the full
-change set, so a single-arm reading inside that band carries no signal. In the primed CLI regime the
-same arm read **+7.27 %** peak memory, which is a regime artifact rather than a regression —
-`opcache.file_cache_only=1` deserializes opcodes into process memory, so a file that is no longer
-compiled at bootstrap shifts where the arena is charged; that regime is used for wall time only, as
-stated in the Measurement Law section.
+The three `lcpMinusTtfb` rows are from the canonical pair, so they reflect **all** the changes
+together, not this one in isolation; they are included here because post-TTFB rendering is where an
+inline-payload reduction would show up if it showed up anywhere. One of the sixteen contexts moved the
+wrong way, and the median is −4.47 %, so the honest reading is a small effect at best, not a
+demonstrated rendering win.
 
-Note also the honest gap between the two measurements of the same change: a **3.52 MB** lower
-tokenizer peak against **395,840 B** of per-request peak memory in the parse-dominated regime and
-**0** in the warm regime. That is exactly the proxy-metric caveat in action — PHP releases the
-tokenizer arena as soon as a file is compiled and `memory_get_peak_usage()` never reports it — and it
-is why the tokenizer figures appear here as evidence about the compiler's input rather than as a
-memory claim.
+Peak memory was byte-stable across every sample of every cell above (minimum equal to maximum), which
+is why a 0-byte delta can be stated as an equality rather than as "within noise". The two non-zero
+cells are both the single post, and they are the same reduction measured twice: **−62,240 B, identical
+in the warm and the cold regime**, which makes it a stable property of that request rather than
+sampling noise. It is nevertheless **not claimed as a saving**, for a reason visible in the table
+itself: the home page's document shrinks by exactly the same 13,700 bytes and its peak moves **0 B** in
+both regimes. A reduction that appears on one page and not on another, for an identical byte reduction,
+is an allocation-boundary accident rather than an effect that scales — so the **Value** field below
+still claims 0 bytes of per-request peak for this change. *An earlier draft reported the opposite
+distribution — −7,592 B on `/` and 0 B on the post — from an instance with different content; those two
+cells are withdrawn in favour of the values above.*
 
-**Value**: **3,854 gzipped bytes and 13,700 raw bytes removed from every anonymous front-end page
-view**, which is **30.23 % of the gzipped document** on this instance, and **395,840 B of peak memory
-plus 2.37 ms of tokenization removed from every request that compiles `formatting.php`**. Per 1,000
-anonymous page views that is **3.85 MB of gzipped transfer and 13.7 MB raw** that no longer leaves
-the server, for a feature that most modern browsers and platforms no longer need. The default is a
-behaviour change, so it is made reversible by design: one filter restores the payload, and the eleven
-hook registrations plus core's own per-screen `remove_action()` continue to work untouched. Because
-`SCRIPT_DEBUG=true` on this instance, these byte figures are the unminified loader; a production
-install serving the minified loader will see a smaller absolute saving, and this report does not
-extrapolate one.
+The TTFB deltas are a cleaner case of nothing: each is smaller than, or comparable to, its own sample
+standard deviation, and **the sign flips between the warm and cold regimes on both pages** (−2.13 % and
++0.05 % warm against +1.23 % and +1.64 % cold), which is the signature of noise rather than of a small
+effect. `wp-total` moves in the same pattern and to the same scale, from the same requests.
+
+**Two figures the governing plan claims for this change do not survive its own Measurement Law, and are
+corrected here.** In a passage that is plan-only — neither figure appears anywhere in
+`docs/technical-specifications.md` — the plan states that the relocation measured "a 30.5% faster parse
+and a 6.00 MB lower tokenizer peak", and constraint C14 lists that 6.00 MB among the sources from which the
+per-request memory target may be claimed.
+
+- **The parse-time claim reproduces and is exceeded**: **−36.08 %** (`enable_cli=0`) and **−32.55 %**
+  (`enable_cli=1`), medians of 21 fresh processes per arm.
+- **The 6.00 MB tokenizer-peak claim does not reproduce.** Measured under the method constraint C13
+  mandates — `memory_get_peak_usage( false )`, a single tokenization, a fresh process per sample — the
+  reduction is **3,519,536 B = 3.3565 MiB**, identical to the byte in both opcode-cache regimes, so the
+  stated figure is high by a factor of **1.79**. The 6.00 MB value is an allocator-quantization
+  artifact and it is reproducible as such: with `memory_get_peak_usage( true )` and **two**
+  simultaneous tokenizations of the same file held alive together, the delta is 20,971,520 →
+  14,680,064 B = **exactly 6,291,456 B = 6.00 MiB**; with one tokenization the same `true` variant
+  gives exactly 4,194,304 B = 4.00 MiB. Both are multiples of the allocator chunk size, which is
+  precisely why rule 4 of the Measurement Law excludes the `true` variant.
+- **Neither figure may be carried into a per-request claim** — see §*Proxy metrics are not cost
+  metrics*, and the **Value** field below, which states what this change does and does not contribute.
+
+A floor control isolates the tokenizer from the file read: reading the file without tokenizing it peaks
+at **844,672 B** (base) against **705,408 B** (current) at `enable_cli=0`, and 801,712 B against
+662,448 B at `enable_cli=1` — a difference of **139,264 B in both regimes**, which is simply the source
+string plus its bookkeeping. That the floor difference is regime-invariant while the absolute floors are
+not is itself a check on the method: the opcode cache shifts the baseline, not the delta.
+Floor-corrected, the tokenizer's own peak falls **9,492,376 → 6,112,104 B, −35.61 %**.
+
+`emoji-arrays.php` (142,440 B) is confirmed **not loaded** on a front-page request. Re-verified on
+the measured tree:
+
+```
+curl -s http://localhost:8891/ | grep -c "wpemoji\|_wpemojiSettings"   # -> 0
+```
+
+An independent browser pass over both the home page and a single post measured all five detection
+markers as exactly **0** on each page — `#wp-emoji-settings` elements, `_wpemojiSettings` occurrences,
+`wpemoji` occurrences, `twemoji` occurrences, and network requests matching `wp-emoji` or `twemoji` —
+taken from the live DOM, from a fresh re-fetch of the served bytes, and from an out-of-browser `curl`
+grep, with a matcher control proving the zero results were true negatives.
+
+One nuance worth recording so the zero is not over-read: the case-insensitive substring `emoji` still
+appears **3 times** per page, all inside `<style id="wp-emoji-styles-inline-css">`, which carries
+`img.wp-smiley, img.emoji { display: inline !important; … }`. That is `wp_enqueue_emoji_styles()` — a
+different feature, deliberately untouched, and one that keeps inline-image sizing correct for any emoji
+image a plugin or `wp_staticize_emoji()` still produces. It contributes 0 to the `wpemoji` count
+because its id is hyphenated.
+
+**Output equivalence proven exactly, re-derived on the measured tree.** A byte-level comparison of the base
+and final home page — same instance, same content, same theme, only `formatting.php` swapped — finds the
+two documents share a **242,614-byte common prefix** and a **15-byte common suffix**. Between them lies
+**one contiguous removed region of exactly 13,700 bytes and zero inserted bytes**. The region begins
+with `<script id="wp-emoji-settings" type="application/json">` and ends at the close of the following
+module script that references `wp-emoji-loader.js`. Reconstructing the before document minus that one
+region yields **242,629 bytes that are byte-identical to the after document** — asserted
+programmatically, not by inspection.
+
+The same derivation on the single post gives a **100,970-byte common prefix**, the same **15-byte
+suffix**, the same **single 13,700-byte removed region with zero inserted bytes**, and a reconstruction
+of **100,985 bytes, again byte-identical**. Two pages of different length yielding an identical region
+size and an identical suffix is what establishes that the region is the payload and nothing else
+travelled with it. Emoji markers go from `wpemoji=5, _wpemojiSettings=1, twemoji=5, wp-emoji-loader=2,
+id="wp-emoji-settings"=1` to **`0` in every one**, while `wp-emoji-styles-inline-css` stays at **2** on
+both arms — the styles feature is untouched — and the case-insensitive substring `emoji` falls from
+**103 to 3**.
+
+That single-region result is a strong statement about the whole change set, not just this entry: with
+`formatting.php` as the only difference, **the only change to front-end HTML anywhere in this work is
+the intended emoji gating.** The autoloader, the palette gate, the capability memoization and the
+object-cache counters produce no output difference at all. The autoloader entry above records the same
+conclusion from the other direction: with only `wp-settings.php` and the autoloader files swapped, the
+front-page HTML is byte-identical.
+
+**Value**: stated only for what this change is directly measured to do, in the regime each figure
+names.
+
+- **Transfer size, every front-end page view.** Measured at `SCRIPT_DEBUG=true`, the saving is
+  **13,700 raw bytes and 3,839–3,878 gzipped bytes** per page. In a production configuration
+  (`SCRIPT_DEBUG=false`) the inline payload references the minified loader and is roughly 4× smaller.
+  *Estimate — production configuration.* The production saving is on the order of **3,300 raw and
+  1,300 gzipped bytes** per page; that pair was measured on an earlier instance under
+  `SCRIPT_DEBUG=false` and is quoted here as an order of magnitude, not as a figure from this run,
+  which ran at `SCRIPT_DEBUG=true` (`wp-config.php:96`). The reduction is the same absolute size on every page that
+  carried the payload — confirmed by the home page and the single post both showing exactly −13,700
+  raw bytes — so it scales with page views rather than with page weight. Every visitor stops paying to
+  download and parse a client-side polyfill for a capability that current browsers and operating
+  systems ship natively.
+
+  *Estimate — aggregate egress.* At the production setting, a site serving a million front-end views a
+  month would avoid on the order of **1.2 GB** of egress. This is arithmetic on the measured per-page
+  gzipped delta, not a measurement of any site's traffic, and it assumes every view is uncached and
+  would have carried the payload. It is an illustration of scale, not a result.
+- **Isolated parse cost of the containing file.** 138,199 fewer source bytes and 16,107 fewer tokens
+  reach `token_get_all()`, costing **−36.08 %** of tokenizer time and **−3.3565 MiB** of tokenizer peak
+  in the parse-dominated regime. The figures are not restated here; they are the *Isolated tokenizer*
+  rows of the measurement table above, measured once and reported once. The relocated data is still
+  loaded, in full, the first time `_wp_emoji_list()` is called — so what was removed is the cost of
+  compiling it on requests that never staticize an emoji, which is nearly all of them.
+- **What this change does *not* contribute, stated explicitly.** **0 bytes** of per-request peak
+  memory in every regime where the opcode cache is active — identical to the byte on the emoji post
+  warm, and on both contexts cold — and **−1.30 %** (393,584 B) only with the opcode cache switched
+  off entirely, where the compiled literal is request-local rather than in shared memory. **No
+  measurable TTFB effect** in either regime: every delta is inside its own sample standard deviation
+  and the sign flips between contexts. `wpFilesLoaded` and `wpDbQueries` are unchanged in every cell.
+  This change therefore contributes to the transfer-size and cold-compile parse-cost story only, and
+  **nothing of it is claimed against the ≥10 % per-request memory target or the ≥20 % TTFB target**.
+
+`wp_staticize_emoji()` and `wp_staticize_emoji_for_email()` behave identically, as does the deprecated
+wrapper.
 
 ---
 
 ## Request-scoped memoization of `map_meta_cap()`
 
-**Bottleneck**: `map_meta_cap()` is re-entered on every capability check, and at base it was an
-**836-line** function spanning `src/wp-includes/capabilities.php:L45-L880` with **86** `case`
-branches and no memoization of any kind — no static accumulator, no cache read, nothing. Measured by
-instrument E with a fresh process per sample, 10 samples per arm, `opcache.enable_cli=1`, over
-**28,000 capability checks** against real post IDs: **155.312 ms** of resolution, i.e.
-**5.5468 µs per check**, with a peak of 6,626,792 B and **zero** database queries inside the loop in
-both arms — the cost is pure recomputation of a mapping whose inputs have not changed.
+**Bottleneck**: `map_meta_cap()` in `src/wp-includes/capabilities.php` is an **836-line function with
+86 `case` branches and no memoization of any kind** at base — no static accumulator, no cache read. It
+is re-entered on every capability check, and `current_user_can()` is a one-line delegation into the
+same path, as are four further public entry points. (After this change the function spans 901 lines;
+the 86 branches are untouched.)
 
-**Root Cause**: Every entry point funnels into the same mapping and none of them remembered the
-answer. `current_user_can()` is a one-line delegation to `user_can()`, and the sibling entry points
-behave the same way, so a single request that renders an admin screen resolves the same
-`(user, capability, object)` triple many times over. The mapping is deterministic for core's own
-cases, but it is also a documented filter, so blanket caching would have been incorrect.
+**Root Cause**: The function was written as a pure mapping and grew branch by branch. Nothing ever
+remembered that the same `( user, capability, object )` triple had already been mapped microseconds
+earlier in the same request.
 
-**Change**: A request-scoped memo, keyed on capability, user ID and object ID, added to
-`src/wp-includes/capabilities.php`. `map_meta_cap()` — now at `:L73` — computes a canonical key at
-`:L88` via `_wp_map_meta_cap_memo_key()` (`:L1060`), reads the memo at `:L91`, and writes it at
-`:L946-L947` under an explicit correctness guard:
+**Change**: A request-scoped, bounded memo keyed on user ID, capability and object ID, checked at
+entry and populated on return. Constraint C6 mandates this optimization — "Memoize
+`map_meta_cap()` results for repeated capability checks on same user/post"
+(`docs/technical-specifications.md:532`) — so it is implemented rather than dropped. The honest
+accounting below shows it does far less than the plan predicted, and
+where it does nothing it is reported as doing nothing.
+
+The correctness conditions are the substance of this change, not a footnote — and the delivered
+implementation achieves them by **narrowing what is eligible** rather than by tracking invalidations.
+The memo lives entirely inside the `default:` arm of the `switch`, the arm reached only by capabilities
+that **no case above claims**. That single placement decision does most of the correctness work, and it
+is worth spelling out why.
+
+What the `default:` arm actually computes is a rename of the eight `*_blocks` capabilities to their
+`*_posts` equivalents followed by `$caps[] = $cap`. That result is **a pure function of the capability
+name**. It reads no option, no role, no filter, no super-admin status and no post-type registry — so
+there is nothing for a role change, an option write or a `switch_to_blog()` to invalidate. The memo is
+admitted only when all five of these hold:
 
 ```php
-if ( '' !== $memo_key && ! _wp_map_meta_cap_policy_filter_registered() ) {
-        _wp_map_meta_cap_memo( $memo_key, $caps );
+! $args && is_int( $user_id ) && is_string( $cap )
+    && ! isset( $GLOBALS['wp_filter']['map_meta_cap'] )
+    && ! isset( $GLOBALS['wp_filter']['all'] )
 ```
 
-Two predicates keep the fast path correct rather than merely fast.
-`_wp_map_meta_cap_is_memoizable_cap()` at `:L1170` names the capabilities whose mapping is a pure
-function of its arguments, so anything whose mapping legitimately varies is never memoized at all.
-`_wp_map_meta_cap_policy_filter_registered()` at `:L1270` detects a callback on the filters that can
-change a mapping and **bypasses the memo entirely** while one is present, so a plugin's dynamic or
-time-based mapping is never served from cache and the documented filter contract is preserved
-unchanged. Invalidation is explicit rather than hopeful: `_wp_reset_map_meta_cap_memo()` at `:L1385`
-clears the memo, `_wp_reset_map_meta_cap_memo_on_user_meta()` at `:L1413` clears it when the user
-meta a mapping depends on changes, and both are wired to their hooks at `:L1964` and `:L1982`.
-`src/wp-includes/class-wp-roles.php` and `src/wp-includes/post.php` call the reset at the points where
-roles or post state change. The 86 `case` branches and the return contract are untouched.
-
-**Measurement**: Two measurements, one of the work removed and one of the request effect.
-
-| Instrument, regime | Metric | Before | After | Δ |
-|---|---|---|---|---|
-| E, `opcache.enable_cli=1`, 28,000 checks, 10 samples | resolution wall time | 155.312 ms | 102.597 ms | **−33.94 %** |
-| E, same | per-check cost | 5.5468 µs | 3.6642 µs | **−33.94 %** |
-| E, same | process peak memory | 6,626,792 B | 5,708,792 B | **−13.85 %** |
-| C, warm HTTP admin, 12 samples | `timeToFirstByte` | 49.63 ms | 48.34 ms | **−2.61 %** |
-| C, warm HTTP admin, 12 samples | `wpTotal` | 48.69 ms | 47.44 ms | **−2.58 %** |
-| C, warm HTTP admin, 12 samples | `wpMemoryPeak` | — | — | **+34,840 B (+0.84 %)** |
-| C, warm HTTP admin, 12 samples | queries / cache misses / files loaded | — | — | **0 / 0 / 0** |
-
-The request-level arm is the base tree with **only** `capabilities.php`, `class-wp-roles.php` and
-`post.php` swapped in. Sample spreads are given because a −2.6 % effect must be shown to sit outside
-the noise rather than asserted to: base TTFB samples ran 46.8–59.2 ms and the arm's ran 47.9–56.6 ms,
-with the medians separated by 1.29 ms. The admin HTML was **byte-identical** between arms, and the
-query count, cache-miss count and file count were unchanged, which is what a pure work-reduction
-change should look like.
-
-The **+0.84 % peak memory** is the memo table's own cost, and it is reported rather than omitted: the
-change trades roughly 35 kB of per-request memory for a third of the capability-resolution work. On
-an admin screen that resolves capabilities thousands of times that is a good trade; it is stated
-plainly so that anyone for whom it is not can weigh it.
-
-**Value**: **A third of all capability-resolution work removed from every authenticated request**, and
-**1.25 ms of server time off a warm admin dashboard** measured end to end. The per-check figure is the
-transferable one: **1.88 µs saved per capability check**, so the benefit scales with how
-permission-dense a screen is. A list table that renders 20 rows with five capability checks each pays
-100 checks; a plugin-heavy admin screen pays thousands. Estimated global impact: every authenticated
-WordPress request runs capability checks, and this is the first memoization of the mapping in core's
-history, so the saving applies to every admin screen, every REST permission callback and every
-front-end request that renders an admin bar — while remaining transparent to any site that filters
-the mapping, because those sites bypass the memo entirely.
-
----
-
-## Per-group object cache hit and miss counters
-
-**Bottleneck**: Object-cache behaviour was measurable only in aggregate. `WP_Object_Cache` exposed
-`$cache_hits` and `$cache_misses` at `src/wp-includes/class-wp-object-cache.php:L41` and `:L49` as
-two global integers, so a request that recorded 1,108 hits and 76 misses gave no way to tell which
-cache group was responsible. Every hypothesis about "uncached hot paths" was therefore unfalsifiable
-at the group level, which is precisely the diagnosis the query-reduction target needed: the
-authenticated front page's 76 misses had to be attributed to a group before any of them could be
-removed.
-
-**Root Cause**: The counters were added for a summary display and never grew a dimension. Nothing
-recorded *where* a hit or a miss happened.
-
-**Change**: `src/wp-includes/class-wp-object-cache.php` gains
-`public $cache_group_stats = array();` at **`:L57`**, documented as
-`array<string, array{hits: int, misses: int}>`, seeded for a group the first time that group is
-touched so both branches can increment without an existence check, and surfaced through the existing
-`stats()` method at **`:L655`**, which now prints per-group hit and miss lines alongside the totals.
-The pre-existing public `$cache_hits` and `$cache_misses` integers at `:L41` and `:L49` are
-**unchanged**, because plugins read them directly; the per-group counters are strictly additive. The
-change degrades harmlessly when a drop-in replaces the class wholesale: a drop-in that does not
-define the property simply has no per-group stats, and the harness reads the counters through a
-guarded property map at `tests/performance/wp-content/mu-plugins/server-timing.php:L79-L80` rather
-than assuming they exist. That path is the default condition here, since no object-cache drop-in is
-installed and the drop-in location is gitignored at `.gitignore:86`.
-
-**Measurement**: The counters are an instrument, so the measurement that matters is whether they
-report correctly and cost nothing. Correctness: the totals emitted through the new metrics reconcile
-with the pre-existing global counters in every A/B run, and the per-optimization arms below were
-attributed using them — arm C1 was identified as removing **exactly 4 misses** on both the
-authenticated front page (76 → 72) and the admin dashboard (85 → 81), while arm U1 removed **0
-misses** and instead added hits (1,108 → 1,113 and 827 → 837), which is the signature of a primer
-filling the cache rather than of a query being avoided. Cost: in the arm that changed only
-`comment.php` and `update.php`, per-request peak memory moved **−4,112 B (−0.09 %)** and
-**−592 B (−0.01 %)** respectively — the counters are inside that measurement and are therefore below
-its resolution. Both figures are instrument C, warm HTTP, 12 samples per arm.
-
-**Value**: This is what made the query attribution in this report possible at all. Without per-group
-counters, arm C1 and arm U1 would both have shown "queries went down" with no way to distinguish a
-query that was avoided from a query whose result was already cached — and the two have completely
-different follow-on work. Estimated global impact: any site or host can now identify which cache group
-is missing on a hot path, in production, from `stats()`, without patching core or installing a
-profiler. That converts "the object cache seems ineffective" from an opinion into a group-level
-number, at a memory cost measured below 4 kB per request.
-
----
-
-## Grouped comment-status counts
-
-**Bottleneck**: Counting comments cost five separate database round trips. On the admin dashboard the
-request issued **40 queries**, and on an authenticated front page **32** (instrument C, warm HTTP, 12
-samples, identical in the parse-dominated regime). Five of them resolved comment counts by status,
-one status at a time, on a code path that runs on the dashboard and behind the admin bar's comment
-node — that is, on every authenticated page view, not only in the comments screen.
-
-**Root Cause**: `get_comment_count()` resolved each status with its own count query. Every one of
-those statuses is a distinct value of a single column, `comment_approved`, so the five queries were
-five scans answering one grouped question.
-
-**Change**: `src/wp-includes/comment.php` — `get_comment_count()` at **`:L410`** now answers all five
-statuses with **one** grouped query. There are two forms, both prepared: a per-post variant at
-`:L481` and a site-wide variant at `:L490`, each
-`SELECT comment_approved, COUNT( * ) … GROUP BY comment_approved`. The result is cached in the
-existing `comment-queries` group, salted by the comment last-changed marker, read at `:L471` and
-written at `:L503`, so a comment write invalidates it without an explicit purge. The function's
-documented return shape is preserved — the counts are mapped back onto the same status keys and cast
-with `array_map( 'intval', … )` before return — so `wp_count_comments()` at `:L1548` and every
-existing caller behave identically. The caching is skipped when a comment query hook is in use, which
-is recorded in the function's docblock at `:L392`.
-
-**Measurement**: Arm C1 — the base tree with **only** `comment.php` swapped in, SHA-1-verified before
-the run and after restoration. Instrument C, warm HTTP, 12 interleaved samples per arm. Query counts
-are regime-independent, verified by the identical readings in the parse-dominated regime of the full
-change set.
-
-| Context | Metric | Before | After | Δ |
-|---|---|---|---|---|
-| Authenticated front page `/` | `wpDbQueries` | 32 | 28 | **−4 (−12.50 %)** |
-| Authenticated front page `/` | `wpCacheMisses` | 76 | 72 | **−4** |
-| Authenticated front page `/` | HTML bytes | 42,143 | 42,143 | **byte-identical** |
-| Admin dashboard | `wpDbQueries` | 40 | 36 | **−4 (−10.00 %)** |
-| Admin dashboard | `wpCacheMisses` | 85 | 81 | **−4** |
-| Admin dashboard | HTML bytes | 85,869 | 85,869 | **byte-identical** |
-| Both | files loaded, peak memory | — | — | 0 files; −0.09 % and −0.10 % peak, i.e. nil |
-
-**Value**: **Four database round trips removed from every authenticated page view**, front end and
-admin alike, with byte-identical output. Per 1,000 authenticated page views that is **4,000 queries**
-the database never receives. The saving is largest exactly where it hurts most — a shared-hosting
-install where the database is the contended resource, and a high-traffic site with many logged-in
-users, since the admin bar puts this path on ordinary front-end requests rather than only on admin
-screens. Because the result is cached in an existing group with an existing invalidation marker, a
-site with a persistent object cache pays the grouped query once per comment write rather than five
-queries per request.
-
----
-
-## Batched update-transient reads
-
-**Bottleneck**: The update-count helper read three site transients one at a time, and each of those
-reads cost its own database query on an install with no persistent object cache. Measured in
-isolation: **2 queries per request** on both the admin dashboard and an authenticated front page
-(instrument C, warm HTTP, 12 samples). The path is not admin-only — it runs behind the admin bar's
-updates node, so it executes on every authenticated front-end page view as well.
-
-**Root Cause**: `wp_get_update_data()` called the transient accessor three times in sequence. Site
-transients that carry no timeout are not covered by the option-priming that would otherwise
-consolidate them, so each read went to the database independently.
-
-**Change**: `src/wp-includes/update.php` — `wp_get_update_data()` at **`:L935`** primes all three
-option rows with a single `wp_prime_site_option_caches()` call at **`:L964`** before the three reads
-that follow at `:L974` and `:L982`. The guard is explicit and narrow:
-`if ( ( $core || $plugins || $themes ) && ! wp_using_ext_object_cache() )`, so the primer runs only
-when at least one of the three is actually going to be read — each is already gated on the current
-user's capability — and never when an external object cache is present, because the accessor then
-reads from that cache rather than from the options table and the primer would be pure overhead. The
-reasoning is recorded inline at `:L951-L960`, including the detail that options already in the cache
-are skipped by the primer itself. The three reads themselves are unchanged, so the function's return
-shape and every caller are untouched.
-
-**Measurement**: Arm U1 — the base tree with **only** `update.php` swapped in, SHA-1-verified before
-the run and after restoration. Instrument C, warm HTTP, 12 interleaved samples per arm.
-
-| Context | Metric | Before | After | Δ |
-|---|---|---|---|---|
-| Authenticated front page `/` | `wpDbQueries` | 32 | 30 | **−2 (−6.25 %)** |
-| Authenticated front page `/` | `wpCacheHits` | 1,108 | 1,113 | **+5** — the primer fills the cache |
-| Authenticated front page `/` | `wpCacheMisses` | 76 | 76 | **unchanged** |
-| Authenticated front page `/` | HTML bytes | 42,143 | 42,143 | **byte-identical** |
-| Admin dashboard | `wpDbQueries` | 40 | 38 | **−2 (−5.00 %)** |
-| Admin dashboard | `wpCacheHits` | 827 | 837 | **+10** |
-| Admin dashboard | HTML bytes | 85,869 | 85,869 | **byte-identical** |
-| Both | files loaded, peak memory | — | — | 0 files; −0.01 % peak, i.e. nil |
-
-The rise in cache hits with no change in misses is the diagnostic that distinguishes this change from
-the previous one: the primer does not avoid a lookup, it moves three lookups behind one query and
-serves the rest from the cache. That distinction was only visible because the per-group cache
-counters exist.
-
-**Value**: **Two database round trips removed from every authenticated page view** on which any update
-capability is present, with byte-identical output — **2,000 queries per 1,000 authenticated page
-views**. Combined with the grouped comment counts above, the two changes remove **six queries from
-every authenticated page view**, which is the **−18.75 %** that meets the query target on
-authenticated front-end requests. The guard on `wp_using_ext_object_cache()` means an install with a
-persistent object cache pays nothing extra for the primer, so the change cannot regress the
-configuration it does not help.
-
----
-
-## Output equivalence: proving the deferral changed nothing
-
-A loading change that alters the response is not an optimization, so equivalence was measured rather
-than assumed. Instrument B captured the full response body from both arms in three separate runs — two
-warm replicates and one parse-dominated — and the bodies were compared byte for byte after two
-normalizations, each of which is itself justified:
-
-1. **One per-request nondeterministic token.** The response contains a
-   `wp_block_styles_on_demand_placeholder:<hex>` marker whose hex component differs on every request
-   in both arms (observed `6a74555d2a6c0` and `6a74555d370ec` in one pair). It is normalized because
-   it varies between two requests to the *same* arm.
-2. **The emoji delivery payload, removed from the base arm only.** That payload is the intended
-   difference, and it is exactly two elements: a `<script id="wp-emoji-settings" type="application/json">`
-   block and a `<script type="module">` element carrying the emoji loader, **13,697 bytes** together.
-
-After those two normalizations the base and current responses are **byte-identical at 19,814 bytes**
-in all three runs. Arm W1 in isolation — the autoloader and the bootstrap deferral, with the emoji
-work absent — produced a **byte-identical 33,517-byte** response with no normalization needed at all,
-which is the stronger statement: deferring 118 files from the request changed nothing observable in
-the output. Arms W3, C1 and U1 likewise produced byte-identical admin and front-end responses.
-
-Two further equivalence checks were run because they cover behaviour the byte comparison cannot see.
-The live instance's REST index returns **108 registered routes** with the autoloader active, so
-deferring the controller classes did not lose a route: route registration happens inside
-`create_initial_rest_routes()`, which runs in full — and only — when a REST route is actually
-dispatched, and the controller classes it instantiates are resolved by the autoloader at that moment.
-And the bootstrap query composition is unchanged: a probe with `SAVEQUERIES` enabled records
-**exactly 3 queries** in both arms, with the same shapes in the same order.
-
----
-
-## Measurement integrity: pairs that had to be discarded
-
-Three categories of evidence were rejected during verification. They are listed because a report that
-shows only the surviving evidence gives no way to judge how it was selected.
-
-**Cross-regime pairs from the saved suite comparison.** As set out under *Evidence provenance*, the
-saved comparison's after arm is cold-compile — `wpOpcacheCachedScripts` equals `wpFilesLoaded` in all
-18 contexts, hit rate 0.7264–1.0667 % — while its before arm carries no opcode-cache markers at all
-and shows plainly warm timings (`timeToFirstByte` 51.65 ms, `wpBootstrap` 23.45 ms, against 385.50 ms
-and 288.28 ms after). Every time and memory pair in that artifact was therefore discarded under rule 1
-of the Measurement Law, and all time and memory figures in this report come from same-regime A/B runs
-performed for this report. The artifact's regime-independent pairs were kept.
-
-**A silently warm "parse-dominated" run.** The first HTTP A/B was started with
-`-d opcache.enable_cli=0`, which does not gate the built-in server's `cli-server` SAPI. The run's own
-`wp-opcache-enabled;dur=1` and a 3.05 % hit rate exposed it. It was relabelled as an additional warm
-replicate — which is why two warm replicates appear for the front-page rows — rather than presented as
-a parse-dominated result.
-
-**Figures with no reproducible provenance.** An earlier draft of this document carried headline
-figures that could not be traced to any surviving artifact or reproduced by any instrument in this
-environment, including a front-end TTFB pair of 67.90 → 69.35 ms, an admin DOMContentLoaded after-value
-of 135.00 ms, a peak-memory pair of 5,903,624 → 5,913,664 B, a parse-regime pair of 33.832 → 28.877 MB,
-and an admin JavaScript before-value of 2,165,152 B paired with a suite-measured after-value of
-341,639 B — a pair whose halves came from two different instruments. Every one of those was discarded
-and re-measured from scratch. Some of the replacements are less favourable than the figures they
-replaced; that is the point of the exercise. The same draft cited eight screenshot files and three
-screen recordings that do not exist on disk; those citations were removed and the runtime evidence
-was re-captured, as recorded under *Runtime verification*.
-
----
-
-## Why the two unmet targets are unmet
-
-Both unmet targets have a measured cause, and in both cases the remaining distance is accounted for
-rather than hand-waved.
-
-### Front-end TTFB: −16.86 % against −20 %
-
-The best measured figure is **−16.86 %** on the anonymous front page in the parse-dominated regime
-(192.88 → 160.36 ms, instrument B, 12 samples per arm), with the authenticated front page at
-**−14.70 %** and the admin dashboard at **−18.55 %**. In the warm regime the same pairs read
-**−4.03 %** and **−7.32 %** across two replicates. The measured obstruction is visible in the phase
-breakdown: `wpBootstrap` improved **−20.74 %** on the anonymous front page and **−22.12 %** on the
-dashboard — both past the 20 % line — while `wpTemplate` **rose 33.89 %**, because deferral moves
-compilation out of the bootstrap and into first use during rendering. TTFB is measured at the end of
-the whole response, so it nets the two against each other.
-
-Closing that gap requires reducing template-phase work, not bootstrap work, and the two largest
-remaining template-phase costs are both out of scope by boundary rather than by preference: the
-89-file Gutenberg-synced `wp-includes/blocks` cluster, and the block-supports and block-patterns
-registration that runs during rendering. The measured share is what makes this concrete — of the 482
-files a base front-end bootstrap loads, **96 are untouchable** (89 synced `blocks` plus 7 synced
-`wp-includes/build`), and they are exactly the ones the template phase needs.
-
-### PHP files loaded: −29.25 % against −30 % (count metric, regime-independent)
-
-The isolated bootstrap reaches **−29.25 %** (482 → 341, instrument A, 10 samples, zero variance) and
-a full HTTP request reaches **−23.65 %** (499 → 381). Both figures are count metrics and therefore
-regime-independent: they were identical in the parse-dominated regime (`opcache.enable_cli=0`,
-`opcache.enable=0`) and in the warm regime, with zero variance across every sample in each arm. The
-remaining distance is **4 files** at the
-bootstrap: against a base of 482, a file count of **337** is the first that clears 30 % (145 files
-removed, −30.08 %), and **341** was measured.
-
-The reason those last files stay is structural and measured, not incidental. A class map can only
-defer a file whose contents are a class. Of the 175 requires in the base loader's dense region,
-**124** target files declaring exactly one class and are therefore mechanically autoloadable; the
-other **51** declare functions, declare several classes, or declare none, and an autoloader is never
-asked to resolve a function name. The canonical case is the REST bootstrap file itself, which stays
-eager because `src/wp-includes/default-filters.php:L532-L536` references its functions **by name at
-registration time** — five lines that register `rest_api_init`, `rest_api_default_filters`,
-`register_initial_settings`, `create_initial_rest_routes` and `rest_api_loaded` before any of them
-could be autoloaded. Deferring that file would break registration on every request.
-
-On the harness's own `delta / after` convention this target is met — **−41.35 %** at the bootstrap and
-a **−30.01 %** median across all 18 suite contexts — and it is not claimed on that basis. The
-remaining work needed to clear it conservatively is enumerated in the backlog below.
-
----
-
-## Runtime verification
-
-Server-side byte accounting proves what was sent; it does not prove the resulting page works. Every
-behavioural claim below was therefore verified in a **real headless Chrome session** against the
-running instance at `http://localhost:8889` (nginx 1.31.3 → php-fpm 8.5.9, `SCRIPT_DEBUG=true`,
-`WP_DEBUG=true` with `WP_DEBUG_DISPLAY=true`, no `object-cache.php` drop-in), with a temporary
-gitignored must-use plugin providing a per-request opt-in so that a filter could be turned on for one
-navigation without altering the shipped default for any other. Both arms of every comparison ran on
-the same instance, in the same session, seconds apart.
-
-### The anonymous front end
-
-The homepage and a single post were each loaded twice, once with the shipped default and once with
-`should_load_emoji_detection_script` filtered to true.
-
-| Measurement | Homepage default | Homepage opted in | Single post default | Single post opted in |
-|---|---|---|---|---|
-| HTTP status | 200 | 200 | 200 | 200 |
-| `script[src]` count | **1** | **1** | **2** | **2** |
-| `script[src]` URL list versus the other arm | identical, compared programmatically | identical, compared programmatically | identical, compared programmatically | identical, compared programmatically |
-| inline scripts containing `_wpemojiSettings` | **0** | **1** | **0** | **1** |
-| occurrences of `twemoji` | **0** | **5** | **0** | **5** |
-| `typeof window._wpemojiSettings` | `"undefined"` | `"object"` | `"undefined"` | `"object"` |
-| transfer size | 41,707 B | 55,407 B | 45,189 B | 58,908 B |
-| console messages of any level | **none** | **none** | **none** | **none** |
-| requests with status ≥ 400 | **none** | **none** | **none** | **none** |
-
-The decisive assertion is the third row. The `script[src]` URL list is **identical between the two
-arms on both pages**, compared programmatically rather than by eye, and still identical after the
-opt-in arm's emoji module had finished executing. That is the runtime proof of the claim the change
-rests on: the emoji payload is inline output and never enters the `WP_Scripts` enqueue graph, so
-gating it cannot disturb the dependency system. In the opt-in arm the polyfill ran, reported
-`supports.everything === true`, and never called its own `addScript()`.
-
-Two further checks matter more than they look. First, **the two homepage screenshots are
-byte-identical** — same 99,326 bytes, same MD5, 1280 × 1291 — so opting the payload back in changes
-nothing a reader sees, which is the same statement in reverse: gating it removes nothing a reader
-sees. Second, a case-insensitive sweep for `emoji` in the default homepage returns four matches, and
-all four are accounted for and none is the detection script: the `wp-emoji-styles-inline-css` style
-block, the `img.wp-smiley, img.emoji` selector inside it, that block's `sourceURL` comment, and the
-English word in the post's own prose. The emoji **styles** are still emitted, exactly as the change
-intends; only the detection **script** is gone. The emoji itself renders — the codepoint scan isolated
-one glyph, U+1F600, drawn by the platform's own colour font with zero `img.wp-smiley` or `img.emoji`
-replacements in either arm.
-
-Both default arms were then re-loaded in a **second, verified-empty browser context**, and reproduced
-character for character — `outerHTML.length` of 41,343 and 44,798 exactly, all markers still zero — so
-the zero counts are a property of the server's response and not of client cache state. `document.cookie`
-was empty in every arm and the server set no cookie on any of the four responses. An independent
-`curl` pass outside the browser returned the same marker counts and the same script-source lists on
-all four URLs.
-
-### The authenticated admin
-
-| Measurement | Dashboard, default | Dashboard, filter opted in | Block editor, no opt-in |
-|---|---|---|---|
-| script responses | **40** | **81** | **106** |
-| URLs containing `core-commands` | **0** | **1** | **1** |
-| `wp-core-commands` occurrences in markup | **0** | **3** | **3** |
-| `typeof ( window.wp && window.wp.commands )` | `"undefined"` | `"object"` | `"object"` |
-| `Ctrl+K` opens the palette | **no** | **yes** | **yes** |
-| visible `[role="dialog"]` after `Ctrl+K` | **0** | 1 | 1 |
-| console errors | **0** | **0** | **0** |
-| requests with status ≥ 400 | **none** | **none** | **none** |
-
-The dashboard renders completely on 40 scripts: admin bar, full menu, Screen Options and Help tabs,
-the update notice, the welcome panel, and the Site Health, At a Glance, Activity and Quick Draft
-metaboxes. Interactive controls were exercised rather than assumed — Screen Options expanded and
-collapsed with `aria-expanded` following, and typing into Quick Draft populated the field. No PHP
-notice, warning or fatal text appeared anywhere, with `WP_DEBUG_DISPLAY=true`.
-
-`Ctrl+K` on the gated dashboard is **inert, proven at pixel level**: after the keystroke there were
-zero dialogs, zero palette elements, zero comboboxes, an unchanged `document.body.children.length`,
-`activeElement` still on `body`, `typeof wp.commands` still `"undefined"`, no network request and no
-console output — and the screenshots taken immediately before and after the keystroke are
-**byte-identical, same MD5, 264,748 bytes**. `Meta+K` behaved identically. `Object.keys( window.wp )`
-on the gated dashboard holds 18 entries and contains no `commands`, no `blockEditor` and no
-`components`; not one resource of any type on that page contains even the substring `command`.
-
-The palette is not broken, only relocated to where it is used. With the filter opted in, `window.wp`
-grows to 54 keys, the two bundles `dist/commands.js` and `dist/core-commands.js` load, an admin-bar
-`Ctrl+K` affordance appears, and `Ctrl+K` opens a focused combobox that returns nine live results for
-`settings`. On the **block editor, with no opt-in at all**, the palette opens by default and its own
-command providers are registered: searching `settings` returns eleven results, two of which are of the
-editor-only `Command` kind that exists nowhere else, and searching `paragraph` correctly returns the
-palette's own "No results found." empty state, because the palette indexes commands and navigation
-targets rather than blocks. `Escape` unmounted the palette completely, and the editor remained usable
-afterwards — typing into the title propagated to `wp.data.select( 'core/editor' ).getEditedPostAttribute( 'title' )`,
-updated the header command bar and the sidebar, and enabled "Save draft".
-
-The gate is screen-general, not dashboard-special. Verified server-side on eight admin screens with an
-authenticated session:
-
-| Screen | `<script src>` | `wp-core-commands` | Palette delivered |
-|---|---|---|---|
-| `/wp-admin/` (Dashboard) | 40 | 0 | no |
-| `/wp-admin/?blitzy_optin=palette` | 81 | 3 | yes, by filter opt-in |
-| `/wp-admin/post-new.php` (block editor) | 104 | 3 | yes, by default |
-| `/wp-admin/site-editor.php` (Site Editor) | 97 | 3 | yes, by default |
-| `/wp-admin/edit.php` (Posts list) | 19 | 0 | no |
-| `/wp-admin/options-general.php` | 38 | 0 | no |
-| `/wp-admin/plugins.php` | 21 | 0 | no |
-| `/wp-admin/upload.php` (Media) | 39 | 0 | no |
-
-The block-editor row reads 104 here and 106 in the browser table above, and the difference is
-accounted for rather than averaged: the browser count includes two scripts Gutenberg injects
-dynamically after load, which do not appear in the server-rendered markup. Resource-timing on that
-screen additionally records 140 entries for those 106 URLs, because the editor canvas is an iframe
-that re-requests a subset of them.
-
-The Posts list was additionally confirmed in the browser: the list table renders its two rows and its
-filter links, `typeof wp.commands` is `"undefined"`, and the admin-bar palette node is absent. The
-security direction was confirmed unauthenticated: `/wp-admin/` redirects to the login screen with zero
-palette markers, and `/wp-login.php` and `/` carry none either, so no privileged JavaScript is exposed
-to an unauthenticated visitor.
-
-### Console and network, stated exactly
-
-**Zero console errors on every screen in every arm**, established two independent ways: the browser's
-own console listing including preserved messages, and an interceptor installed before any page script
-ran, hooking `console.*`, `window.onerror` and `unhandledrejection`. Both agreed. The anonymous front
-end produced **no console output at all**, in either arm, including the arm that executes a
-13,272-character inline module and a Web Worker. The admin produced exactly three distinct non-error
-messages, each attributable and each pre-existing:
-
-| Message | Level | Where it appears | Attribution |
-|---|---|---|---|
-| `JQMIGRATE: Migrate is installed with logging active, version 3.4.1` | log | all admin screens | jQuery Migrate's own banner, logged because `SCRIPT_DEBUG=true` serves the unminified build |
-| React DevTools download notice | info | only where React loads | React's development-build banner, present only because `SCRIPT_DEBUG=true` |
-| `useSelect` returns different values warning, `clientIds` | warn | block editor only | traced through its stack to `TemplateContentPanel` in `js/dist/editor.js`, a Gutenberg component in a synced tree this change set does not touch |
-
-**No request returned status ≥ 400 anywhere** — 111 of 111 requests HTTP 200 on the heaviest admin arm.
-Two benign non-200 entries were investigated rather than ignored: the browser's automatic
-`/favicon.ico` fetch returns 302 to the site icon and resolves 200, and a `blob:` URL fetched once by
-the emoji loader is its own Web Worker for the canvas support probe, which is skipped on subsequent
-loads because the result is cached in `sessionStorage`.
-
-### Corrections this runtime pass made to earlier drafts of this section
-
-Runtime measurement corrected two figures that an earlier draft of this section carried in a single
-sentence, and both corrections are kept visible rather than quietly overwritten. The draft stated that the gated dashboard
-"continues to render 43 script responses and its full HTML structure at 73,284 bytes". Measured again
-on the live instance at the time of this pass, those figures are **40 script responses and 60,453
-HTML bytes**; the 43/73,284 pair was correct for the earlier session and is retained in the
-optimization block above as one half of that session's pair. The cause of the drift is the instance's
-own dashboard state, and it is set out in full where the replication is reported. The lesson is the
-one the Measurement Law already states: absolute figures belong to the session that produced them, and
-only same-session pairs may be differenced.
-
-### Diagram render verification
-
-The single Mermaid figure in this report was rendered in a browser rather than eyeballed, because no
-Mermaid parser is installed in this environment. Mermaid **11.16.1** accepted the block through both
-`mermaid.parse()` and `mermaid.render()` with **zero console output and zero failed requests**,
-producing one SVG containing 12 nodes, 10 edges and 2 clusters — exactly the 12 nodes, 10 `-->`
-operators and 2 `subgraph` blocks in the source. All 12 labels reconstructed character for character
-against the source, the `<br/>` tags became real line breaks in every one of them, the em dashes are
-genuine U+2014, and `wp_should_load_command_palette_assets()` renders with its parentheses intact in a
-box the renderer widened to fit rather than truncated. No label overflows its shape, none of the 66
-pairwise node-box tests overlaps, and no node escapes the diagram bounds.
-
-### Other runtime facts
-
-- **Every measured request returned HTTP 200** across all 12 samples in both arms of every A/B, and
-  the authenticated runs rendered the admin bar in both arms (`id="wpadminbar"` present, verified per
-  run).
-- **The REST index returns 108 registered routes** on the running instance with the autoloader active.
-- **Both filters are independent.** Opting one in reproduces the other's gated figures exactly.
-
-### Evidence captured
-
-The browser session saved the following artifacts into an untracked scratch directory in the working
-tree. They are deliberately **not** part of the commit — a repository is not the place for binary
-evidence — and the paths are recorded here so the evidence is traceable within the session that
-produced it:
-
-| Artifact | Path |
-|---|---|
-| Anonymous homepage, default | `blitzy/screenshots/front-anonymous-default.png` |
-| Anonymous homepage, emoji opted in (byte-identical to the above) | `blitzy/screenshots/front-anonymous-emoji-optin.png` |
-| Anonymous single post, default | `blitzy/screenshots/single-post-anonymous-default.png` |
-| Dashboard, default | `blitzy/screenshots/admin-dashboard-default.png` |
-| Dashboard after `Ctrl+K`, unchanged | `blitzy/screenshots/admin-dashboard-ctrl-k-inert.png` |
-| Dashboard, palette opted in | `blitzy/screenshots/admin-dashboard-palette-optin.png` |
-| Block editor with the palette open, no opt-in | `blitzy/screenshots/block-editor-palette-open.png` |
-| Posts list, default, no palette | `blitzy/screenshots/admin-posts-list-default-no-palette.png` |
-| DOMContentLoaded A/B, gated arm | `blitzy/screenshots/admin-dcl-arm-a-default.png` |
-| DOMContentLoaded A/B, opted-in arm | `blitzy/screenshots/admin-dcl-arm-b-palette-optin.png` |
-| Mermaid figure rendered at 1:1 | `blitzy/screenshots/report-mermaid-render.png` |
-| Recording: `Ctrl+K` and `Meta+K` leaving the gated dashboard static | `blitzy/screen_recordings/step1_dashboard_default_ctrlk_metak.webm` |
-| Recording: palette opening and searching with the filter opted in | `blitzy/screen_recordings/step2_dashboard_optin_palette_open_and_search.webm` |
-| Recording: palette in the block editor, `Escape`, and the editor still editing | `blitzy/screen_recordings/step3_block_editor_palette_and_escape_probe.webm` |
-
----
-
-## Quality-gate verification
-
-**Gate 1 — zero test regressions, with no new skips or exclusions.** The suite inventory for this tree,
-counted directly: **1,091** PHPUnit test files under `tests/phpunit/tests/`, **32** QUnit files,
-**15** E2E specs, **12** files in `tests/performance/`, and **3** in `tests/visual-regression/`. The
-change set **adds** coverage rather than relaxing it — 20 new test files, including
-`tests/phpunit/tests/load/wpAutoloadClass.php` and `tests/phpunit/tests/load/bootstrapLoading.php` for
-the autoloader and the deferral, `tests/phpunit/tests/load/wpSiteHealthLoader.php` for the one
-deliberate conditional require, `tests/phpunit/tests/dependencies/commandPalette.php` for the palette
-gate, `tests/phpunit/tests/formatting/emojiArrays.php` for the relocated emoji data,
-`tests/phpunit/tests/user/mapMetaCapMemo.php` for the capability memo,
-`tests/phpunit/tests/performance/serverTimingMetrics.php` for the instrumentation,
-`tests/performance/specs/utils.test.js` for the reporting helpers, and
-`tests/e2e/specs/command-palette.test.js` and `tests/e2e/specs/emoji-detection.test.js` for the two
-new filters end to end. Eight isolated-process probes under `tests/phpunit/data/isolated/` cover the
-cases that cannot be tested in-process, including an object-cache drop-in replacement, so the
-graceful-degradation requirement is verified rather than argued. `phpunit.xml.dist` is configured
-strictly — `convertDeprecationsToExceptions`, `failOnRisky` and `beStrictAboutOutputDuringTests` are
-all enabled — so a deprecation notice or a byte of stray output introduced by any change here would be
-a hard failure rather than a warning.
-
-The suites below were executed for this report, in this environment, through the project's own runners.
-Every figure is the runner's own summary line; nothing is inferred:
-
-| Check | Command | Result |
+and it is stored as `$GLOBALS['_wp_map_meta_cap_memo'][ $user_id ][ $cap ]`, read at
+`capabilities.php:883` and written at `:921`. Three consequences follow directly, each of which an
+earlier and much larger design had to buy with bookkeeping:
+
+- **A mapping that reported a misuse is never stored — by construction.** Several branches call
+  `_doing_it_wrong()`, and that notice is part of the documented behaviour of calling the function
+  incorrectly: it must fire on **every** such call, not only the first. All **12** `_doing_it_wrong()`
+  call sites in the function sit at lines 93, 126, 200, 229, 299, 328, 356, 388, 409, 454, 560 and 716
+  — every one inside a `case` branch, and all of them strictly before the `default:` arm at line 840.
+  A branch that reports a misuse therefore **cannot reach** the memo read at 883 or the write at 921.
+  No `did_action( 'doing_it_wrong_run' )` counter is needed, and there is no window in which one could
+  be wrong. `Tests_User_MapMetaCapMemo::test_a_mapping_that_reports_a_misuse_reports_it_every_time`
+  pins this at its most dangerous point, using core's own ticket-44591 pattern — an argument-less
+  `map_meta_cap( $cap, $user_id )` call, which is exactly the shape the memo *does* admit.
+- **A registration change is honoured at once — by ordering.** Custom post-type meta capabilities are
+  resolved by the `$post_type_meta_caps` lookup at lines 842-844, which **returns before** the memo is
+  ever consulted. A post type registered after a mapping was memoized is therefore picked up on the
+  very next call.
+- **The memo is bounded.** Once it holds **512** mappings for a single user the whole memo is emptied,
+  so a request checking a large number of distinct capability names cannot grow it without limit. No
+  configuration constant gates it, and there is no observability helper: the delivered code adds two
+  reads, one count and one write, and nothing else.
+
+**Measurement**: Behaviour-preserving by construction, and verified as such on the delivered tree:
+`tests/phpunit/tests/user/mapMetaCapMemo.php` passes **144 tests / 375 assertions** (24 methods over 3
+data providers), and the full `--group capabilities` suite — which includes the pre-existing
+`capabilities.php` and `mapMetaCap.php` — reports `OK (933 tests, 3378 assertions)`.
+
+The per-call cost was then measured in isolation, three arms, same method throughout: 2,000 calls per
+pass, 21 passes per arm, 50 warm-up calls discarded, `capabilities.php` swapped to its base blob for the
+base arm and restored byte-identically afterwards. **All three arms returned the identical mapping**
+(`["edit_others_posts","edit_published_posts"]`), which is what makes this a cost comparison rather than
+a behaviour comparison. Because the opcode-cache state moves these numbers materially, both regimes are
+reported rather than one:
+
+| Arm | Median per call, `enable_cli=1` | Median per call, `enable_cli=0` |
 |---|---|---|
-| Full default PHPUnit suite, single site | `npm run test:php -- --no-coverage` | **29,555 tests, 3,543,280 assertions, 0 failures, 0 errors**, 86 warnings, 50 skipped |
-| `rest-api` (less the autosaves suite the config runs last), `option` and `load` directories | `phpunit -c <temporary config>` | **3,710 tests, 17,695 assertions, 0 failures, 0 errors**, 5 warnings, 10 skipped |
-| The 16 suites that bear directly on the claims here, run one file per invocation | `phpunit <file>` ×16 | **1,722 tests, 106,764 assertions**, every file plain `OK` — no skips, no incompletes, no risky tests |
-| End-to-end | `CI=true npm run test:e2e` | 38 tests, **37 passed, 1 failed** — `install.test.js:34` only, diagnosed below |
-| Reporting-helper unit spec | `npm run test:performance -- tests/performance/specs/utils.test.js` | **32 passed** (16 tests × `repeatEach: 2`) |
-| JavaScript type check | `npm run typecheck:js` | **exit 0** |
-| JavaScript lint, the aggregate the precommit task uses | `grunt jshint:corejs` | **exit 0 — 273 files lint free** (grunt 1, tests 32, themes 45, core 97, media 98) |
-| PHP coding standards over the changed PHP | `phpcs <23 changed files in ruleset scope>` | **0 errors**, 28 warnings — and the same two files at the base commit produce the identical 0 errors / 28 warnings, so none is new |
+| Base (no memo code at all) | **2.618 µs** | **2.650 µs** |
+| Memo present but disabled | **4.419 µs** (+1.800) | **4.800 µs** (+2.150) |
+| Memo present and enabled, repeated key | **1.117 µs** (−1.501) | **1.314 µs** (−1.336) |
 
-**The skips and warnings are all pre-existing, and that is verified rather than assumed.** Parsing the
-run's own `tests/phpunit/build/logs/junit.xml` and checking each file against
-`git diff <base>..HEAD --name-only`, **all 50 skipped tests and all 86 warnings live in test files this
-change set never touched** — the largest groups being `tests/phpunit/tests/theme.php` (15 skips),
-`tests/phpunit/tests/icons/wpRestIconsController.php` (5) and
-`tests/phpunit/tests/image/editorImagick.php` (3). Every one of the 86 warnings is a PHPUnit 10
-forward-compatibility notice about the `expectWarning` family — 35 for `E_DEPRECATED`, 24 for
-`E_ERROR`, 15 for `E_STRICT`/`E_NOTICE` and 12 for `E_WARNING`. Not one is a WordPress deprecation and
-not one is stray output, which is what the strict configuration above would have converted into a
-failure.
+*These three arms were measured against a heavier memo implementation than the one delivered — the arm
+labelled "disabled" was disabled through a configuration constant that the delivered code does not
+have, and its guard work included building a composite key from the blog ID, three registry counts and
+the `$super_admins` list. The delivered guard is the five-condition test quoted above and the delivered
+hit path is one nested `isset()` plus a return. The figures are therefore **bounds, not point
+estimates**, and both bounds point the same way: the delivered miss costs **at most** the +1.800 µs
+shown, and the delivered hit saves **at least** the 1.501 µs shown, so the real break-even share is
+**better** than the figures below. They are retained rather than deleted because the direction and
+order of magnitude are what the conclusions rest on, and both survive.*
 
-**On added skips, stated plainly because the diff contains some.** The change set adds 14
-`markTestSkipped()` calls, all of them in `tests/phpunit/tests/cache.php`, all with the same reason:
-the new per-group counter assertions cannot hold when an external object cache drop-in has replaced
-`WP_Object_Cache` wholesale. They guard **new** assertions and relax **none** — no pre-existing test
-acquired a skip, a group exclusion or a weakened assertion. In this environment none of them fired:
-`cache.php` ran 50 of 50 tests. The three pre-existing PHPUnit files the change set modifies are
-purely additive — `tests/phpunit/tests/cache.php` +462, `tests/phpunit/tests/comment/getCommentCount.php`
-+109 and `tests/phpunit/tests/formatting/emoji.php` +619, with **zero lines removed** from any of them.
-`phpunit.xml.dist` is untouched, and the one change to `tests/phpunit/multisite.xml` corrects that
-file's JUnit log path to be relative to its own directory; no group exclusion was added anywhere.
+So a **hit saves 1.501 µs** and a **miss costs 1.800 µs** in the warm regime, putting break-even at
+**≈45.5 % distinct keys**; in the parse-dominated regime a hit saves 1.336 µs and a miss costs 2.150 µs,
+putting break-even at **≈38.3 %**. Below that share the memo pays, above it the memo costs. The regime
+dependence is the reason a single break-even figure is not quoted: *an earlier draft gave one number,
+42.7 %, without naming a regime, and the true value straddles it.* Note also that the "disabled" arm is
+*slower* than base in both regimes — the guard work itself is not free, which is why that arm exists in
+this table at all.
 
-**The single end-to-end failure is a harness timing race, and the underlying behaviour was verified
-directly.** `tests/e2e/specs/install.test.js` rewrites `wp-config.php` to change `$table_prefix` in
-`beforeEach`, then asserts within 5 seconds that `/` redirects to the installer. The PHP container runs
-`opcache.enable=On` with `opcache.validate_timestamps=On` and `opcache.revalidate_freq=2`, so the
-rewritten `wp-config.php` is not necessarily visible to PHP-FPM when the assertion runs. Two
-independent observations show the code path is intact. First, after dropping 12 residual `wp_e2e_*`
-tables left by an earlier run of the same spec, it re-ran as *flaky* — failing the first attempt and
-**passing on retry**. Second, a direct probe: setting the prefix to an unused value, waiting past the
-revalidation window and requesting `/` returns **HTTP 302 with `Location: …/wp-admin/install.php`**,
-so the not-installed redirect works exactly as before the bootstrap deferral. `wp-config.php` was
-restored and checksum-verified identical afterwards, and the table residue was removed. This is the
-same class of hazard as rule 3 of the Measurement Law, arriving from an entirely different direction.
+Per-path counters were then instrumented on real requests, and the result is not what the plan's rationale for this
+change anticipated:
 
-**What was not run in this pass, and why.** QUnit was not re-run: the change set contains **zero**
-changes under `src/js`, which is the tree QUnit exercises, and running it requires a production build
-followed by a mandatory development rebuild. The visual-regression suite was not run because this
-checkout has no committed snapshots, so it can neither pass nor fail meaningfully — that gap is listed
-under *Verification-coverage gaps*. The Multisite configuration and a fresh 18-context performance-suite
-comparison were also not re-run in this pass; the saved suite artifact is used only for the
-regime-independent metrics described under *Evidence provenance*.
+| Request path | Memoizable calls | Hits | Misses | Net effect |
+|---|---|---|---|---|
+| Front end, logged **out** | **0** | 0 | 0 | **no effect whatsoever** |
+| Front end, logged **in** | **0** | 0 | 0 | **no effect whatsoever** |
+| `/wp-admin/` (Dashboard) | 29 | 6 | 23 | **≈ −32 µs (a net loss)** |
+| `/wp-admin/edit.php` (post list) | 181 | 140 | 41 | **≈ +136 µs** |
+| `/wp-admin/post.php?action=edit` | 32 | 25–26 | 6–7 | **≈ +26 µs** |
 
-**Gate 2 — performance proof through the project's own comparison tooling.** Every new metric flows
-through the existing pipeline unchanged: emitted as a `Server-Timing` entry by the mu-plugin, converted
-to a JavaScript key by `camelCaseDashes()`, formatted by `formatValue()`, and compared by
-`tests/performance/compare-results.js`, which prints
-`Metric | Before | After | Diff abs. | Diff % | STD | MAD`. The saved comparison in `artifacts/`
-demonstrates the whole path working across 18 contexts and 40 samples per metric. Where that artifact's
-pairs were not regime-compatible they were replaced by same-regime A/B runs using the identical
-metrics from the identical instrumentation, and the substitution is disclosed rather than smoothed
-over — see *Evidence provenance* and *Measurement integrity*.
+The counts were read from an observability helper at `shutdown`, and each path was requested
+twice: every path returned identical counters on both requests except post-edit, which moved by one
+between hit and miss. The net effects apply the warm-regime constants above (a hit saving 1.501 µs, a
+miss costing 1.800 µs), so `/wp-admin/` is 6 × 1.501 − 23 × 1.800 ≈ −32 µs and the post list is
+140 × 1.501 − 41 × 1.800 ≈ +136 µs.
 
-**Gate 3 — value documentation for each change.** This document. Eight landed optimizations, eight
-entries, each with the measurement that justified it and the measurement that proved it. No landed
-change lacks an entry, and no entry describes work that did not land.
+*Two notes on how this table survives reconciliation. First, the helper that produced the counts is not
+part of the delivered code, so these are recorded counts from the measured arm rather than something a
+reader can re-derive; what they measure, however, is the **call pattern of each screen**, which is a
+property of WordPress and not of the memo's internals, so the shape of the finding stands. Second, the
+measured arm also reported a `flushed` counter sitting at 74 per request, attributed to invalidation as
+options and roles settled during bootstrap. **The delivered memo has no invalidation machinery at all**
+— for the reason given above, the mapping it stores cannot go stale — so that number describes work
+the delivered code never does. It is withdrawn rather than restated, and its removal only improves the
+per-path arithmetic.*
 
-**Gate 4 — no speculative optimization.** Every `Bottleneck` field above contains a measurement taken
-before the change, from a named instrument in a named regime. The discipline also shows in what is
-*not* here: three candidate workstreams were dropped once measured. The N+1 and batch-priming
-workstream was dropped because core already primes posts, post meta, terms, term meta, authors,
-parents, thumbnails and users on both the front-end and REST paths. Webpack code splitting was dropped
-because it is structurally impossible — `js/dist` is copied in by `tools/gutenberg/copy.js:L51`, not
-built by the core webpack config. The customizer JavaScript tree was dropped because it is enqueued
-from one screen-scoped call site at `src/wp-admin/customize.php:L125` and appears nowhere in the
-measured admin payload. A fourth candidate, priming bootstrap options, was dropped on direct
-measurement: a `SAVEQUERIES` probe shows the entire bootstrap issues **3 queries**, of which one is
-already the batched autoload read and one is already an `option_name IN (…)` multi-read, leaving a
-single theme-mods read that no bootstrap primer could reach. And the admin JavaScript target was
-**re-aimed** by measurement, from the file the brief named — `common.min.js`, 7,820 gzipped bytes,
-0.75 % of the payload — to the command palette closure at 91.2 %.
+**Value**: stated for exactly what it is.
 
-**Gate 5 — minimal diff.** Each optimization is one independently revertible change, which is what
-made the isolation arms possible: every arm is the base tree plus exactly one file or file group.
-There are **no file deletions** anywhere in the change set, so no old-files manifest needed updating.
-No refactoring, style change or unrelated cleanup was bundled. The clearest illustration is what was
-excluded on this ground: `src/wp-admin/includes/ajax-actions.php` is **5,647 lines** containing **94**
-`wp_ajax_*` handlers, and deferring them would require wrapping each handler body — roughly **3,496
-lines of whitespace-only re-indentation** for a file that is off the front-end critical path entirely.
-It was left alone.
+- **On the post list and the post edit screen it pays**: those screens render list tables and row
+  actions that ask the same capability question about the same object repeatedly, and there the memo
+  is worth roughly **+136 µs** and **+26 µs** respectively.
+- **On the Dashboard it is a small net loss** of about **32 µs**, because that screen's capability checks
+  are mostly distinct keys (23 misses against 6 hits) and so pay the miss cost without earning the hit
+  saving.
+- **On the front end it does nothing at all.** Zero memoizable calls were recorded on a front-end
+  request whether logged in or logged out. **This directly refutes the plan's stated rationale for this
+  change** — a plan-only passage that justifies it as a front-end TTFB and per-request memory
+  improvement, beyond the tracked one-line mandate at `docs/technical-specifications.md:532`. It is neither.
+  No part of the front-end TTFB or memory result reported anywhere in this document is attributable to
+  this change, and the canonical front-end figures would be the same without it.
+- **The documented filter contract is preserved exactly**: any site filtering `map_meta_cap` bypasses
+  the fast path entirely and observes unchanged behaviour, and a mapping that reports a misuse keeps
+  reporting it on every call.
 
-**Gate 6 — backward compatibility.** Each mechanism was chosen for reversibility, and each has
-measured evidence:
-
-| Guarantee | Mechanism | Evidence |
-|---|---|---|
-| `remove_action()` keeps working for the palette | the gate lives inside the callback; `default-filters.php:L605` is untouched, and `doing_action()` at `script-loader.php:L3565` limits the gate to the hooked invocation | palette assets still enqueue on a direct call; documented at `script-loader.php:L3538-L3546` |
-| `remove_action()` keeps working for emoji | the eleven registrations are untouched; core's own opt-out at `edit-form-blocks.php:L42` is unaffected | `<script src>` count unchanged in both arms |
-| Filtered capability mapping is never cached | `_wp_map_meta_cap_policy_filter_registered()` at `capabilities.php:L1270` bypasses the memo entirely while a callback is present | memo write is guarded at `:L946-L947` |
-| Plugins reading the cache counters keep working | `$cache_hits` (`:L41`) and `$cache_misses` (`:L49`) unchanged; `$cache_group_stats` (`:L57`) is additive | totals reconcile with the per-group sums in every run |
-| REST API surface unchanged | controller classes are resolved by the autoloader at dispatch; registration still runs in full inside `create_initial_rest_routes()` | **108 routes** on the live instance |
-| Output unchanged | — | **byte-identical** responses for arms W1, W3, C1 and U1; and for the full change set after normalizing one per-request token and the intended emoji delta |
-| Comment and update helper contracts unchanged | grouped results mapped back to the same status keys and `intval`-cast before return; the three transient reads themselves untouched | byte-identical admin and front-end HTML in arms C1 and U1 |
-| Behaviour degrades gracefully with no object cache | measured *with* no object cache — `wpExtObjCache` reads `no` in every figure in this report — and an isolated drop-in-replacement probe covers the opposite case | `tests/phpunit/data/isolated/object-cache-dropin.php` |
-
-**Gate 7 — security invariant.** No deferral places an authentication or authorization primitive behind
-a lazy load: `wp_authenticate`, `check_ajax_referer`, `wp_verify_nonce`, `current_user_can` and
-`auth_redirect` all remain in eagerly loaded files on every request path, and the capability memo
-changes when a mapping is *recomputed*, never whether it is *checked* — the memo is keyed on the user
-and object and is reset when the roles or user meta a mapping depends on change
-(`capabilities.php:L1385`, `:L1413`, wired at `:L1964` and `:L1982`). The command-palette gate only
-ever narrows delivery: it removes privileged administrative JavaScript from screens that do not use
-it, and cannot cause an unauthenticated or lower-privilege context to receive anything it did not
-receive before. Deferring the REST controller classes does not defer their permission callbacks, which
-are registered inside `create_initial_rest_routes()` and therefore run in full on any dispatched REST
-request — confirmed by the unchanged 108-route index.
+Given that accounting, the defensible reason to keep this change is that constraint C6 mandates it
+(`docs/technical-specifications.md:532`) and it is
+a measured win on the two admin screens where capability checks actually repeat — not that it moves any
+of the six targets. It moves none of them.
 
 ---
 
-## Corrections to prior in-repository documentation
+## Per-group object cache hit/miss counters
 
-Two documents in `docs/` predate this work and describe an earlier plan for a similar mission:
-`docs/technical-specifications.md` (1,049 lines) and `docs/project-guide.md` (541 lines). Neither was
-modified by this change set, and neither was used as a source of fact here. They are cited by full
-path throughout, never by bare section number, because the first contains its own similarly numbered
-plan and a bare number would be ambiguous.
+**Bottleneck**: Cache effectiveness could be measured only in aggregate.
+`src/wp-includes/class-wp-object-cache.php` exposed `$cache_hits` and `$cache_misses` as public
+integers — **global counters with no per-group breakdown** — so "which cache group is missing" was
+unanswerable, and the query-count target depends on exactly that question.
 
-Fourteen factual claims in `docs/technical-specifications.md` are contradicted by direct measurement.
-They are recorded here because several of them, if trusted, would have directed this work at the wrong
-files — most sharply the admin JavaScript claim, which pointed at 0.75 % of the payload instead of
-91.2 %. **The verified column is authoritative; the claimed column is reproduced only to identify what
-was corrected.**
+**Root Cause**: The counters predate the group-aware cache API and were never extended when groups
+arrived.
 
-| Claim in `docs/technical-specifications.md` | Verified value |
+**Change**: Added per-group hit/miss accumulators alongside the existing globals and surfaced them
+through `stats()`. The public `$cache_hits` and `$cache_misses` integers are untouched, because plugins
+read them directly.
+
+Review found the first implementation added unconditional work to the hottest method in the object
+cache, and it was corrected. Collection is now **opt-in and bounded**:
+
+- `$track_group_stats` defaults to **`false`**. Nothing is collected on a normal request; `get()` pays
+  a single boolean test. A diagnostic session opts in explicitly with
+  `wp_cache_get_object()->track_group_stats = true;`.
+- `$max_tracked_groups` caps the number of distinct groups at **250**, and a bounded register records
+  the *names* of groups that arrived after the cap so the omission is visible rather than silent. A
+  request that touches an unbounded number of dynamic group names therefore cannot grow the arrays
+  without limit — the failure mode the cap exists to prevent.
+- `stats()` reports the per-group breakdown only when tracking was enabled, and says so plainly when it
+  was not, so an empty breakdown can never be misread as "no cache activity".
+
+**A distinction the earlier draft of this report got wrong, corrected here.** The harness metrics
+`wpCacheHits` and `wpCacheMisses` are the object cache's **pre-existing global** `$cache_hits` /
+`$cache_misses` integers, read by `server-timing.php`. They are **not** the per-group counters
+described in this entry, and the harness never reads the per-group counters at all — it could not,
+since tracking is off by default. The two are independent: the observability entry above adds the
+*global* counters to the Server-Timing header; this entry adds an *opt-in per-group* breakdown to
+`stats()` for diagnosis.
+
+**Measurement**: `tests/phpunit/tests/cache.php` passes **54 tests / 166 assertions**, covering the
+opt-in default, the cap, the omission register, and that `$cache_hits` / `$cache_misses` are unchanged.
+Because tracking is off by default there is no per-request cost to measure on a normal request: the
+change adds one boolean test per `get()`, on a method reached roughly **2,900 times** on the canonical
+front-end request and **1,110 times** on an admin request.
+
+Those two call counts are derived rather than sampled, and the derivation is exact. `get()` increments
+`$cache_hits` on a hit (`class-wp-object-cache.php:446`) and `$cache_misses` otherwise (`:460`), on
+every path except an invalid key — `is_valid_key()` (`:209`) rejects only a non-integer, non-string or
+empty-string key — and `get_multiple()` is a loop over `get()`, so it contributes one increment per key.
+**`$cache_hits + $cache_misses` is therefore the exact number of `get()` calls.** Summed from the
+canonical after-arm artifact that gives **2,898** for Homepage tt5 en_US and **1,109** for Admin en_US;
+an independent in-request probe on the same context read **2,894**. *An earlier draft of this report
+stated 589 and 731. Those values match no artifact in the manifest and are withdrawn; they understated
+the reach of the method by roughly 5× and 1.5× respectively.* The conclusion is unaffected — a single
+`false` boolean test at even 2,900 calls is unmeasurable against a request of this size — but the
+premise is now auditable from the artifacts rather than asserted.
+
+The global counters, which *are* in the harness, moved as follows on the canonical pair — and the
+movement belongs to the palette gate, not to this change: Admin en_US **1,006.5 → 975.5 hits
+(−3.08 %)** and **135.5 → 131.5 misses (−2.95 %)**; front-end scenarios **−0.12 % to −0.34 % hits** and
+**0.00 % misses** in every one of the sixteen.
+
+Graceful degradation verified in the condition that matters: with the drop-in absent — the default
+here, since `src/wp-content/object-cache.php` is gitignored and provisioned only by CI — the reporter
+falls back to core's own integers and emits **zero** notices.
+
+**Value**: Turns cache behaviour from an aggregate number into a per-group diagnosis *when a developer
+asks for it*, at no cost to a request that does not. It is how the palette gate's secondary effect — 31
+fewer cache lookups per admin page, from no longer registering dozens of script and style handles —
+became attributable. It is a diagnostic capability, and it is claimed as nothing more: it moves none of
+the six targets, and the governing plan scopes it as cache-layer visibility rather than as an
+optimization (`docs/technical-specifications.md:19`).
+
+---
+
+## Grouped comment-status counts — WITHDRAWN
+
+> **This optimization is not in the delivered change set.** `src/wp-includes/comment.php` ships
+> **byte-identical to base** (`git rev-parse HEAD:src/wp-includes/comment.php` equals the base blob), and
+> `tests/phpunit/tests/comment/getCommentCount.php` is likewise back to pristine core coverage. It was
+> withdrawn under gate 4 of the governing plan — no speculative optimization — because the query
+> reduction it delivers is an **admin-path** reduction, and the plan's target is expressly
+> *"DB queries per front-end page load"*. On an anonymous front-end request `get_comment_count()` is
+> never reached, so the change moved the targeted metric by exactly **0.00 %** while modifying a
+> hook-sensitive query path used by every comment screen. The section is retained below, struck through
+> in effect rather than deleted, because the measurement is sound and the analysis is the reason a
+> future attempt should be scoped to the admin target instead. **Nothing in the summary table depends
+> on it.**
+
+**Bottleneck**: `get_comment_count()` requested five status counts separately. On an authenticated
+front-end request or Dashboard request that renders the admin bar, that meant five
+`WP_Comment_Query` count queries over the same comment rows: approved, moderation, spam, trash and
+post-trash.
+
+**Root Cause**: Each status was historically expressed as an independent `get_comments()` call even
+though every row belongs to exactly one `comment_approved` value and SQL can return all five totals
+with one `GROUP BY`.
+
+**Change**: `src/wp-includes/comment.php` now performs one grouped query and maps its result back to
+the unchanged public return shape. The result uses the existing `comment-queries` cache group and
+the normal comment last-changed salt. The old per-status path remains intact whenever
+`parse_comment_query`, `pre_get_comments`, `comments_pre_query` or `comments_clauses` has a callback,
+because those hooks are the documented way to change the counted population.
+
+**Measurement**: With both tracked measurement mu-plugins installed and a successful HTTP 202 cache
+reset before each sample, ten authenticated front-end requests measured **25 → 21 queries** when
+only the pre-change `comment.php` was substituted: exactly four queries removed. Dashboard requests
+measured **31 → 27**, also exactly four removed. The isolated PHPUnit coverage in
+`tests/phpunit/tests/comment/getCommentCount.php` verifies the grouped result, cache invalidation and
+the hook-sensitive fallback; the full single-site and Multisite suites both pass.
+
+**Value**: Four fewer database round trips on every request that asks for the comment totals — which
+is every admin page and every authenticated request that renders the admin bar — without bypassing any
+query hook. On an anonymous front-end request the function is not reached, so the saving there is
+**zero**; see the target-table note on row 5.
+
+---
+
+## Batched update-transient reads — WITHDRAWN
+
+> **This optimization is not in the delivered change set.** `src/wp-includes/update.php` ships
+> **byte-identical to base**. It was withdrawn for the same reason as the section above: the two
+> queries it removes are removed from *authenticated* requests that render the update count, and the
+> plan's target names the front-end page load, where `wp_get_update_data()` is not reached. The
+> measurement is retained for the same reason — it correctly scopes a future admin-targeted attempt.
+
+**Bottleneck**: `wp_get_update_data()` reads the core, plugin and theme update site transients while
+building the admin-bar update count. Those three special transients have no timeout row, so
+`get_site_transient()` does not run its usual timeout/value priming and each value was fetched
+separately when no persistent object cache was present.
+
+**Root Cause**: The capability checks were interleaved with three independent transient reads, even
+though the function already knew up front whether any update type was visible to the current user.
+
+**Change**: `src/wp-includes/update.php` computes the three capability booleans first and primes
+`_site_transient_update_core`, `_site_transient_update_plugins` and
+`_site_transient_update_themes` together with `wp_prime_site_option_caches()`. The primer is skipped
+when an external object cache is active, where the site-transient cache group already avoids option
+queries and priming the database would add work.
+
+**Measurement**: In the same ten-sample cold-compile A/B, substituting only the pre-change
+`update.php` moved authenticated front-end requests **23 → 21 queries** and Dashboard requests
+**29 → 27**: two database round trips removed in each context. The complete single-site, Multisite
+and targeted integration suites pass with the change.
+
+**Value**: Two fewer option-table queries on every authenticated request that renders the update count.
+
+**The combined query result, and why both halves were withdrawn.** As measured, grouped comment counts
+removed exactly 4 queries and batched transient reads removed exactly 2, so the two together removed
+**exactly 6 queries** from any request that renders the admin bar's comment and update counts — Admin
+en_US **53.5 → 47.5** and Admin de_DE **54 → 48**, i.e. **−11.21 %** and **−11.11 %** on this
+content-loaded install.
+
+But the governing plan's target is **"DB queries per front-end page load ≥15 % reduction"**
+(`docs/technical-specifications.md:911`), and on the front end the
+measured reduction is **0.00 % in all sixteen theme×locale scenarios, logged out**. Neither of these
+functions is reached on an anonymous front-end request. An earlier draft of this report satisfied the
+target row by measuring an *authenticated* front-end request instead (27 → 21, −22.22 %). That was a
+substituted scenario and the substitution is withdrawn: **row 5 of the target table is reported as
+failed.**
+
+That failure is the reason both changes were then withdrawn from the change set rather than merely
+re-labelled. Under gate 4 an optimization has to address the bottleneck the plan names; under gate 5 it
+has to be the minimum change that does so. Neither of these moved the named metric at all, and each
+modified a hook-sensitive query path — `comment.php`'s five-status count and `update.php`'s transient
+priming — whose behaviour every comment screen and every update check depends on. Carrying that risk
+for 0.00 % against the target is not a trade the gates permit, so **both files ship byte-identical to
+base** and **no query reduction is claimed anywhere in this report**. The 6-query admin reduction is
+real and remains available; it is recorded in the backlog as a properly-scoped admin-path opportunity
+rather than as a delivered result.
+
+---
+
+## Bootstrap option-priming candidate rejected on measurement
+
+**Bottleneck hypothesis**: A bootstrap call to `wp_prime_option_caches()` attempted to batch
+`wp_enable_real_time_collaboration` and `site_logo` before their possible reads.
+
+**Root Cause**: The hypothesis assumed both names would otherwise cause independent uncached
+lookups. On a normal installed database the collaboration option is autoloaded, while `site_logo`
+is context-dependent and is not read on most admin requests.
+
+**Change**: The candidate priming block was removed from `src/wp-settings.php` after final
+same-regime validation. This is an evidence-driven rejection, not an omitted optimization.
+
+**Measurement**: With the block present, the authenticated front end stayed at **21 queries** and
+Admin used **28**. Without it, the same ten-sample medians were **21** and **27**. It delivered no
+front-end saving and added one query to Admin.
+
+**Value**: Removing the speculative primer restores one admin query and keeps the production tree
+aligned with the measurement-first rule. It also prevents the valid reductions above from being
+partly hidden by an unrelated bootstrap regression.
+
+---
+
+## Correctness work required by the deferral
+
+Three defects were found by testing the deferral rather than by reading it, and each is recorded here
+because each one is a hazard that any similar change would meet.
+
+**`WP_Site_Health` had to remain resolvable on every request path.** The class was constructed only
+under `if ( is_admin() || wp_doing_cron() )`. That predicate is unavailable at bootstrap time on the
+paths that matter: `wp-cron.php` defines `DOING_CRON` *after* `wp-settings.php` has finished;
+`ALTERNATE_WP_CRON` runs due events inside an ordinary front-end request; and WP-CLI dispatches from a
+bootstrap that is neither admin nor cron. The consequence was measured, not theorised — the weekly
+`wp_site_health_scheduled_check` fired with **zero** handlers instead of one, silently retiring the
+check. Construction is now unconditional, costing exactly **+1 file per request**, and a
+bootstrap-mode matrix confirms `has_action()` returns 1 in all five modes where it previously returned
+0 in three of them. The "defer it and keep the handler" goal proved impossible without changing
+documented behaviour, and that impossibility is documented in the source itself.
+
+**`wp-admin/includes/plugin.php` must stay eagerly required.** Commit `b67c76ebc6` (\[59488\],
+#62244) made it a direct `require` *precisely because* "other functions from that file are often used
+by plugins without necessarily checking whether they are available, easily causing fatal errors."
+Deferring it reintroduces exactly the fatals that ticket fixed. It also holds procedural functions,
+not classes, so a class map cannot reach it in any case. Retained, with the rationale recorded in
+source. See the backlog for the standing reconciliation note.
+
+**Case-insensitive lookup.** Covered under the autoloader entry above; the failure mode was that
+`class_exists()` returned `false` for a case variant of a deferred class name.
+
+---
+
+## Measurement integrity: defects that had to be removed before comparison
+
+The first baseline run reported **740 passed / 2 failed**, both in `admin.test.js` for the `de_DE`
+locale. The cause was environmental, not a regression: this container cannot complete outbound TLS to
+`api.wordpress.org` inside WordPress's 3-second budget, so `wp_version_check()` calls
+`wp_trigger_error()` (`src/wp-includes/update.php:249`; likewise `:475` and `:761`), which becomes a
+`trigger_error()` that `WP_DEBUG_DISPLAY` prints into the response body. The harness's
+`admin.visitAdminPage()` treats any error text in page content as a hard failure, and the second
+assertion failure (`expected 20 received 0` samples) was downstream of the same throw.
+
+Left in place, this would have made every admin comparison non-deterministic. It was neutralised with
+a gitignored control that short-circuits `pre_http_request` for `api.wordpress.org` only, returning a
+well-formed "nothing to report" payload shaped per endpoint — reproducing locally the condition CI
+already has, where `.org` is reachable and these checks emit nothing. It was applied **identically to
+both code states**, so it cannot bias the delta; it removes a shared source of variance and a shared
+failure mode. The original controlled source A/B then ran **742 passed / 0 failed** in both states.
+
+This is recorded because a two-test flake in a 742-test suite is exactly the kind of noise that gets
+waved away, and waving it away here would have meant reporting admin numbers drawn from runs where
+one of the twenty iterations threw.
+
+Reconciliation then found six further instrument defects. Each one, left in place, would have let a
+misleading number be reported as a result — which is why they are listed individually rather than
+summarised.
+
+1. **The saved baseline workflow did not install `clear-cache.php`**, so its `/?clear_cache` navigation
+   returned 200 and left OPcache warm. Both arms of the canonical pair now install both tracked
+   mu-plugins, and all three specs require HTTP 202 before every measured request.
+2. **The front-end result objects did not declare the new Server-Timing metrics**, so values such as
+   `wpDbQueries` accumulated across theme and locale buckets — the `twentytwentyfive`/`en_US` baseline
+   contains 140 query samples per repetition rather than 20. The specs now reset every declared metric
+   and assert each array has exactly `TEST_RUNS` samples before the reporter attaches it.
+3. **The comparator divided by the wrong value.** `percentage` was computed as `delta / after`, which
+   inflates every reduction. It now divides by the before value (`compare-results.js:416`), and the
+   change moves the canonical file-count figure from −27.05 % to **−21.29 %** — the difference between
+   a number that flatters the work and one that reports it.
+4. **The comparator printed figures it had no right to print.** A missing baseline, a scenario present
+   in one artifact and not the other, a metric key mismatch, a sample-count or cardinality mismatch,
+   and — most importantly — an **interpreter-regime mismatch** are now all fatal. A pair taken across
+   two regimes reports the regime rather than the change, so the comparator refuses to report it at
+   all. A deliberately missing baseline requires the explicit `PERFORMANCE_ALLOW_MISSING_BASELINE`
+   opt-in, which is set only in the two CI pipelines whose baseline build is conditional.
+5. **The reporter emitted results for runs that had failed.** It now writes nothing unless
+   `'passed' === result.status`, so an incomplete run cannot be mistaken for a measurement, and it
+   stores repository-relative spec paths rather than absolute ones. The specs also had their `afterAll`
+   hooks reordered to validate (immutability and cardinality) → attach → reset in a `finally`, so a
+   validation failure can no longer publish a partial payload or leak state into the next scenario.
+6. **The `opcache-enabled` metric reported activation state rather than configuration**, which made the
+   heaviest scenario unmeasurable under defect 4's own regime check. Diagnosed, quantified (0 of 40
+   serial cycles versus 56 of 60 concurrent ones) and fixed; see the observability entry above.
+
+An authenticated storage state was also being written into the published artifacts directory. It was
+relocated to `.cache/performance-storage-states/`, a `global-teardown.js` now deletes it after every
+run, the retained copy was removed, and all admin sessions on the instance were destroyed.
+
+The repaired suite passes **786 tests / 0 failed** on the measured tree
+(`R04-performance-final-head.log`), and both canonical artifacts show the shape it is supposed to
+produce: 18 result entries, two repetitions each, every metric series exactly 20 samples — 788 series per
+artifact, counted directly from the JSON (`R18-artifact-cardinality.log`).
+`tests/performance/compare-results.js` exits 0 and produces all 18 comparison tables, with the
+interpreter regime asserted identical across the pair before a single figure is printed
+(`R05-compare-results-canonical.log`). *An earlier draft said the 786-pass result was "reproduced in
+all three canonical runs"; only one full-suite run has a retained console log, so the pass count is
+claimed from that run and the per-arm claim is made from the artifacts instead, which is what the
+artifacts can actually attest.*
+
+---
+
+## Why four targets are not met
+
+Each unmet target is accounted for below by measurement, with the governing constraint named for
+every blocked pool. Nothing here is a judgement that a target was unreasonable; it is a statement of
+what the remaining distance consists of, and in two cases an admission that the governing plan's own premise for
+the target did not survive measurement.
+
+### Files loaded: −21.29 % against ≥30 % (canonical), −22.52 % at best
+
+The reduction was attributed directly rather than argued. A probe dumping `get_included_files()`
+grouped by directory was run on the canonical anonymous request in both code states, swapping **only**
+`src/wp-settings.php`, with php-fpm restarted between them. Base **511** files, final **402**, delta
+**−109** — reproducing the harness's 512 → 403 exactly, offset by the harness's own two mu-plugins.
+
+| Bucket | Base | Final | Δ |
+|---|---|---|---|
+| `wp-includes/rest-api/` | 57 | **0** | **−57** |
+| `wp-includes/*.php` (root) | 186 | 161 | −25 |
+| other `wp-includes` subdirectories | 38 | 31 | −7 |
+| `wp-includes/html-api/` | 14 | 7 | −7 |
+| AI client (`ai-client/` + `php-ai-client/`) | 19 | 14 | −5 |
+| `wp-includes/l10n/` | 5 | 1 | −4 |
+| `wp-includes/Requests/` | 5 | 3 | −2 |
+| `wp-includes/sitemaps/` | 9 | 8 | −1 |
+| `wp-admin/` | 2 | 1 | −1 |
+| `wp-includes/blocks/` | 89 | **89** | **0** |
+| `wp-includes/block-supports/` | 22 | **22** | **0** |
+| `wp-includes/widgets/` | 20 | **20** | **0** |
+| `wp-includes/block-patterns/` | 11 | **11** | **0** |
+| `wp-includes/build/` | 7 | **7** | **0** |
+| `wp-content/` (bundled theme) | 6 | **6** | **0** |
+| entry points / `wp-config.php` | 6 | **6** | **0** |
+| `wp-includes/style-engine/` | 5 | **5** | **0** |
+| `wp-includes/fonts/` | 5 | **5** | **0** |
+| `wp-includes/pomo/` | 5 | **5** | **0** |
+| **Total** | **511** | **402** | **−109** |
+
+The REST cluster went to **exactly zero** on a front-end request — the single largest contribution, and
+a clean confirmation of the deferral's premise. Everything the change set could reach, it reached.
+
+Why the ten zero-delta buckets stay:
+
+| Bucket | Files | Why it cannot be deferred | Governing constraint |
+|---|---|---|---|
+| `wp-includes/blocks/` | **89** | Gutenberg-synced: 1 tracked `.php` against 87 on disk. `require-dynamic-blocks.php` is untracked, headed "autogenerated by `tools/gutenberg/copy.js`, do not change manually", and `blocks/index.php:22-23` requires it **at file scope**, pulling the dynamic-block render files into every request. | **C5** (`docs/technical-specifications.md:329`) |
+| `wp-includes/build/` | **7** | Gutenberg-synced; 0 tracked files; headed "Auto-generated by build process." | **C5** (`docs/technical-specifications.md:329`) |
+| `wp-includes/block-supports/` | **22** | Declare functions *and* register at file scope; an autoloader is never asked to resolve a function. | **C9** (`docs/technical-specifications.md:857`) |
+| `wp-includes/widgets/` | **20** | `wp_widgets_init()` instantiates every widget at `init` on every request, and `functions.php:5453` `require_once`s `default-widgets.php` from inside it. Measured saving from deferring: **0 files** — which is why the 20 mapped widget entries are reported as inert above. | **Gate 6** |
+| `wp-includes/block-patterns/` | **11** | Each file `return`s an array; the lazy `filePath` API needs files that *output* markup — a rewrite of all 11. | **Gate 5** |
+| `wp-includes/pomo/`, `style-engine/`, `fonts/` | **15** | File-scope requires and function holders, reached on every request. | **C9** (`docs/technical-specifications.md:857`) |
+| `wp-content/` | **6** | Bundled-theme boundary. | **C1** (`docs/technical-specifications.md:845-859`) |
+| Entry points, `wp-config.php` | **6** | Not deferrable by definition. | — |
+
+**The single blocking fact**: `blocks/` + `build/` is **96 files, 23.9 %** of the final result, and it
+is the only pool large enough to close the remaining gap. Reaching 30 % from 511 requires 154 files;
+109 were removed, leaving **45 short**. Both pools are written by `tools/gutenberg/copy.js`, both carry
+do-not-edit-manually headers, and **constraint C5 excludes them by name** (`docs/technical-specifications.md:329`). Were the dynamic-block pool
+reachable, the result would be comfortably past the target. Every other bucket was measured and yields
+either zero files or a constraint violation.
+
+**A claim from an earlier draft of this report is withdrawn.** It asserted that `src/wp-settings.php`
+was "provably exhausted" as a lever, on the strength of an inspector run that found only 2 remaining
+single-clean-symbol requires. Re-running the generator's inspector over the final file finds **207
+resolvable literal require targets**: **87 declare exactly one clean symbol**, 119 have file-scope side
+effects, and 1 declares two or more symbols. The bootstrap is therefore *not* exhausted in the
+mechanical sense — 87 more requires could be deferred. They are eagerly required **by measured
+choice**, not by ineligibility: 85 of those 87 are the requires deliberately restored because their
+classes load on a canonical request anyway, where deferral adds ≈1.4 µs per class and removes nothing.
+The remaining two are `class-wp-error.php` (the `wpdb::$error` contract depends on it, and
+`wpdb::bail()` probes it with an autoload-blind `class_exists( …, false )`) and
+`class-wp-site-health.php` (the map-less fallback for the correctness fix above). "Exhausted" was the
+wrong word; "measured to the point of diminishing returns" is the accurate one, and it does not close
+the 45-file gap either way.
+
+### Front-end peak memory: −5.44 % against ≥10 % (canonical), −9.50 % at best
+
+This is the closest of the four misses, and the accounting is straightforward. The reduction comes from
+compiling 109 fewer files, so it is bounded by the share of peak memory that parse cost represents. On
+the canonical `twentytwentyfive` homepage, peak memory is 11.72 MB before, of which the 109 deferred
+files account for 638,040 bytes — **5.44 %**. On the lighter `twentytwentyfour` homepage the same 109
+files are a larger share of a smaller peak, and the figure rises to **−9.50 %**, 0.5 percentage points
+short.
+
+The remainder of peak memory is dominated by runtime registries and hydrated data, not by parse cost:
+block patterns registry 344 KB, block type registry 299 KB, `wp_styles` 189 KB, object cache 136 KB,
+`wp_scripts` 94 KB. Deferring files cannot move a figure made of hydrated registries, and the pools
+that would move it are the same Gutenberg-synced ones excluded above.
+
+The warm-regime result is more pointed still: on the four single-post scenarios — warm requests, see
+the 301 note — removing 106–107 files moves peak memory by **+0.78 %, −0.42 %, −0.76 % and −0.54 %**.
+When the opcode cache already holds the compiled files, there is no parse cost to remove, so there is
+no memory to save. Any claim of a ≥10 % per-request memory reduction in a warm regime would be false,
+and none is made.
+
+### Front-end DB queries: 0.00 % against ≥15 %
+
+There is nothing to apportion: **the measured reduction on the front end is exactly zero in all sixteen
+theme×locale scenarios, logged out.** `wpDbQueries` is identical before and after in every one — 32,
+30, 29, 73 on the homepages and 32, 26, 28, 42 on the single posts.
+
+The reason is that the only two query optimizations this work found are on paths an anonymous front-end
+request never takes. `get_comment_count()` is called by the admin bar; `wp_get_update_data()` is called
+by the admin bar. Each removed exactly the queries it was measured to remove — 4 and 2 respectively,
+confirmed to the query by the canonical admin pair's 53.5 → 47.5 — but neither is a front-end saving,
+and **both were therefore withdrawn from the change set**: `comment.php` and `update.php` ship
+byte-identical to base. Their sections above record the measurement and the withdrawal reasoning, and
+the opportunity is carried in the backlog scoped to the admin target it actually serves. The
+consequence for this row is unchanged either way — it was 0.00 % with those changes in place and it is
+0.00 % without them.
+
+The plan's own reading of this target — constraint C11 (`docs/technical-specifications.md:802-812`) —
+is the reason it went unmet, and that reading was correct: the
+requirements hypothesised N+1 patterns in template tags and REST serialization, and measurement
+disproved the hypothesis. Core already batch-primes posts, post meta, terms, term meta, authors,
+parents, thumbnails, users and comments on both the front-end and REST paths — `WP_Query` at
+`class-wp-query.php:1973-1992`, `:3295`, `:3429`, `:3640`, `:3643`, `:3659`, `:3777`, `:3780`, and
+`class-wp-rest-posts-controller.php:461-466`. The 22 per-item lookup sites across the loop-oriented
+template files were each traced and are cache-backed reads, not queries. With the hypothesised pool
+absent, no in-scope front-end query reduction was available, and inventing one would violate gate 4.
+The one genuine residual found anywhere is CPU-bound rather than query-bound and is routed to the
+backlog.
+
+### Front-end TTFB: −14.34 % against ≥20 % (canonical), −17.84 % at best
+
+TTFB improved substantially and consistently — every one of the sixteen front-end scenarios moved
+between **−14.34 %** and **−17.84 %** — but no scenario reached 20 %, so the shortfall is a systematic
+2 to 6 percentage points rather than measurement noise. *An earlier draft gave the lower bound as
+−14.21 %; that value occurs in no scenario. The least improvement in the run is the canonical
+Homepage tt5 en_US scenario at −14.34 % (488.60 ms → 418.55 ms), and the greatest is Single Post tt1
+en_US at −17.84 % (437.25 ms → 359.25 ms); all 18 scenario percentages are listed in
+`P7-01-ttfb-dcl-recompute.log`, recomputed from `artifacts/performance-results.md`.*
+
+Phase-level profiling attributes a **warm** front-end request as follows. Conditions, stated because an
+absolute phase figure means nothing without them: anonymous homepage, active theme
+**`twentytwentyfive`**, SAPI **`fpm-fcgi`**, `opcache.enable=1`, warm regime, **12 samples with the
+median reported per column**, collected by a temporary gitignored mu-plugin hooked at eight bootstrap
+marks (raw per-sample data retained at `artifacts/qa-logs-remediation/P3-10-phase-trace-tt5.jsonl`). The
+final row is the harness's own collection point: `server-timing.php` hooks `shutdown` at priority
+`PHP_INT_MIN`, so it measures the **start of shutdown**, before any other `shutdown` callback, object
+destructor, `wp_ob_end_flush_all()` output flush or persistent-cache write. Work that runs later is
+genuinely not counted, and the row is labelled accordingly rather than as a total.
+
+| Phase mark | Elapsed | Δ | Files | Peak | Queries |
+|---|---|---|---|---|---|
+| bootstrap → mu-plugin | 16.69 ms | 16.69 | 326 | 1.65 MB | 1 |
+| → `plugins_loaded` | 17.72 ms | 1.03 | 352 | 1.93 MB | 2 |
+| → `init` | 18.30 ms | 0.58 | 353 | 2.00 MB | 2 |
+| `init` → `init:END` | 27.43 ms | 9.13 | 369 | 3.01 MB | 3 |
+| → `wp_loaded` | 27.44 ms | 0.02 | 369 | 3.01 MB | 3 |
+| → `template_redirect` | 31.11 ms | 3.67 | 370 | 3.23 MB | 14 |
+| **`template_redirect` → `wp_head`** | **117.85 ms** | **86.74** | 403 | **7.09 MB** | 72 |
+| → `shutdown` (start of, `PHP_INT_MIN`) | 118.62 ms | 0.77 | 403 | 7.09 MB | 72 |
+
+**`template_redirect` → `wp_head` is 86.74 ms and +3.86 MB — the dominant cost by a wide margin** — and
+it is owned by Gutenberg-synced block rendering and theme JSON resolution, outside the in-scope file
+list. It is also where 58 of the request's 72 queries are issued. Bootstrap, the part this work can
+reach, is **16.69 ms of a 118.62 ms warm request — 14.07 %** — so even eliminating it entirely could not
+reach a 20 % reduction of the whole in that regime. *An earlier draft of this table reported a six-mark
+trace (16.17 / 18.24 / 28.15 / 30.76 / 66.06 / 72.08 ms, 252→376 files, 5.68 MB) without naming the
+theme, SAPI, regime or sample count. Those figures are withdrawn: they are not reproducible from this
+tree, and the theme alone moves the `wp_head` phase by tens of milliseconds. The re-measured trace above
+makes the same argument more strongly — the unreachable phase is a larger share of the request than the
+withdrawn figures implied, not a smaller one.*
+
+In the cold-compile regime the harness actually measures, the balance is different and more favourable:
+`wpBootstrap` is roughly 90 % of `wpTotal` on the homepage, and this work cuts it by **−19.14 %** to
+**−20.13 %**. That is the mechanism behind the −14.34 % TTFB. The reason bootstrap's −19 % does not
+become the whole request's −20 % is that TTFB also carries the template phase, which this change set does
+not touch by design, and — on the single-post scenarios — the 301 redirect leg described earlier.
+
+Two candidate micro-optimizations were measured and **rejected on the evidence**. The autoloader's
+`file_exists()` guard costs **0.765 µs per call** with the realpath cache warm (measured over the 145
+mapped paths, 20 passes, medians; 0.7646 µs at `opcache.enable_cli=0` and 0.7662 µs at `=1` — the guard
+is a syscall, so the opcode cache is correctly irrelevant to it). A canonical front-end request performs
+**22** resolutions, so the guard costs **≈0.017 ms**, about **0.014 %** of that request; the admin
+request performs 27, or ≈0.021 ms. Removing it would be speculative at that scale and would reintroduce
+the failure mode where a missing or tampered classmap path is no longer safe. *An earlier draft put this
+at 0.085–0.11 ms and 0.12 % — roughly 6× too high, because it multiplied the per-call cost by the whole
+143-entry map rather than by the 22 resolutions a request actually performs. The rejection stands on
+firmer ground than before, not weaker: the guard is even cheaper than it was credited with being.* Deferring the AI-client bootstrap config measured −9 files but
+leaves `AiClient::defaultRegistry()` — called unconditionally on `init` — with no configured HTTP client,
+cache or event dispatcher.
+
+The admin path improves at the same rate: TTFB **−15.72 %** (en_US) and **−15.52 %** (de_DE), and
+`wpTotal` **−15.99 %** / **−15.80 %**. The admin target, DOMContentLoaded, is met at −79.42 %; the
+admin TTFB figure is reported for completeness and is not a target row.
+
+---
+
+## Final browser and runtime verification
+
+A headless-Chrome pass on the measured tree exercised the integrated source tree rather than a generated
+fixture. Every figure below was measured in that pass.
+
+**Anonymous front end.** `/` returned 200. All five emoji-detection markers were exactly **0** on both
+the home page and a single post — `#wp-emoji-settings` elements, `_wpemojiSettings` occurrences,
+`wpemoji` occurrences, `twemoji` occurrences, and network requests matching `wp-emoji` or `twemoji` —
+measured from the live DOM, from a fresh re-fetch of the served bytes, and from an out-of-browser
+`curl` grep. The single post rendered fully: first heading `<h1>` "Block: Image", 21 paragraphs,
+4,349 characters of content, all WordPress-served assets 200. An earlier pass additionally verified the
+opt-in direction: a query-gated mu-plugin opted the detector back in, `#wp-emoji-settings` appeared
+exactly once, `supports.flag`, `supports.emoji` and `supports.everything` were all `false`, and both
+`twemoji.js` and `wp-emoji.js` loaded with HTTP 200 and executed.
+
+**Dashboard.** 43 `<script src>` tags, 8 of them `/js/dist/`, and **zero** matching any palette or
+editor bundle. `wp-commands`, `core-commands`, `wp-core-commands` and the bare substring `commands`
+occur **0 times** in the 127,505-byte document; `typeof window.wp.commands` is `undefined`; no
+admin-bar node and **none of 301 id-bearing elements** contains "command". `Ctrl+K` and `Meta+K` each
+left the element count at **1,002**, body children at 8, `activeElement` at `BODY`, zero
+MutationObserver additions and zero console output — with all four keydowns reaching `document`
+**uncancelled**, proving no listener exists. Reproduced on two independent loads.
+
+**Block editor** (`post.php?post=1789&action=edit`). 105 `<script src>` tags, 62 `/js/dist/`, including
+`commands.js` and `core-commands.js`; `typeof window.wp.commands` is `object` with the expected six
+keys. `Ctrl+K` opened a dialog `components-modal__frame commands-command-menu`, `aria-label="Command
+palette"`, at rect (440, 154, 400 × 113), its `"Search commands and settings"` combobox auto-focused,
+with a live suggestion rendered. An earlier pass exercised the REST path the deferral depends on:
+searching `sample` returned "Sample Page" and the backing
+`/wp-json/wp/v2/pages?…search=sample` and `/wp-json/wp/v2/posts?…search=sample` requests both returned
+200 — directly exercising deferred REST controller resolution.
+
+**REST index.** `/?rest_route=/wp/v2` returned 200 with **108** keys in `routes`, agreeing exactly
+between the browser and a server-side JSON parse, and **108 of 108** routes carry both `methods` and
+`endpoints` with complete argument schemas. The root index exposes **133** routes across **6**
+namespaces, including the eight `/wp-site-health/v1` routes. Site Health rendered both tabs, completed
+its async checks, every Site Health REST/XHR request returned 200, and the scheduled-check hook has one
+registered handler.
+
+**Console.** Zero JavaScript exceptions, zero warnings on the front end, zero warnings and zero errors
+on the Dashboard across three separate loads, zero PHP fatals and zero class-not-found errors anywhere.
+The only front-end console output was `Failed to load resource: … 404` — 11 occurrences on the home page
+and 5 on the single post, every one a media binary under `/wp-content/uploads/`, which contains **0
+files** in this worktree because the theme-test-data import creates attachment posts without copying
+their binaries. Verified with `find`, spot-checked on five paths, and re-confirmed with `curl`; every
+WordPress-served asset returned 200. This is a pre-existing environment fixture gap, present identically
+in both code states. The only editor console output was the known upstream Gutenberg `useSelect`
+unstable-reference warning plus the same five media 404s.
+
+One behaviour worth flagging for anyone writing tests against this build, discovered during the pass and
+unrelated to this work: merely **opening** the block editor auto-issues
+`POST /wp-json/wp/v2/posts/1789` with `X-HTTP-Method-Override: PUT`. Post content was verified
+byte-stable (9,285 bytes, 32 blocks, checksum `-407635720`, measured identically from two page contexts)
+and the published-post total unchanged at 49, but `post_modified` advances and a revision is created.
+
+The E2E suite was then re-run in full against the same instance on the measured tree, with
+`CI=true npm run test:e2e` and `WP_BASE_URL` set. It was run **twice**, and the two runs are reported
+distinctly because their exit codes differ and only the second is a clean result:
+
+| Run | Retained log | Declared | Passed | Flaky (retry-recovered) | Failed | Exit |
+|---|---|---:|---:|---:|---:|---:|
+| First — residual `wp_e2e_*` tables from an earlier session still present | `R13-e2e-final-head.log` | 38 | 37 | 0 | **1** | **1** |
+| Second — after those 12 tables were dropped (`R14-drop-e2e-residue.log`) | `R15-e2e-final-head-clean.log` | 38 | 36 | **2** | **0** | **0** |
+
+The first run's single failure was `install.test.js:34`, which exhausted both retries: it asserts
+`toHaveURL( /wp-admin\/install\.php$/ )` at `install.test.js:40` and received
+`http://localhost:8891/` instead. The cause is environmental and specific to that residue. The spec
+rewrites `$table_prefix` in `wp-config.php` in `beforeEach` so that the site appears uninstalled; with
+the alternate prefix's tables *already present* from a previous session, the site was installed under
+that prefix too, so no retry could ever see the installation screen. Dropping the residual tables
+removed the condition. The count is 12 because that is one complete single-site table set — the spec
+rewrites the prefix at `install.test.js:26` (`$table_prefix = 'wp_'` → `'wp_e2e_'`) and lets WordPress
+install a full set under it, and this database holds exactly 12 `wp_` tables
+(`R22-e2e-table-basis.log`, which also confirms `wp_e2e_*` is back to **0**).
+
+The second run is the clean result: **38 declared, 36 passed, 2 retry-recovered flakes, 0 failed,
+exit 0.** The two flakes are both pre-existing and both unrelated to every file this change set touches:
+
+- `install.test.js:34` — the same assertion as above, but now recovering on retry. With
+  `opcache.validate_timestamps=1` and `revalidate_freq=2`, the rewritten `wp-config.php` is not visible
+  to php-fpm for up to two seconds, so the first attempt reads the pre-rewrite prefix and the retry
+  succeeds. The setup notes for this environment already document this spec as retry-dependent.
+- `media-upload.test.js:11` — fails `Error: Not logged in` inside
+  `admin.visitAdminPage( '/media-new.php' )` at `media-upload.test.js:14`, then passes on retry. A
+  pre-existing session race, also present in the retained pre-existing logs `86-e2e-src-cleandb.log`
+  and `88-e2e-build-CI.log`.
+
+Both runs include all 13 tests this work added (11 in `command-palette.test.js`, 2 in
+`emoji-detection.test.js`), and in both runs all 13 pass. No integration-scoped E2E behaviour failed in
+either run.
+
+*An earlier draft reported a single E2E run as "38 declared, 37 passed, 0 failed, exit 0, with one
+retry-recovered flake". That conflates the two runs above: the 37-passed figure belongs to the run that
+exited **1** with a hard failure, and the run that exited 0 passed **36** with **two** flakes. Both runs
+are now reported separately with their own exit codes.*
+
+One methodological caution for anyone reproducing this: the base URL is resolved as
+`process.env.WP_BASE_URL || 'http://localhost:8889'` at
+`node_modules/@wordpress/scripts/config/playwright.config.js:13`, the shared base config that
+`tests/e2e/playwright.config.js:10` requires — not in the repository's own config file, whose line 13
+sets `STORAGE_STATE_PATH`. Playwright does **not** read `.env` — only Docker Compose does. Every Playwright invocation must therefore carry `WP_BASE_URL`
+explicitly, or it will silently exercise whatever happens to be listening on port 8889 rather than the
+instance under test.
+
+---
+
+## Verification summary
+
+Every count below was re-measured against the tree recorded by `77aecc34e9` — the same tree the
+§*Source identity of the measured code* table pins by content hash — with both performance mu-plugins
+removed and `src/wp-content/uploads` cleared beforehand, as the two conditions that otherwise perturb
+the suite (`ob_start()` in `server-timing.php` makes the ajax group risky, and upload residue breaks
+`test_sideload_scaled_unique_filename`).
+
+| Gate | Result |
 |---|---|
-| 333 `require`/`include` in `wp-settings.php` | **323** resolved include-family constructs — 311 `T_REQUIRE`, 7 `T_REQUIRE_ONCE`, 2 `T_INCLUDE`, 3 `T_INCLUDE_ONCE` |
-| 306 unconditional requires | **323** resolved constructs, of which **306** are at file scope and **316** are literal `require ABSPATH …` |
-| 96+ AJAX handlers | **94** `wp_ajax_*` handlers in a **5,647**-line file |
-| 57 REST endpoint controllers | **45** controllers; **57** total files under `rest-api/` — a labelling error |
-| ~1,200 core files eagerly required per request | **482** at bootstrap and **499** on a full HTTP front-end request; **529** on the admin dashboard |
-| `common.js` is 2,359 lines | **2,358** |
-| Metadata lazyloader covers 2 object types | **3** — `term`, `comment` and `blog`, in a 200-line file |
-| Four new `wp_cache_prime_*` helpers are needed | **Redundant** — the multi-key API already ships as `wp_cache_get_multiple()`, `wp_cache_set_multiple()`, `wp_cache_add_multiple()` and `wp_cache_delete_multiple()` in `src/wp-includes/cache.php` |
-| `_print_emoji_detection_script()` lives in `script-loader.php` | **False** — `src/wp-includes/formatting.php:L5962`; the hooked wrapper is `:L5935`; `print_emoji_styles()` is deprecated in `src/wp-includes/deprecated.php` |
-| REST posts N+1: 10 posts produce 30+ queries | **False** — `WP_Query`'s priming defaults prime posts, meta and terms |
-| Template-tag N+1 across 12 files | **False** — the per-item lookups in the loop-oriented template files are cache-backed reads, not queries |
-| Admin JS reducible by webpack code splitting | **Structurally impossible** — `js/dist` is copied in by `tools/gutenberg/copy.js:L51`, not built by the core webpack config |
-| Author N+1 on REST and front end | **False** — `update_post_author_caches()` runs on both paths |
-| Customizer JS is a viable workstream | **Zero contribution** — screen-scoped to `src/wp-admin/customize.php:L125` and absent from the measured admin payload |
+| Zero test regressions | Every figure in this row is the exact result line of a retained log, named beside it. Single-site PHPUnit `Tests: 29481, Assertions: 3542452, Warnings: 86, Skipped: 50`, rc=0 (`R11-phpunit-single-full.log` + `R11-single-full.junit.xml`). Multisite `Tests: 30274, Assertions: 3544489, Warnings: 86, Skipped: 52`, rc=0 (`R12-phpunit-multisite-full.log` + JUnit XML). `--group capabilities` → `OK (888 tests, 3842 assertions)`, rc=0 (`R06`). `tests/phpunit/tests/load/` → `Tests: 270, Assertions: 2001, Skipped: 1`, rc=0 (`R07`). `--group ajax` → `Tests: 180, Assertions: 1132, Skipped: 1`, rc=0 (`R09`). The ten added or changed PHPUnit classes, run one per invocation, sum to **557 tests / 102,120 assertions**, 0 failures, 0 errors (`R08-ten-classes.log` + ten `R08-junit-*.xml`). QUnit **456 tests, 0 failed, 0 skipped, 0 todo** across both `compiled.html` and `index.html` (`qa-logs/01-build-qunit.log:433-437`); that log predates the measured tree, and its result still holds because `git diff dd815f6a25..HEAD` touches **no** file under `src/js`, `src/wp-includes/js`, `src/wp-admin/js` or `tests/qunit`, and the one `Gruntfile.js` hunk in that range contains no `qunit` reference (`R19-qunit-validity.log`). E2E was run twice: the first exited **1** with one hard failure caused by residual `wp_e2e_*` tables (`R13`), and after those tables were dropped (`R14`) the second exited **0** with **38 declared, 36 passed, 2 retry-recovered flakes, 0 failed** (`R15`) — both flakes pre-existing and unrelated to any changed file; all 13 tests this change set adds pass in both runs. Performance suite **786 passed / 0 failed** (`R04`); the suite declares 786 tests in 4 files at this tree (`R17`). No new skip, incomplete marker, requirement or suite exclusion was added anywhere, and both skips are named and accounted for: the load-directory skip is `wpDebugMode.php:37` (needs `WP_DEBUG_*` constants set in `wp-tests-config.php`), and the ajax skip is `Tests_Ajax_wpAjaxResponse::test_response_charset_in_header` at `tests/phpunit/tests/ajax/wpAjaxResponse.php:78`, skipped by its own `@requires function xdebug_get_headers` because Xdebug is absent on both SAPIs here. Neither file has changed since base `5e9d05d7dd` (`R20-skip-provenance.log`, `R21-ajax-skip.log`). *An earlier draft claimed "every suite exited 0" and reported a single E2E run as 37 passed / 0 failed; the first E2E run exited 1. The separate claim that the performance suite passed "three separate times" is withdrawn once, where the suite's pass count is established, in §*Measurement integrity: defects that had to be removed before comparison*.* **Re-verified on the delivered tree** (the figures above are the retained logs of the measured tree; these are fresh runs of the code that ships): single-site PHPUnit `Tests: 29555, Assertions: 3542245, Failures: 0, Errors: 0, Warnings: 86, Skipped: 50`; QUnit **456 tests, 0 failed, 0 skipped** across both `compiled.html` and `index.html`; `--group capabilities` → `OK (933 tests, 3378 assertions)`; every class in `tests/phpunit/tests/load/` → `Tests: 293, Assertions: 2160, Skipped: 1`; the ten added or changed classes sum to **627 tests / 101,904 assertions**, 0 failures; `tests/performance/specs/utils.test.js` **96 passed / 0 failed**; the two E2E specs this change set adds **13 passed / 0 failed** (11 + 2), exit 0 under `CI=true`; `grunt verify:build-guards` **15/15**; PHPStan **no errors**; PHPCS **0 errors** over the changed tracked files. The delivered suite is **+74 tests** against the measured tree's 29,481 and the warning and skip counts are unchanged, so no suite was made to pass by adding a skip or an exclusion. The 86 warnings remain the framework's own PHPUnit-9→10 forward-compatibility notices in untouched classes, and the 50 skips remain the pre-existing set. |
+| Warnings accounted for | All 86 PHPUnit warnings are the framework's own PHPUnit-9→10 forward-compatibility notices, in exactly four texts — "Expecting E_DEPRECATED and E_USER_DEPRECATED is deprecated…" ×35, "Expecting E_ERROR and E_USER_ERROR…" ×24, "Expecting E_STRICT, E_NOTICE, and E_USER_NOTICE…" ×15, "Expecting E_WARNING and E_USER_WARNING…" ×12 — raised by **22** distinct test classes, **none of which is a file this change set touches**. The tally was derived by parsing the `There were 86 warnings:` listings of both retained logs (`R11`, `R12`), whose 86 numbered blocks are complete and gap-free in each; the four texts, their four counts and the 22-class breakdown are **identical between the single-site and multisite runs**. Each of the 22 classes was then located in `tests/phpunit/tests/` and checked against `git diff --name-only 5e9d05d7dd..HEAD` — overlap is empty, so every warning is pre-existing framework noise rather than anything this work introduced. Parse, per-class tally and attribution check: `R23`. *An earlier draft of this row said 23 classes; the corrected count is 22, and the class-by-class tally is recorded in `R23`.* |
+| Performance proof | The canonical before/after pair was produced by swapping only the 12 in-scope `src/` files between the measured tree and base `5e9d05d7dd`, with SHA256 verification in both directions and `git status` confirmed unchanged afterwards, then running the identical harness in each state, and re-running the after arm on freshly restarted php-fpm workers so that both arms were measured on equally young worker generations — the worker-generation symmetry the OPcache Measurement Law requires. What each arm attests is its own result set, and both are complete: **18 result entries × 2 repetitions × 20 samples per metric series**, verified directly from the two JSON artifacts (`R18-artifact-cardinality.log`). `tests/performance/compare-results.js` exits **0** over that pair across all 18 scenarios (`R05-compare-results-canonical.log`, which also confirms it rewrites `artifacts/performance-results.md` byte-identically). A retained full-suite run on the measured tree reports **786 passed / 0 failed** (`R04`), and its result set agrees with the canonical after arm on every deterministic metric (`R16`). The four failed targets are reported as failures from that same data rather than being substituted with a more favourable measurement; the two isolated single-file A/B runs quoted above are corroboration, not the primary proof. |
+| Value documentation | This document. |
+| No speculative optimization | N+1 priming, customizer JS and webpack splitting were rejected during discovery; the admin-JS target was re-aimed from `common.js` (0.75 % of payload) to the Command Palette (91.2 %); the final bootstrap option-primer was removed after measuring 0 saved front-end queries and +1 admin query. |
+| Minimal diff | No file deletions. Gates added inside callbacks, never by removing a registration. `ajax-actions.php` left alone because deferring its 94 handlers forces ~3,496 lines of whitespace-only diff. |
+| Backward compatibility | `/wp/v2` still registers **108** routes, and 108 of 108 carry their `methods` and `endpoints` schemas; the root index still exposes 133 routes across 6 namespaces. Front-end HTML differs from base by exactly **one contiguous 13,700-byte removal and zero inserted bytes**, verified by reconstructing the after-document byte-for-byte from the before-document minus that region. Public signatures, hook names and argument counts are unchanged; the `map_meta_cap` memo is bypassed for any branch that emits `_doing_it_wrong()` and for any non-core filter callback; `$cache_hits` and `$cache_misses` remain the same public integers. Chrome validation on the measured tree confirmed default and opt-in emoji behaviour, Dashboard palette absence down to four uncancelled keydowns, editor palette delivery and its REST search path, and Site Health rendering. The 13 E2E tests added by this change set all pass. |
+| Security invariant | `wp_authenticate`, `check_ajax_referer`, `wp_verify_nonce`, `current_user_can` and `auth_redirect` remain eagerly available on every request path. The palette gate only ever *reduces* what a context receives. REST permission callbacks are registered inside `create_initial_rest_routes()`, which runs in full whenever a REST route is dispatched. |
 
-Four claims in that document were verified as **correct** and are relied on: `emoji-loader.js` at 436
-lines, and the customizer `controls.js`, `nav-menus.js` and `widgets.js` line counts.
+### Coverage added or extended by this change set
 
-`docs/project-guide.md` records result figures from the same earlier lineage. Each item in the
-following list is that document's **claim**, not a finding of this report: it claims a front-end
-TTFB pair of 53.72 → 41.9 ms; it claims an admin DOMContentLoaded pair of 50.66 → 42.05 ms; it claims
-a count of batch-primed REST controllers; and it claims a reveal.js executive presentation was
-delivered. None of those
-figures is reproducible here: the front-end baseline it names does not match any measurement in this
-environment, the admin DOMContentLoaded metric had no baseline in existence until this change set
-created one, the batch-priming workstream was deleted on measurement, and no presentation artifact
-exists or was requested. That document was consulted for Markdown house style only, and none of its
-numbers appears in this report.
+Ten PHPUnit classes were added or extended to pin the new behaviour. Their exact counts come from **ten
+separate runs, one per class** — PHPUnit 9 takes a single path argument, so ten invocations are required
+rather than one. The **total** row is the sum of those ten, not a figure any single run printed. *An
+earlier draft described this as "a single JUnit-logged run of all ten" reporting
+`OK (557 tests, 102120 assertions)`; no such single run is possible, and the wording is corrected here.*
+Every figure below was re-measured on the **delivered** tree by running the class's own file, so the
+table describes the code that ships rather than a superseded arm. Two rows moved for reasons worth
+naming: `Tests_User_MapMetaCapMemo` covers a different memo design than the one an earlier draft
+described (§*Request-scoped memoization of `map_meta_cap()`*), and `Tests_Comment_GetCommentCount` is
+back to pristine core coverage because the optimization it guarded is withdrawn.
+
+| Test class | Tests | Assertions | What it pins |
+|---|---:|---:|---|
+| `Tests_Load_wpAutoloadClass` | 208 | 1,922 | every one of the 143 class-map entries resolves to a readable file; the generator reads a PHP 7.4-alike token stream; an unusable or malformed map is a silent miss rather than a fatal; the generator's temporary file is unguessable and created exclusively |
+| `Tests_User_MapMetaCapMemo` | 144 | 375 | 24 methods over 3 data providers: memo admission (no arguments, integer user, string capability), suppression while a `map_meta_cap` or `all` callback is attached, per-user separation, the 512-entries-per-user cap, role and capability mutations taking effect at once, post types registered after a memo was stored, `switch_to_blog()`, containment to `capabilities.php`, and the `_doing_it_wrong()` guarantee |
+| `Tests_Performance_ServerTimingMetrics` | 78 | 668 | the new harness metrics are always integers, produce no output and raise no diagnostic; the withdrawn metric names are absent |
+| `Tests_Cache` | 58 | 183 | per-group counters stay off by default, stay bounded by `$max_tracked_groups` in both the tracked and the untracked-group direction, and leave `$cache_hits` / `$cache_misses` exact |
+| `Tests_Formatting_Emoji` | 41 | 292 | the gated detection script prints exactly once when asked for, and `_wp_emoji_list()` always returns arrays |
+| `Tests_Dependencies_CommandPalette` | 38 | 123 | the gate's screen-based default, that the filter receives it, and that delivery follows the filtered value |
+| `Tests_Load_BootstrapLoading` | 36 | 166 | the autoloader is registered in every context; Site Health and the plugin API stay reachable; the bootstrap loads only the mapped files it documents |
+| `Tests_Comment_GetCommentCount` | 9 | 47 | *(pristine core coverage — the optimization it guarded is withdrawn; see §*Reconciliation to the delivered tree*)* |
+| `Tests_Load_wpSiteHealthLoader` | 8 | 31 | the deferred Site Health class loads on the paths that need it |
+| `Tests_Formatting_EmojiArrays` | 7 | 98,097 | every entry of the relocated arrays matches the generator's contract |
+| **total** | **627** | **101,904** | |
+
+Two wider groups were also run to confirm nothing around the changed code shifted: `--group
+capabilities` → `OK (933 tests, 3378 assertions)`, and every class in
+`tests/phpunit/tests/load/` → `Tests: 293, Assertions: 2160, Skipped: 1`, both exit 0. The single skip in the load directory is pre-existing: it is
+the only `markTestSkipped()` in that directory, at `tests/phpunit/tests/load/wpDebugMode.php:37`
+("Test requires setting `WP_DEBUG_*` constants in `wp-tests-config.php`…"), in a file this change set
+does not touch. *An earlier draft cited no artifact for the capabilities group; it is cited above. The
+load directory's superseded 249/1,981 figure is withdrawn once, where that console line was originally
+quoted, in §*Safety contract: why the map holds 143 entries and not 290*. The per-class and group
+figures in this section were re-measured on the delivered tree; the earlier 557/102,120 and
+888/3,842 and 270/2,001 figures belong to the superseded arm and are withdrawn.* On the JavaScript side, `tests/performance/specs/utils.test.js` was
+added to cover the comparator/reporter contract, and two E2E specs were added
+(`command-palette.test.js`, 11 tests; `emoji-detection.test.js`, 2 tests).
+
 
 ---
 
 ## Prioritized opportunities discovered but not implemented
 
-Ordered by measured value against implementation risk. Each carries the evidence that identified it
-and the reason it was not implemented.
+Ordered by measured value. Each entry states what blocks it today.
 
-**1. Close the last 4 files on the file-count target by deferring the remaining single-class
-clusters, and find another mechanism for the non-class require clusters a class map cannot reach.**
-The bootstrap reaches **341** files; against this instance's measured base of **482**, the first count
-that clears 30 % is **337**. (The brief's ≤338 ceiling was derived from a 484-file baseline; the
-equivalent ceiling against 482 is 337, and both are stated so the arithmetic is checkable.)
-The **evidence**: of the 175 requires in the base loader's dense region, **124** target files declaring
-exactly one class and **51** do not — they declare functions, declare several classes, or declare
-none — and the class map currently holds **228** entries, so single-class candidates remain unmapped.
-The 51 are structurally out of an autoloader's reach: an autoloader is only ever asked to resolve a
-class name, and the canonical case is the REST bootstrap file, whose functions
-`src/wp-includes/default-filters.php:L532-L536` references **by name at registration time**.
-It is **not implemented** because the remaining single-class candidates are the ones whose eligibility
-is least certain — files that may be probed for with `class_exists( $name, false )`, or that a second
-autoloader must not race — and each needs its own isolated correctness proof before it can be
-deferred; the non-class clusters need a different mechanism entirely, such as the closure-wrapped
-`require` core already ships, applied per call site with its own measurement. Deferring either group
-speculatively to reach a round number would violate the measurement-first discipline this work is held
-to. Estimated value: the remaining 0.75 percentage points on target 6, plus a proportional share of
-the 7.56 MB parse-cost saving.
+1. **Lazy dynamic-block registration — 83 files; the only remaining opportunity large enough to pass
+   the file-count target.** `wp-includes/blocks/index.php:22-23` requires the generated
+   `require-dynamic-blocks.php` at file scope, and that file issues **81** unconditional
+   `require_once` statements, one per dynamic-block render file; two further partials
+   (`blocks/navigation-link/shared/render-submenu-icon.php` and `…/item-should-render.php`) come in
+   behind them, for **89** measured includes under `wp-includes/blocks/` — a count the probe recorded
+   as **identical in both code states**, 89 before and 89 after. Needs `tools/gutenberg/copy.js` to
+   emit a callback or class map instead of a file-scope require chain, with render callbacks
+   registered lazily. **Estimate**, arithmetic only, not measured: deferring the 81 render files and
+   their 2 partials while retaining the six loader/manifest files would take the canonical count from
+   405 to **322**, i.e. **−37.11 %** against the 512 baseline, clearing ≥30 % with roughly 7.1 points
+   of margin. Whether the real saving lands there depends on how many render files a given page
+   actually touches, which is why the figure is labelled an estimate rather than a result.
+   **Blocked by constraint C5** (`docs/technical-specifications.md:329`) — the Gutenberg-synced tree.
+   By a wide margin the highest-value single
+   remaining opportunity in the codebase, and the reason target 6 is reported as failed rather than as
+   exhausted.
+2. **A caching layer for `get_block_templates()` — up to 4 front-page queries.** Q12/Q13 come from
+   `resolve_block_template()` running twice, once via `get_front_page_template()` and once via
+   `get_home_template()`, each issuing its own `WP_Query`; Q14/Q25 come from template-part rendering.
+   The function has only a short-circuit filter and a trailing filter around a bare query, so a
+   request-scoped memo would be a small, well-contained change. **Blocked because
+   `block-template-utils.php` is outside the in-scope file list and template-part rendering is in the
+   Gutenberg-synced tree.** This remains the strongest opportunity for anonymous block-theme
+   requests, and it is the only kind of change that could move row 5 at all. The two **withdrawn**
+   query changes — grouped comment counts and batched transient reads — removed 6 queries from requests
+   that render the admin bar's comment and update counts, but they removed **0** from an anonymous
+   front-end request and therefore did **not** satisfy the front-end DB-query target, which stands at
+   **0.00 % and failed**. There is no separate authenticated target for them to satisfy: the plan
+   states exactly one DB target, "per front-end page load" — which is why they were withdrawn rather
+   than kept, and why they now appear as item 3 below.
+3. **Re-land the two withdrawn query optimizations against an admin-path target — 6 queries, already
+   measured.** The grouped comment-status count in `get_comment_count()` and the batched site-transient
+   priming in `wp_get_update_data()` were implemented and measured before being withdrawn: together
+   they remove **exactly 6 queries** from any request rendering the admin bar's comment and update
+   counts, worth **−11.21 %** (en_US) and **−11.11 %** (de_DE) on the canonical admin pair. Both files
+   ship byte-identical to base today. **Blocked by scope, not by measurement or by an external
+   constraint** — the plan states exactly one DB target and it names the front-end page load, so under
+   Gate 4 these addressed no named bottleneck. Given an admin-path query budget they become admissible
+   on evidence already in hand, which makes this the cheapest large win in the list. Close
+   verification-coverage gap 4 first.
+4. **Block-supports lazy registration — 22 files.** Needs a registration manifest so the 22
+   function-holding files load only when a support is actually applied. **Blocked by constraint C9** (`docs/technical-specifications.md:857`)
+   (function-holding files ineligible for deferral).
+5. **Block-pattern `filePath` conversion — 11 files.** Mechanical, but converting each
+   `return array( title, content )` file into one that outputs markup touches all 11. **Blocked by
+   Gate 5** (no bundled refactoring).
+6. **AI-client discovery deferral — 9 files (measured).** Requires `connectors.php` to stop calling
+   `AiClient::defaultRegistry()` unconditionally on `init` (priorities 15 and 20). Deferring only the
+   bootstrap configuration saves 0 files and breaks HTTP-client discovery. **Blocked by Gate 6.**
+7. **`build/routes.php` + `build/pages.php` gating — 7 files.** Function declarations would disappear
+   from the front end, breaking `function_exists()` probes. **Blocked by constraint C9 (`docs/technical-specifications.md:857`) and constraint C5 (`docs/technical-specifications.md:329`).**
+8. **`ABSPATH`-guard recognition in the classmap generator.** Teaching the generator that a bare
+   `if ( ! defined( 'ABSPATH' ) ) die;` is not a real side effect would admit more files in
+   principle. Measured reach: only 7 relevant class files carry that guard, and the two linchpins
+   (`class-wp-customize-control.php`, `class-wp-customize-section.php`) *also* carry file-tail
+   `require_once` chains, so recognition would unlock only `WP_Customize_Panel` / `WP_Customize_Setting`
+   and their subclasses — a tree that loads on **zero** measured request paths. **Rejected under
+   Gate 4 and Gate 5**; recorded so the analysis is not repeated.
+9. **Per-image-size recomputation in the attachments REST controller.**
+   `class-wp-rest-attachments-controller.php:1088-1104` loops over
+   `$data['media_details']['sizes']` calling `wp_get_attachment_image_src()` per size plus once more
+   for `full`, each round-tripping into `image_downsize()`; the code's own comment concedes it
+   duplicates that method's work. Metadata is already cached, so this is CPU recomputation rather
+   than a query storm, and it is confined to `/wp/v2/media`, so it cannot move any of the six
+   targets.
+10. **A `wp_lazyload_post_meta()` analogue.** `class-wp-metadata-lazyloader.php` registers three
+    object types — `term`, `comment`, `blog` — and core ships `wp_lazyload_term_meta()`,
+    `wp_lazyload_comment_meta()` and `wp_lazyload_site_meta()` but no post-meta counterpart. Filling
+    the gap would be a consistency win; no measured front-page bottleneck attributes to it.
+11. **Reconcile the `plugin.php` deferral line-item.** The governing plan's per-file scope, constraint C6 (`docs/technical-specifications.md:479-599`), names
+    `wp-admin/includes/plugin.php` as a deferral target, but constraint C9 (`docs/technical-specifications.md:857`) forbids deferring
+    function-holding files, and \[59488\] / #62244 made it a direct require precisely because plugins
+    call its functions without an existence check. The binding constraint governs and the file is
+    retained; the plan line-item should be corrected rather than the code.
+12. **Non-class require clusters generally.** A class map cannot reach a file that declares only
+    functions. Any further large file-count reduction outside `blocks/` needs a *function*-level
+    lazy-loading mechanism, which core does not have and which is a substantially larger design
+    question than an autoloader.
 
-**2. Reduce template-phase work, which is what now blocks the TTFB target.** **Evidence**: measured
-directly — `wpBootstrap` improved 20.74–22.12 % while `wpTemplate` rose 33.89 % in the same requests,
-and TTFB nets the two. **Why not implemented**: the two largest template-phase costs are the 89-file
-Gutenberg-synced `blocks` cluster and the block-supports registration that runs during rendering, and
-both are outside this change set's boundary. Estimated value: the remaining 3.14 percentage points on
-target 1, and more in the warm regime where the bootstrap saving is smallest.
+### Verification-coverage gaps
 
-**3. Eliminate the per-image-size recomputation in the attachments REST controller.**
-`src/wp-includes/rest-api/endpoints/class-wp-rest-attachments-controller.php` loops over each
-registered image size and calls `wp_get_attachment_image_src()` once per size plus once more for
-`full`; each call round-trips through `image_downsize()` in `src/wp-includes/media.php`, and the code's
-own comment concedes it duplicates that method's work. **Why not implemented**: the attachment
-metadata is already cached, so this is CPU recomputation rather than a query storm, and it is confined
-to `/wp/v2/media`. It cannot move any of the six targets, so implementing it would have been
-speculative optimization under gate 4. Estimated value: proportional to the number of registered image
-sizes, on one endpoint.
+These are not performance opportunities. They are gaps in the machinery that *proves* the changes
+above are safe, each discovered while verifying this change set and none of them fixed by it. They
+are recorded so the limits of the evidence in this report are explicit.
 
-**4. Add a `wp_lazyload_post_meta()` analogue to close the metadata-lazyloader gap.**
-`src/wp-includes/class-wp-metadata-lazyloader.php` is 200 lines and registers exactly **three** object
-types in its constructor — `term`, `comment` and `blog` — and core ships `wp_lazyload_term_meta()`,
-`wp_lazyload_comment_meta()` and `wp_lazyload_site_meta()` with **no post-meta counterpart**. **Why
-not implemented**: outside the measured targets, and post meta is already primed eagerly by
-`WP_Query`, so the gain would be confined to code paths that assemble post lists without `WP_Query`.
-It needs its own profiling before it can be justified.
-
-**5. Extend the per-group cache counters into a hit-ratio regression check.** **Evidence**: the
-counters now exist and were decisive for attributing this work — arm C1 removed 4 misses while arm U1
-removed 0 and added hits — but nothing yet asserts a floor on the ratio. **Why not implemented**: it
-requires a policy decision about acceptable ratios per group, which is a project decision rather than
-an implementation one.
-
-### Reasoned exclusions
-
-These were considered and excluded on evidence, not overlooked.
-
-**The `wp-includes/blocks` cluster — 89 files, the largest single sub-directory in the bootstrap and
-the largest deferral-shaped opportunity in it.** Untouchable: it is Gutenberg-synced, with `src`
-holding one loader file while the built tree holds the rest,
-and the generated `require-dynamic-blocks.php` in the built tree declares in its own header that it
-was autogenerated by `tools/gutenberg/copy.js` and must not be edited manually. This same boundary is
-what makes admin JavaScript code splitting structurally impossible, since `js/dist` is written by
-`tools/gutenberg/copy.js:L51` rather than by the core webpack config. Only the core-owned loader
-`src/wp-includes/blocks/index.php` is even theoretically in reach, and it is used here as the
-reference for the generated-manifest pattern rather than modified.
-
-**`src/wp-admin/includes/ajax-actions.php` — 5,647 lines, 94 handlers.** Excluded despite its size: it
-is off the front-end critical path, and deferring the handlers requires wrapping each body, which
-forces roughly 3,496 lines of whitespace-only re-indentation. That is a gate 5 violation with no
-measured front-end benefit.
-
-**The customizer JavaScript tree — 20,291 lines across 11 source files**, the largest being
-`controls.js` at 9,389 lines, `nav-menus.js` at 3,556 and `widgets.js` at 2,373. Excluded on
-measurement: it is enqueued from
-exactly one screen-scoped call site at `src/wp-admin/customize.php:L125` and no `customize-*` handle
-appears anywhere in the measured admin payload, so optimizing it cannot move the admin JavaScript
-metric by a single byte.
-
----
-
-## Verification-coverage gaps
-
-Stated so that the boundaries of the evidence above are visible rather than implied.
-
-- **Every figure in this report was measured on one instance**, with `twentytwentyone` active,
-  locale `en_US`, MySQL 8.4.11 and no persistent object cache. The 18-context suite comparison is the
-  only evidence that spans four themes and two locales, and it contributes only regime-independent
-  metrics. Behaviour with a memcached or Redis drop-in is covered by an isolated unit probe, not by a
-  performance measurement.
-- **`SCRIPT_DEBUG=true` on this instance**, so every asset-byte figure is an unminified figure. A
-  production install serving minified assets will see different absolute numbers, particularly for the
-  emoji payload. No production extrapolation is made from these figures.
-- **Peak memory over HTTP is process-cumulative** on the built-in server used for the A/B instruments
-  (`wpProcessRequests` median 11.5 in every arm). Per-request memory claims therefore come from the
-  CLI bootstrap probe, and the HTTP peak figures are corroboration only.
-- **The `de_DE` locale is measured only for `domContentLoaded` and the file count**, both from the
-  suite artifact. No same-regime A/B was run against a non-English locale.
-- **The admin JavaScript byte figures cover three screens** — the dashboard, the users list and the
-  general settings screen — plus one later replication pair on the dashboard. The gate's effect was
-  additionally confirmed present or absent on **eight** admin screens by markup inspection, but those
-  five further screens were not byte-counted. Screens that legitimately need the command palette are
-  unaffected by the gate by design.
-- **The browser instrument covers one screen, one locale and one cache state.** The same-instance
-  DOMContentLoaded A/B was run on `/wp-admin/` in `en_US` only, cache-cold, and by hard reload rather
-  than fresh navigation, for the reason recorded with the figure. It therefore measures the
-  first-visit client cost of one screen, not a fleet average, and it says nothing about a warm-cache
-  return visit beyond the direction of the effect.
-- **The visual-regression suite cannot be used as the appearance guard in this checkout**, because it
-  has no committed snapshots: with nothing to compare against it can neither confirm nor deny a visual
-  change. The appearance evidence in this report is therefore the byte-level output equivalence
-  measured for each arm, plus the browser runtime verification recorded above — including two pairs of
-  byte-identical screenshots — rather than a snapshot diff.
-- **The diagram render check used Mermaid 11.16.1 delivered from a CDN**, which is not necessarily the
-  version the MkDocs `mermaid2` plugin resolves at build time. It proves the block is valid Mermaid
-  and renders cleanly in a current runtime; it does not pin the rendering version this project ships.
-- **QUnit was not re-run**, on the ground that the change set contains no `src/js` changes at all. That
-  is an argument from the diff rather than from a green run, and it is stated as such.
-- **Only the single-site configuration was exercised.** Multisite has its own bootstrap path — the
-  `ms-required` group is excluded from the single-site run by `phpunit.xml.dist` — and no figure or
-  suite result in this report speaks to it.
+1. **The visual-regression suite cannot fail.** The plan names it as the guard for the
+   "no admin UI visual change" boundary, constraint C10 (`docs/technical-specifications.md:853`), and
+   lists the suite directory at `docs/technical-specifications.md:202`, but `tests/visual-regression/specs/__snapshots__/` is empty
+   *and* gitignored (`.gitignore:119`), so no baseline can ever be committed — a first run writes new
+   baselines and passes rather than comparing against a known-good reference. No workflow under
+   `.github/workflows/` references `test:visual` or `visual-regression` either, so it is not a CI
+   gate. The 22 admin snapshot comparisons cited in this report were therefore produced by an
+   external comparison run, not by a suite that would catch a future regression. Committing baselines
+   and adding a workflow job would make the boundary self-enforcing. Highest-value gap of the four.
+2. **The `#wp-admin-bar-root-default` mask covers zero pixels.** `visual-snapshots.test.js` lists it
+   in `elementsToHide` on all 22 specs to suppress admin-bar volatility, but the element is a
+   float-collapsed `<ul>` measuring **1280 × 0** at runtime, so Playwright's mask rectangle has no
+   area and the toolbar is compared normally. Masking `#wpadminbar` instead would give the intent
+   effect. Worth fixing together with item 1, since the two interact.
+3. **The performance reporter has no end-to-end output test.** `isComparableMetric()` is now unit
+   covered and `compare-results.js` is structurally asserted to use it (both in
+   `tests/performance/specs/utils.test.js`), which closes the specific defect that let
+   `wpPhpVersionId` render as `'PHP 0.0.0'`. *That metric no longer exists in the delivered harness at
+   all — it is one of the five withdrawn names — so the defect is now closed by removal as well as by
+   coverage, and the comparator's environment-metric list holds exactly `wpOpcacheEnabled` and
+   `wpOpcacheJit`.* What is still uncovered is the reporter *as a program*:
+   no test feeds it a fixture before/after artifact pair and asserts the rendered console table or
+   `performance-results.md`. A small fixture-driven test would cover value formatting, scenario
+   pairing and cardinality suppression in one place. *A related redundancy is worth recording: the
+   per-iteration sample-count invariant is enforced **twice**, once in `validateResults()` and once in
+   `compare-results.js`. `validateResults()` runs first, so the comparator's own guard is unreachable
+   from the CLI and only protects a caller that assembles stats without validating. That is defensible
+   defence in depth, but it means the comparator's copy has no reachable coverage; consolidating the two
+   or exercising the second directly would remove the ambiguity.*
+4. **Neither `get_comment_count()` nor `wp_get_update_data()` has query-count coverage.** Both were the
+   subject of query-count optimizations that were implemented, measured and then withdrawn (see
+   §*Reconciliation to the delivered tree*), and both ship at base. No test pins the number of queries
+   either function issues, at the base commit or here, so nothing regressed — but the withdrawn work is
+   carried in the opportunity list above, and re-landing it would be unguarded until this gap is
+   closed. Closing it first is the cheap ordering.
+5. **Cross-suite fixture leakage.** Suites do not fully restore global state between runs — the
+   performance suite's `global-setup.js` activates `twentytwentyone` and leaves it active, draft
+   posts accumulate, and `wp_e2e_`-prefixed tables persist. Every measurement in this report was
+   taken with the theme and dataset pinned deliberately, so no figure here is affected, but the
+   leakage makes suite ordering significant when it should not be.
+6. **`single-post.test.js` measures a redirected request, so four of the eighteen scenarios never
+   observe a cold compile.** The spec navigates to `/?p=<id>`-style permalinks that the installed
+   structure — `/%year%/%monthnum%/%postname%/`, set by `tools/local-env/scripts/install.js:49` and
+   identical in CI — answers with a **301**. Playwright follows the redirect, so `timeToFirstByte` and
+   `largestContentfulPaint` are timed from the *first* request while the `wp-*` Server-Timing values
+   arrive from the *second*, already-warm one. The effect is unmistakable in the data: the single-post
+   scenarios report `wpTotal` of 53.91 → 53.80 ms against a `timeToFirstByte` of 437.25 → 359.25 ms,
+   and their peak memory moves by **+0.78 %, −0.42 %, −0.76 %, −0.54 %** — i.e. essentially not at all
+   — while the parse-dominated home scenarios move −5.44 % to −9.50 % on the same change. Nothing here
+   is wrong, and the behaviour is unchanged from the base commit, but it means the single-post
+   scenarios are a warm-regime control rather than a second cold-regime sample, and the report treats
+   them that way. The instrumentation added by this change set is what makes the diagnosis certain
+   rather than inferred: `wpOpcacheHitRate` reads **0.70 %–7.76 %** on the ten direct-200 scenarios and
+   **49.42 %–50.07 %** on all four single-post scenarios — the arithmetic signature of two requests per
+   iteration, one cold and one warm. Pointing the spec at a canonical permalink would give four more
+   cold samples.
+7. **No test or benchmark pins the cost of an autoload resolution.** The restore decision in this
+   change set rests on a measured **≈1.4 µs** per resolved class (in-request, php-fpm, 12 warm samples;
+   1.37–1.89 µs across both CLI opcode-cache regimes with and without `spl_autoload_call()` dispatch),
+   and the resolution path is deliberately short — one `strtr()` case fold, at most six `strncmp()`
+   prefix tests, one `isset()`, one `preg_match()` canonical-path check and one `file_exists()`.
+   `wpAutoloadClass.php` asserts that resolution is *correct*; nothing asserts that it stays *cheap*.
+   A future change that added, say, a filter call or a second stat to that path would silently invert
+   the restore arithmetic with no failing test — and the margin is thinner than the earlier ≈5.4 µs
+   estimate implied, which makes the guard more valuable rather than less. A micro-benchmark assertion
+   with a generous ceiling would close this.
+8. **Nothing guards against the `map_meta_cap()` memo being a net loss on a given screen.** The
+   per-path instrumentation in this report shows the memo is worth **+136 µs** on the post list and
+   **+26 µs** on post edit, is worth **nothing at all** on any anonymous front-end request (zero
+   memoizable calls), and is a **≈−32 µs net loss** on the Dashboard, where 23 misses outnumber
+   6 hits. The delivered code exposes **no** hit/miss counters and offers no switch to disable the
+   memo — both belonged to a superseded implementation — so this backlog item is now larger than it
+   was: a hit-rate guard would first have to add the observability it needs, and no test asserts a
+   hit-rate floor on any screen today. A test that fails when a hot admin screen falls below the measured
+   break-even — **≈45.5 % distinct keys** in the warm regime, **≈38.3 %** in the parse-dominated
+   regime — would turn today's manual finding into a standing guarantee. Because the break-even is
+   regime-dependent, such a test must pin the regime it asserts against.

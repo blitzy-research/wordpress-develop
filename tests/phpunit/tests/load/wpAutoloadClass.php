@@ -20,6 +20,29 @@ require_once ABSPATH . WPINC . '/autoload.php';
 class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 
 	/**
+	 * Scratch directories created by a test, removed when it finishes.
+	 *
+	 * Tracked here rather than removed inline so that a test which fails part way
+	 * through still leaves nothing behind: an abandoned fixture tree would be found
+	 * by the next run's iteration over the temporary directory, and a leftover
+	 * temporary file beside a target is exactly the condition these tests exist to
+	 * detect.
+	 *
+	 * @var string[]
+	 */
+	private $scratch_directories = array();
+
+	public function tear_down() {
+		foreach ( $this->scratch_directories as $directory ) {
+			self::remove_directory_tree( $directory );
+		}
+
+		$this->scratch_directories = array();
+
+		parent::tear_down();
+	}
+
+	/**
 	 * Tests that every generated class map entry points at a readable file.
 	 *
 	 * A mapped value is resolved by the autoloader as `ABSPATH . $path`, so it
@@ -1293,10 +1316,15 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 	 * either rule fails here.
 	 *
 	 * Each name is resolved in a process of its own, so one name cannot be
-	 * satisfied by a file some earlier name happened to load. A name that resolves
-	 * to nothing is not a failure; only a fatal error is.
+	 * satisfied by a file some earlier name happened to load. Both outcomes short
+	 * of a declaration are failures: a process that dies, and a process that
+	 * survives without declaring the name it was asked for. The second shape is
+	 * what an unresolvable dependency now looks like, because the autoloader
+	 * catches the Error such a file raises while it compiles rather than letting a
+	 * request end inside an autoloader, so a map entry that cannot be loaded
+	 * reports as undeclared instead of as a fatal error.
 	 */
-	public function test_no_mapped_name_ends_in_a_fatal_error_when_resolved_alone() {
+	public function test_every_mapped_name_resolves_alone_without_a_fatal_error() {
 		$names = array_keys( self::get_class_map() );
 
 		$this->assertNotEmpty(
@@ -1319,7 +1347,7 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 		foreach ( $names as $name ) {
 			$output = $this->run_isolated_resolution_probe( $probe_file, $name );
 
-			if ( false === strpos( $output, '--WP-AUTOLOAD-RESOLUTION--' ) ) {
+			if ( false === strpos( $output, '--WP-AUTOLOAD-RESOLUTION--resolved' ) ) {
 				$failures[ $name ] = trim( $output );
 			}
 		}
@@ -1335,8 +1363,9 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 		$this->assertSame(
 			array(),
 			$failures,
-			'Resolving a mapped name must not raise a fatal error. Before the class map existed these names were '
-				. "not autoloadable at all, so a reference to one answered false instead of ending the request:\n"
+			'Every mapped name must declare itself when it is resolved on its own, with nothing loaded but the '
+				. 'autoloader. A name reported here either ended its process or survived without being declared, '
+				. "and in both cases it is not loadable in the earliest context that can ask for it:\n"
 				. implode( "\n\n", $reports )
 		);
 	}
@@ -1502,6 +1531,768 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 			$problems,
 			'An entry point exempted from the redeclaration check must bootstrap itself and never reach wp-includes/autoload.php.'
 		);
+	}
+
+	/**
+	 * Tests that the generator builds a map from a fixture that holds every input it reads.
+	 *
+	 * The control for the three refusal tests below. Each of those removes exactly one
+	 * of this fixture's inputs and asserts that the run fails, and without this test
+	 * they would all pass for a fixture the generator could never have built from at
+	 * all, which would prove nothing about the input that was removed.
+	 */
+	public function test_generator_builds_a_class_map_from_a_complete_fixture() {
+		$src_dir = $this->write_generator_fixture();
+		$result  = $this->run_generator( $src_dir );
+
+		$this->assertSame(
+			0,
+			$result['status'],
+			"The generator must build a map from a complete fixture. It reported:\n" . $result['output']
+		);
+
+		$this->assertStringContainsString(
+			'AUTOLOAD_CLASSMAP_DIGEST entries=3',
+			$result['output'],
+			"The fixture declares three mappable names, so the digest must report three entries. It reported:\n" . $result['output']
+		);
+
+		$map_file = $src_dir . 'wp-includes/autoload-classmap.php';
+
+		$this->assertFileExists( $map_file, 'A successful run must publish the class map.' );
+
+		$published = file_get_contents( $map_file );
+
+		$expected = array(
+			"'wp_autoload_fixture' => 'wp-includes/class-wp-autoload-fixture.php'",
+			"'wp_site_health' => 'wp-admin/includes/class-wp-site-health.php'",
+			"'wp_site_health_auto_updates' => 'wp-admin/includes/class-wp-site-health-auto-updates.php'",
+		);
+
+		foreach ( $expected as $entry ) {
+			$this->assertStringContainsString(
+				$entry,
+				$published,
+				'The published map must hold every fixture entry, lower cased and relative to the root.'
+			);
+		}
+	}
+
+	/**
+	 * Tests that the generator refuses to build when a file it maps by name is unreadable.
+	 *
+	 * wp_autoload_classmap_additional_files() opts two files outside `wp-includes/`
+	 * into the map by name, because the bootstrap stopped requiring them on every
+	 * request and the map is now the only thing that keeps the classes they declare
+	 * resolvable. An unreadable one is therefore not a file this run merely does not
+	 * cover: it is an entry the map is expected to hold. Dropping it would still
+	 * produce a map that looks complete, and the class would go missing at runtime
+	 * instead of at build time.
+	 */
+	public function test_generator_fails_when_a_file_mapped_by_name_cannot_be_read() {
+		$src_dir = $this->write_generator_fixture( array( 'wp-admin/includes/class-wp-site-health.php' => null ) );
+		$result  = $this->run_generator( $src_dir );
+
+		$this->assertSame(
+			1,
+			$result['status'],
+			"An unreadable file that the map opts in by name must fail the run. It reported:\n" . $result['output']
+		);
+
+		$this->assertStringContainsString(
+			'Unable to read ' . $src_dir . 'wp-admin/includes/class-wp-site-health.php, which is mapped by name',
+			$result['output'],
+			'The diagnostic must name the opted in file that could not be read.'
+		);
+
+		$this->assertFileDoesNotExist(
+			$src_dir . 'wp-includes/autoload-classmap.php',
+			'A refused run must publish nothing.'
+		);
+	}
+
+	/**
+	 * Tests that the generator refuses to build when the prefix list cannot be read.
+	 *
+	 * wp_autoload_classmap_core_prefixes() reads $core_prefixes out of
+	 * wp-includes/autoload.php, and every candidate name is checked against that list
+	 * before it can be mapped. An empty list is not an inert value: it is the value
+	 * that switches the check off. A run that could not read the authority and carried
+	 * on would therefore map names the autoloader prefilters away, and the map would
+	 * look like a legitimate result while holding entries that can never be resolved.
+	 * Refusing the build is what keeps an unreadable list from being mistaken for an
+	 * empty one.
+	 */
+	public function test_generator_fails_when_the_prefix_authority_cannot_be_read() {
+		$src_dir = $this->write_generator_fixture( array( 'wp-includes/autoload.php' => '' ) );
+		$result  = $this->run_generator( $src_dir );
+
+		$this->assertSame(
+			1,
+			$result['status'],
+			"An unreadable prefix authority must fail the run. It reported:\n" . $result['output']
+		);
+
+		$this->assertStringContainsString(
+			$src_dir . 'wp-includes/autoload.php',
+			$result['output'],
+			'The diagnostic must name the file that could not be read.'
+		);
+
+		$this->assertStringContainsString(
+			'Refusing to build a class map without them',
+			$result['output'],
+			'The diagnostic must say why the run stopped rather than only that it stopped.'
+		);
+
+		$this->assertFileDoesNotExist(
+			$src_dir . 'wp-includes/autoload-classmap.php',
+			'A refused run must publish nothing.'
+		);
+	}
+
+	/**
+	 * Tests that the generator refuses to build when the authority declares no prefixes.
+	 *
+	 * The unreadable case above is not the only way the list can arrive empty: the
+	 * file can be perfectly readable and still not declare one, either because the
+	 * variable is gone or because it is there and holds nothing. Both reach the same
+	 * place as an unreadable file - a build with the prefix check switched off - so
+	 * both are refused, and both are asserted here because they are separate branches.
+	 *
+	 * @dataProvider data_authorities_without_a_prefix_list
+	 *
+	 * @param string $autoloader Contents to write to wp-includes/autoload.php.
+	 */
+	public function test_generator_fails_when_the_prefix_authority_declares_no_prefixes( $autoloader ) {
+		$src_dir = $this->write_generator_fixture( array( 'wp-includes/autoload.php' => $autoloader ) );
+		$result  = $this->run_generator( $src_dir );
+
+		$this->assertSame(
+			1,
+			$result['status'],
+			"An authority that declares no prefixes must fail the run. It reported:\n" . $result['output']
+		);
+
+		$this->assertStringContainsString(
+			'No $core_prefixes list could be read from ' . $src_dir . 'wp-includes/autoload.php',
+			$result['output'],
+			'The diagnostic must name both the missing list and the file it was expected in.'
+		);
+
+		$this->assertFileDoesNotExist(
+			$src_dir . 'wp-includes/autoload-classmap.php',
+			'A refused run must publish nothing.'
+		);
+	}
+
+	/**
+	 * Data provider.
+	 *
+	 * @return array[]
+	 */
+	public function data_authorities_without_a_prefix_list() {
+		return array(
+			'no prefix list at all' => array(
+				"<?php\nfunction wp_autoload_class( \$class_name ) {\n\treturn null;\n}\n",
+			),
+			'an empty prefix list'  => array(
+				"<?php\nfunction wp_autoload_class( \$class_name ) {\n\t\$core_prefixes = array();\n\n\treturn \$core_prefixes;\n}\n",
+			),
+		);
+	}
+
+	/**
+	 * Tests that the generator refuses to build when a bootstrapped file cannot be read.
+	 *
+	 * wp_autoload_classmap_bootstrap_closure() walks the unconditional file scope
+	 * requires out of wp-settings.php to learn which names the bootstrap already
+	 * declares, and a file it cannot read contributes nothing to that set. Carrying on
+	 * would map a name the bootstrap goes on to declare with a plain `require`, and
+	 * that is the one shape of entry that ends in a redeclaration fatal rather than in
+	 * a missing class. The walk therefore stops instead of guessing.
+	 */
+	public function test_generator_fails_when_a_bootstrapped_file_cannot_be_read() {
+		$src_dir = $this->write_generator_fixture( array( 'wp-includes/plugin.php' => null ) );
+		$result  = $this->run_generator( $src_dir );
+
+		$this->assertSame(
+			1,
+			$result['status'],
+			"An unreadable bootstrapped file must fail the run. It reported:\n" . $result['output']
+		);
+
+		$this->assertStringContainsString(
+			'Unable to read ' . $src_dir . 'wp-includes/plugin.php, which the bootstrap requires unconditionally',
+			$result['output'],
+			'The diagnostic must name the file the bootstrap requires and could not be read.'
+		);
+
+		$this->assertFileDoesNotExist(
+			$src_dir . 'wp-includes/autoload-classmap.php',
+			'A refused run must publish nothing.'
+		);
+	}
+
+	/**
+	 * Tests that the temporary file the generator writes through is unguessable.
+	 *
+	 * The map is published by renaming a temporary file over it, and that temporary
+	 * file is the only thing the write ever touches, so its name is what decides
+	 * whether the write can be diverted. A name derived from the process ID is
+	 * guessable and the operating system reuses it, so anything able to write the
+	 * directory could put a file - or a symbolic link to one it does not own - at
+	 * that path first, and the write would follow it. The name is therefore random
+	 * per call, and the create is exclusive so that a path that already exists is
+	 * refused rather than opened.
+	 */
+	public function test_generator_temporary_file_is_unguessable_and_created_exclusively() {
+		$this->require_generator();
+
+		$directory = $this->make_scratch_directory();
+		$target    = $directory . 'map.php';
+
+		$first  = wp_autoload_classmap_open_temporary_file( $target );
+		$second = wp_autoload_classmap_open_temporary_file( $target );
+
+		$this->assertIsResource( $first['handle'], 'The temporary file must be returned open for writing.' );
+
+		$this->assertMatchesRegularExpression(
+			'#^' . preg_quote( $target, '#' ) . '\.tmp[0-9a-f]{32}$#',
+			$first['path'],
+			'The temporary file must sit beside its target under a name of 16 random bytes, so that the rename stays on one filesystem and the name cannot be predicted.'
+		);
+
+		$this->assertNotSame(
+			$first['path'],
+			$second['path'],
+			'Two temporary files created in one process must not share a name.'
+		);
+
+		/*
+		 * Compared as whole values rather than searched for as a substring. The suffix is 32
+		 * hexadecimal characters, so a short process ID -- and a container routinely gives out
+		 * single digit ones -- occurs inside it by chance about seven times in eight, which
+		 * would make a substring check report a defect at random instead of when there is one.
+		 * What actually rules out a name derived from the process ID is asserted above and
+		 * here together: the process ID is fixed for the length of the run, yet the two names
+		 * created in that one run differ, and neither is the process ID rendered in either
+		 * base and padded to the width of the field.
+		 */
+		$suffix = substr( $first['path'], strlen( $target . '.tmp' ) );
+		$pid    = getmypid();
+
+		foreach ( array( (string) $pid, dechex( $pid ) ) as $derived ) {
+			foreach ( array( STR_PAD_LEFT, STR_PAD_RIGHT ) as $padding ) {
+				$this->assertNotSame(
+					str_pad( $derived, 32, '0', $padding ),
+					$suffix,
+					'The temporary name must not be derived from the process ID, which is guessable and reused.'
+				);
+			}
+		}
+
+		$this->assertFalse(
+			is_link( $first['path'] ),
+			'The temporary file must be a file, never a link to one.'
+		);
+
+		$status = lstat( $first['path'] );
+
+		$this->assertSame(
+			0100000,
+			$status['mode'] & 0170000,
+			'The temporary file must be a regular file.'
+		);
+
+		$this->assertSame(
+			1,
+			(int) $status['nlink'],
+			'Nothing but the created path may reach the temporary file.'
+		);
+
+		$this->assertSame(
+			0600,
+			$status['mode'] & 0777,
+			'The temporary file must never be group or world readable while the map is being written into it.'
+		);
+
+		$reopened = @fopen( $first['path'], 'xb' ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+
+		$this->assertFalse(
+			$reopened,
+			'The mode the temporary file is created under must be exclusive, so that an existing path is refused instead of written.'
+		);
+
+		fclose( $first['handle'] );
+		fclose( $second['handle'] );
+	}
+
+	/**
+	 * Tests that a temporary file is removed when the generator gives up on it.
+	 *
+	 * Every checked step of the publication reports through this one path, so it is
+	 * what keeps a failed generation from leaving a partly written map beside the real
+	 * one in a tracked directory. The handle is closed before the unlink because the
+	 * file is removed by the name it was created under, and an open handle would keep
+	 * the bytes alive for the rest of the process.
+	 */
+	public function test_generator_discards_a_temporary_file_when_publication_fails() {
+		$this->require_generator();
+
+		$directory = $this->make_scratch_directory();
+		$temporary = wp_autoload_classmap_open_temporary_file( $directory . 'map.php' );
+		$message   = 'Cannot write the autoload class map: this run gave up on purpose.';
+
+		try {
+			wp_autoload_classmap_discard_temporary_file( $temporary['handle'], $temporary['path'], $message );
+
+			$this->fail( 'Discarding a temporary file must report the failure that caused it.' );
+		} catch ( RuntimeException $exception ) {
+			$this->assertSame(
+				$message,
+				$exception->getMessage(),
+				'The diagnostic that caused the discard must be the one reported.'
+			);
+		}
+
+		$this->assertFileDoesNotExist(
+			$temporary['path'],
+			'A discarded temporary file must be removed from the tree.'
+		);
+
+		$this->assertFalse(
+			is_resource( $temporary['handle'] ),
+			'A discarded temporary file must be closed, so that its bytes are actually released.'
+		);
+	}
+
+	/**
+	 * Tests that the generator publishes the map by replacing it in one step.
+	 *
+	 * The map is a tracked artifact that the build copies into `build/` and that the
+	 * workflows compare with `git diff --exit-code`, so a half written map is worse
+	 * than none: it reads as a legitimate result while resolving only the names that
+	 * reached the disk. Writing elsewhere and renaming is what makes a reader see
+	 * either the whole previous file or the whole new one. The mode the file already
+	 * carried is restored too, because a file created for this write would otherwise
+	 * publish whatever the umask of the build happened to be.
+	 */
+	public function test_generator_publishes_the_class_map_by_atomic_replacement() {
+		$this->require_generator();
+
+		$directory = $this->make_scratch_directory();
+		$target    = $directory . 'map.php';
+		$contents  = "<?php\n\nreturn array( 'wp_autoload_fixture' => 'wp-includes/class-wp-autoload-fixture.php' );\n";
+
+		file_put_contents( $target, "<?php\n\nreturn array();\n" );
+		chmod( $target, 0644 );
+
+		wp_autoload_classmap_replace_file( $target, $contents );
+		clearstatcache( true, $target );
+
+		$this->assertSame(
+			$contents,
+			file_get_contents( $target ),
+			'The published file must hold exactly what was rendered.'
+		);
+
+		$status = lstat( $target );
+
+		$this->assertSame(
+			0100000,
+			$status['mode'] & 0170000,
+			'The published map must be a regular file.'
+		);
+
+		$this->assertSame(
+			1,
+			(int) $status['nlink'],
+			'Nothing but the published path may reach the map.'
+		);
+
+		$this->assertSame(
+			0644,
+			$status['mode'] & 0777,
+			'Publication must restore the mode the map already carried rather than the mode of the temporary file.'
+		);
+
+		$this->assertSame(
+			array(),
+			glob( $directory . '*.tmp*' ),
+			'Publication must leave no temporary file beside the map.'
+		);
+	}
+
+	/**
+	 * Tests that publication replaces a symbolically linked target instead of following it.
+	 *
+	 * The rename acts on the link itself, so a link left at the map's path is replaced
+	 * by the real file rather than used as a route to whatever it points at. Without
+	 * that, a link planted at the path would turn every build into a write to a file
+	 * of someone else's choosing, and the `chmod()` that restores the map's mode would
+	 * relax the mode of that file as well.
+	 */
+	public function test_generator_publication_does_not_write_through_a_linked_target() {
+		$this->require_generator();
+
+		$directory = $this->make_scratch_directory();
+		$victim    = $directory . 'victim.php';
+		$target    = $directory . 'map.php';
+		$contents  = "<?php\n\nreturn array();\n";
+
+		file_put_contents( $victim, "<?php\n\n// Not the map.\n" );
+		chmod( $victim, 0600 );
+
+		$this->assertTrue( symlink( $victim, $target ), 'The linked target fixture must be created.' );
+
+		wp_autoload_classmap_replace_file( $target, $contents );
+		clearstatcache( true, $victim );
+		clearstatcache( true, $target );
+
+		$this->assertSame(
+			"<?php\n\n// Not the map.\n",
+			file_get_contents( $victim ),
+			'Publication must not write through a link, so the file it pointed at must be untouched.'
+		);
+
+		$this->assertSame(
+			0600,
+			fileperms( $victim ) & 0777,
+			'Publication must not relax the mode of the file a planted link pointed at.'
+		);
+
+		$this->assertFalse(
+			is_link( $target ),
+			'Publication must replace the link with the map itself.'
+		);
+
+		$this->assertSame(
+			$contents,
+			file_get_contents( $target ),
+			'The published path must hold the map after the link is replaced.'
+		);
+
+		$this->assertSame(
+			array(),
+			glob( $directory . '*.tmp*' ),
+			'Publication must leave no temporary file beside the map.'
+		);
+	}
+
+	/**
+	 * Tests that a mapped file which cannot be bound is contained rather than fatal.
+	 *
+	 * The autoloader's last step is the one it does not control: compiling a mapped file binds
+	 * that file's declaration, and a declaration whose parent is undeclared raises an Error
+	 * while it is being bound. The `catch ( Error )` around the `require_once` exists so that
+	 * such a file cannot end the request from inside an autoloader.
+	 *
+	 * That branch is unreachable against the shipped tree, because the generator refuses to map
+	 * a declaration whose parent it cannot account for, so measuring the real class map leaves
+	 * the branch untested: the `catch` can be deleted outright and nothing fails. It is reached
+	 * here by pointing ABSPATH at a synthetic root that maps one name to a file which cannot
+	 * bind, while the code under test stays the shipped `wp-includes/autoload.php` rather than a
+	 * copy of it.
+	 *
+	 * Four properties are required of the outcome, and the difference between them matters:
+	 * surviving says the error did not escape; the target staying undeclared says the error was
+	 * not papered over; the file being recorded as included says the failure really happened at
+	 * bind time rather than the file having been declined earlier; and the handler behind this
+	 * one being asked for the same name says the turn was passed on rather than consumed.
+	 */
+	public function test_a_mapped_file_that_cannot_be_bound_is_contained() {
+		$report = $this->get_containment_probe_report();
+
+		$this->assertTrue(
+			$report['survived'],
+			'A mapped file that cannot be bound must not end the request from inside the autoloader.'
+		);
+
+		$this->assertFalse(
+			$report['throwing_first'],
+			'A mapped file that cannot be bound must leave its name undeclared, exactly as an unmapped name does.'
+		);
+
+		$this->assertTrue(
+			$report['file_included'],
+			'The mapped file must have been reached and required, which is what makes the contained error the branch under test rather than an earlier decline.'
+		);
+
+		$this->assertFalse(
+			$report['throwing_second'],
+			'Asking a second time must decline again rather than fatally redeclare, which is what require_once rather than require provides.'
+		);
+
+		$this->assertTrue(
+			$report['healthy'],
+			'The handler must go on resolving other mapped names after containing an error.'
+		);
+	}
+
+	/**
+	 * Tests that containing the error leaves the rest of the autoload chain its turn.
+	 *
+	 * SPL calls registered autoloaders in order until the name is declared. A handler that
+	 * declines has to leave the name to the handlers behind it, and one that ends the chain
+	 * while returning quietly is indistinguishable from one that declines properly unless the
+	 * handler behind it is watched. So a second handler is registered after the core one, and
+	 * what it was asked for is what is asserted here.
+	 *
+	 * Both names in the chain are required: the undeclared parent reaches the chain while the
+	 * mapped file is being bound, and the mapped name itself reaches it after the core handler
+	 * has contained the error and returned.
+	 */
+	public function test_containing_the_error_leaves_the_rest_of_the_chain_its_turn() {
+		$report = $this->get_containment_probe_report();
+
+		$this->assertSame(
+			array( 'wp_autoload_class', 'object' ),
+			$report['handlers'],
+			'The core handler must be registered first and the probe handler behind it, or the chaining this measures is not being measured.'
+		);
+
+		$this->assertContains(
+			'WP_Autoload_Probe_Absent_Parent',
+			$report['chain'],
+			'The undeclared parent must reach the handler behind the core one while the mapped file is being bound.'
+		);
+
+		$this->assertSame(
+			2,
+			count( array_keys( $report['chain'], 'WP_Autoload_Probe_Throwing', true ) ),
+			'Both attempts at the mapped name must reach the handler behind the core one, because the core one declined both.'
+		);
+
+		$this->assertTrue(
+			$report['later'],
+			'A name only the handler behind the core one can declare must still be declared, so the chain is intact rather than merely unbroken once.'
+		);
+	}
+
+	/**
+	 * Tests that a mapped file which is not on disk is declined without being reached.
+	 *
+	 * The two ways a mapped entry can fail to produce a class look the same to a caller and are
+	 * not the same event: this one is caught by the `file_exists()` check before anything is
+	 * loaded, while the previous test's is caught after the file has been required. Asserting
+	 * both against the same synthetic root is what keeps either from being mistaken for the
+	 * other, and what keeps the earlier check from being deleted on the grounds that the
+	 * `catch` would cover it -- it would not, because a missing file raises a fatal
+	 * `require_once` warning-and-error pair rather than a catchable bind error.
+	 */
+	public function test_a_mapped_file_that_is_not_on_disk_is_declined_before_it_is_loaded() {
+		$report = $this->get_containment_probe_report();
+
+		$this->assertFalse(
+			$report['vanished'],
+			'A name mapped to a file that is not on disk must be declined.'
+		);
+
+		$this->assertFalse(
+			$report['vanished_included'],
+			'A file that is not on disk must never be reached by an include, which is what the file_exists() check before the require provides.'
+		);
+	}
+
+	/**
+	 * Tests that the autoloader leaves WP_Object_Cache to an object-cache.php drop-in.
+	 *
+	 * `wp-content/object-cache.php` replaces `WP_Object_Cache` wholesale, and WordPress loads
+	 * that drop-in from `wp_start_object_cache()` rather than by referencing the class. If the
+	 * class map claimed the name, then any reference reached before the drop-in was loaded --
+	 * and `wp_using_ext_object_cache()`, `wp_cache_init()` and every early cache call are such
+	 * references -- would resolve to the core file and declare the core class, after which the
+	 * drop-in's own declaration would be a fatal redeclaration.
+	 *
+	 * The name is therefore absent from the map by design, and its absence is asserted from
+	 * outside: a fresh process installs the autoloader, asks for the name, and then loads a
+	 * replacement. Whether the replacement owns the symbol afterwards is the property that
+	 * matters, and it is only observable in a process where the core class is not already
+	 * declared, which the suite's own process is not.
+	 */
+	public function test_the_autoloader_leaves_the_object_cache_to_a_drop_in() {
+		$this->assertArrayNotHasKey(
+			'wp_object_cache',
+			self::get_class_map(),
+			'WP_Object_Cache must stay out of the class map, because an object-cache.php drop-in declares it.'
+		);
+
+		$report = $this->run_isolated_probe(
+			DIR_TESTDATA . '/isolated/object-cache-dropin-probe.php',
+			array( ABSPATH, DIR_TESTDATA . '/isolated/object-cache-dropin.php' )
+		);
+
+		$this->assertFalse(
+			$report['core_claimed'],
+			'Asking for WP_Object_Cache must not resolve through the autoloader, or a drop-in could not declare it.'
+		);
+
+		$this->assertTrue(
+			$report['replacement_declared'],
+			'The replacement cache must be the one that ends up instantiated.'
+		);
+
+		$this->assertSame(
+			'drop-in',
+			$report['implementation'],
+			'The symbol must belong to the drop-in rather than to the core class.'
+		);
+
+		$this->assertSame(
+			realpath( DIR_TESTDATA . '/isolated/object-cache-dropin.php' ),
+			realpath( (string) $report['declaration_file'] ),
+			'WP_Object_Cache must be declared by the drop-in file.'
+		);
+	}
+
+	/**
+	 * Runs the containment probe against a synthetic root and returns what it observed.
+	 *
+	 * The root is built here rather than committed, because it has to contain a class map that
+	 * the generator would refuse to produce and a file that cannot be compiled. Committing
+	 * either would put a file in the tree that the suite's own "every mapped entry is readable
+	 * and bindable" tests would then have to be taught to ignore.
+	 *
+	 * Memoized for the run, because three tests read one probe's report and the process is
+	 * spawned once per report.
+	 *
+	 * @return array Decoded probe report.
+	 */
+	private function get_containment_probe_report() {
+		static $report = null;
+
+		if ( null !== $report ) {
+			return $report;
+		}
+
+		$root = get_temp_dir() . 'wp-autoload-containment-' . md5( __CLASS__ . ABSPATH ) . '/';
+
+		$files = array(
+			'wp-includes/autoload-classmap.php'       => "<?php\nreturn array(\n"
+				. "\t'wp_autoload_probe_throwing' => 'wp-includes/class-wp-autoload-probe-throwing.php',\n"
+				. "\t'wp_autoload_probe_healthy' => 'wp-includes/class-wp-autoload-probe-healthy.php',\n"
+				. "\t'wp_autoload_probe_vanished' => 'wp-includes/class-wp-autoload-probe-vanished.php',\n"
+				. ");\n",
+			// Its parent is declared nowhere and by nothing, so binding it raises an Error.
+			'wp-includes/class-wp-autoload-probe-throwing.php' => "<?php\nclass WP_Autoload_Probe_Throwing extends WP_Autoload_Probe_Absent_Parent {}\n",
+			'wp-includes/class-wp-autoload-probe-healthy.php' => "<?php\nclass WP_Autoload_Probe_Healthy {}\n",
+			// Reachable only through the handler registered behind the core one.
+			'later/class-wp-autoload-probe-later.php' => "<?php\nclass WP_Autoload_Probe_Later {}\n",
+		);
+
+		foreach ( $files as $relative => $contents ) {
+			$path = $root . $relative;
+
+			if ( ! is_dir( dirname( $path ) ) ) {
+				$this->assertTrue(
+					mkdir( dirname( $path ), 0777, true ),
+					'The synthetic root for the containment probe must be creatable.'
+				);
+			}
+
+			$this->assertNotFalse(
+				file_put_contents( $path, $contents ),
+				"The containment probe fixture {$relative} must be writable."
+			);
+		}
+
+		// Mapped but deliberately never written, which is the branch the file_exists() check owns.
+		$this->assertFileDoesNotExist(
+			$root . 'wp-includes/class-wp-autoload-probe-vanished.php',
+			'The vanished fixture must not exist, or the branch it measures is not reached.'
+		);
+
+		try {
+			$report = $this->run_isolated_probe(
+				DIR_TESTDATA . '/isolated/autoload-containment-probe.php',
+				array( $root, ABSPATH . WPINC . '/autoload.php' )
+			);
+		} finally {
+			foreach ( array_keys( $files ) as $relative ) {
+				if ( file_exists( $root . $relative ) ) {
+					unlink( $root . $relative );
+				}
+			}
+
+			foreach ( array( 'wp-includes', 'later' ) as $directory ) {
+				if ( is_dir( $root . $directory ) ) {
+					rmdir( $root . $directory );
+				}
+			}
+
+			if ( is_dir( $root ) ) {
+				rmdir( $root );
+			}
+		}
+
+		return $report;
+	}
+
+	/**
+	 * Runs one committed isolated probe and returns its decoded report.
+	 *
+	 * Every probe under tests/phpunit/data/isolated writes one JSON object to standard output
+	 * and nothing else, so all three streams are checked rather than only the payload: a notice
+	 * on standard error or a nonzero exit status is a failure of the thing being probed even
+	 * when the payload arrives intact. The interpreter flags make that check meaningful by
+	 * turning every diagnostic on and routing it to standard error rather than into the report.
+	 *
+	 * @param string   $probe     Absolute path of the probe.
+	 * @param string[] $arguments Arguments to pass to the probe.
+	 * @return array Decoded probe report.
+	 */
+	private function run_isolated_probe( $probe, $arguments ) {
+		$this->assertFileIsReadable( $probe, 'The isolated probe must be readable.' );
+
+		$command = array_merge(
+			array(
+				WP_PHP_BINARY,
+				'-d',
+				'error_reporting=-1',
+				'-d',
+				'display_errors=STDERR',
+				'-d',
+				'log_errors=0',
+				$probe,
+			),
+			$arguments
+		);
+
+		$descriptors = array(
+			0 => array( 'pipe', 'r' ),
+			1 => array( 'pipe', 'w' ),
+			2 => array( 'pipe', 'w' ),
+		);
+
+		$process = proc_open( $command, $descriptors, $pipes );
+
+		$this->assertIsResource( $process, 'The isolated probe process must start.' );
+
+		// The probes read nothing, and an open pipe would keep one waiting for input.
+		fclose( $pipes[0] );
+
+		$stdout = stream_get_contents( $pipes[1] );
+		$stderr = stream_get_contents( $pipes[2] );
+
+		fclose( $pipes[1] );
+		fclose( $pipes[2] );
+
+		$exit_code = proc_close( $process );
+
+		$probe_name = basename( $probe );
+
+		$this->assertSame( '', $stderr, "The {$probe_name} probe must report nothing on standard error." );
+		$this->assertSame( 0, $exit_code, "The {$probe_name} probe must exit successfully." );
+
+		$report = json_decode( $stdout, true );
+
+		$this->assertIsArray(
+			$report,
+			"The {$probe_name} probe must write one readable JSON object and nothing else. It wrote:\n" . $stdout
+		);
+
+		return $report;
 	}
 
 	/**
@@ -2362,13 +3153,13 @@ PROBE;
 				'kind'      => 'class',
 			),
 			array(
-				'requested' => 'WP_LIST_UTIL',
-				'canonical' => 'WP_List_Util',
+				'requested' => 'WP_HTML_TOKEN',
+				'canonical' => 'WP_HTML_Token',
 				'kind'      => 'class',
 			),
 			array(
-				'requested' => 'Wp_Token_Map',
-				'canonical' => 'WP_Token_Map',
+				'requested' => 'Wp_Ajax_Response',
+				'canonical' => 'WP_Ajax_Response',
 				'kind'      => 'class',
 			),
 			array(
@@ -2566,19 +3357,34 @@ PROBE;
 	/**
 	 * Returns the source of the isolated resolution probe.
 	 *
-	 * Installs what a mapped symbol may depend on, and deliberately nothing else:
+	 * Installs the class autoloader and, apart from one stub, nothing else at all:
 	 *
-	 * - The two vendored autoloaders, so that a declaration inheriting from one of
-	 *   those namespaces resolves rather than reaching an undeclared parent.
+	 * - wp-includes/autoload.php, which needs only the ABSPATH and WPINC constants.
 	 * - A stub for _deprecated_file(), which core declares in functions.php. Two
 	 *   mapped files announce their own deprecation as they load, and without the
 	 *   stub they would fail on an undefined function rather than on anything to do
 	 *   with the class map.
 	 *
-	 * The libraries core loads only where they are used are omitted, so a mapped
-	 * name that inherits from one of them fails here. The sentinel is emitted only
-	 * once the name has been resolved, so its absence is what reports a process that
-	 * did not survive resolving it.
+	 * No vendored autoloader is registered here, and that omission is the point.
+	 * wp-settings.php requires wp-includes/autoload.php near the top of the file,
+	 * which is the first line from which a mapped name can be asked for; the two
+	 * vendored autoloaders - WpOrg\Requests\Autoload::register() inside
+	 * class-wp-http.php, and php-ai-client/autoload.php for the WordPress\AiClient
+	 * and WordPress\AiClientDependencies prefixes - are required roughly 180 lines
+	 * further down, and the SHORTINIT early return sits between the two points. So
+	 * this process holds strictly less than any real early context does: less than a
+	 * SHORTINIT bootstrap, less than an object-cache.php or advanced-cache.php
+	 * drop-in, less than a must-use plugin. A name that resolves here therefore
+	 * resolves in all of them, and a name that needs a vendored library to compile
+	 * fails here rather than being masked by a library the bootstrap only registers
+	 * later. Such a name belongs in the eager bootstrap, which is where the
+	 * generator leaves it.
+	 *
+	 * The sentinel records that the resolution attempt completed, and carries whether
+	 * the name came out resolved or unresolved, so its absence is what reports a
+	 * process that did not survive the attempt. Being unresolved is not a failure
+	 * here: a name the autoloader declines is covered by its own tests, while a fatal
+	 * error leaves no sentinel at all.
 	 *
 	 * @return string The probe source.
 	 */
@@ -2590,12 +3396,6 @@ define( 'WPINC', 'wp-includes' );
 
 // Declared by core in wp-includes/functions.php, which this probe does not load.
 function _deprecated_file( $file, $version, $replacement = '', $message = '' ) {}
-
-foreach ( array( '/Requests/src/Autoload.php', '/php-ai-client/autoload.php' ) as $vendor_autoloader ) {
-	require ABSPATH . WPINC . $vendor_autoloader;
-}
-
-WpOrg\Requests\Autoload::register();
 
 require ABSPATH . WPINC . '/autoload.php';
 
@@ -2948,5 +3748,167 @@ PROBE;
 		}
 
 		return null;
+	}
+
+	/**
+	 * Creates an empty scratch directory and returns it.
+	 *
+	 * Unique per call, so that two tests exercising the publication path cannot see
+	 * each other's temporary files, and registered for removal so that a test which
+	 * fails before its own cleanup still leaves the temporary directory as it found it.
+	 *
+	 * @return string Absolute path of the directory, with a trailing slash.
+	 */
+	private function make_scratch_directory() {
+		$directory = get_temp_dir() . 'wp-autoload-scratch-' . bin2hex( random_bytes( 8 ) ) . '/';
+
+		$this->assertTrue(
+			mkdir( $directory, 0755 ),
+			'The scratch directory must be creatable in the temporary directory.'
+		);
+
+		$this->scratch_directories[] = $directory;
+
+		return $directory;
+	}
+
+	/**
+	 * Writes a minimal tree the class map generator can be run against.
+	 *
+	 * A purpose built tree rather than a copy of `src`: the refusal tests need one
+	 * input removed and nothing else different, and on a real tree the removal of a
+	 * bootstrapped file would take a hundred other files out of the closure with it,
+	 * so what the run had actually objected to would no longer be clear. The tree
+	 * holds one of each input the generator reads - the bootstrap, the prefix
+	 * authority the bootstrap requires, a second bootstrapped file, and one mappable
+	 * single class file - which is the smallest tree that can be built from and is
+	 * therefore the smallest tree a removal can be attributed in.
+	 *
+	 * @param array $overrides Optional. Contents to write for a relative path instead
+	 *                         of the default, or null to leave that path out of the
+	 *                         tree entirely. Default empty array.
+	 * @return string Absolute path of the fixture's root, with a trailing slash.
+	 */
+	private function write_generator_fixture( $overrides = array() ) {
+		$files = array(
+			'wp-settings.php'                            => "<?php\nrequire ABSPATH . WPINC . '/autoload.php';\nrequire ABSPATH . WPINC . '/plugin.php';\n",
+			'wp-includes/autoload.php'                   => "<?php\nfunction wp_autoload_class( \$class_name ) {\n\t\$core_prefixes = array( 'wp_', 'walker' );\n\n\treturn \$core_prefixes;\n}\n",
+			'wp-includes/plugin.php'                     => "<?php\nfunction wp_autoload_fixture_helper() {}\n",
+			'wp-includes/class-wp-autoload-fixture.php'  => "<?php\nclass WP_Autoload_Fixture {}\n",
+
+			/*
+			 * The two paths wp_autoload_classmap_additional_files() opts in by name.
+			 * Present here because the generator requires every one of them to be
+			 * readable, which is what test_generator_fails_when_a_file_mapped_by_name_cannot_be_read()
+			 * removes one of them to assert.
+			 */
+			'wp-admin/includes/class-wp-site-health.php' => "<?php\nclass WP_Site_Health {}\n",
+			'wp-admin/includes/class-wp-site-health-auto-updates.php' => "<?php\nclass WP_Site_Health_Auto_Updates {}\n",
+		);
+
+		$src_dir = $this->make_scratch_directory() . 'src/';
+
+		foreach ( array( 'wp-includes', 'wp-admin/includes' ) as $directory ) {
+			$this->assertTrue(
+				mkdir( $src_dir . $directory, 0755, true ),
+				'The fixture directory ' . $directory . ' must be creatable.'
+			);
+		}
+
+		foreach ( $files as $relative => $contents ) {
+			if ( array_key_exists( $relative, $overrides ) ) {
+				$contents = $overrides[ $relative ];
+
+				// A null override leaves the path out, which is what makes it unreadable.
+				if ( null === $contents ) {
+					continue;
+				}
+			}
+
+			$this->assertNotFalse(
+				file_put_contents( $src_dir . $relative, $contents ),
+				'The fixture file ' . $relative . ' must be writable.'
+			);
+		}
+
+		return $src_dir;
+	}
+
+	/**
+	 * Runs the class map generator against a tree and returns what it reported.
+	 *
+	 * Spawned as its own process, with the same PHP binary the test bootstrap uses for
+	 * its install step, because the contract under test is the one
+	 * `grunt build:autoload-classmap` depends on: a nonzero exit status is what fails
+	 * the build rather than shipping whatever is on disk. Running the generator's
+	 * functions in process would also memoize the prefix list read from the real tree,
+	 * which is the very input a refusal test removes. Standard error is folded in
+	 * because that is where the diagnostic goes.
+	 *
+	 * @param string $src_dir Absolute path of the tree to build from.
+	 * @return array {
+	 *     What the run reported.
+	 *
+	 *     @type int    $status Exit status of the process.
+	 *     @type string $output Everything it wrote to either stream.
+	 * }
+	 */
+	private function run_generator( $src_dir ) {
+		$command = sprintf(
+			'%s %s %s 2>&1',
+			WP_PHP_BINARY,
+			escapeshellarg( self::get_generator_path() ),
+			escapeshellarg( $src_dir )
+		);
+
+		$output = array();
+		$status = null;
+
+		exec( $command, $output, $status );
+
+		$this->assertIsInt(
+			$status,
+			'The class map generator must run in a separate PHP process. Process spawning is required by the test bootstrap itself.'
+		);
+
+		return array(
+			'status' => $status,
+			'output' => implode( "\n", $output ),
+		);
+	}
+
+	/**
+	 * Removes a directory and everything below it.
+	 *
+	 * Links are unlinked rather than followed, so that removing the fixture of
+	 * test_generator_publication_does_not_write_through_a_linked_target() cannot
+	 * itself become the thing that reaches through one.
+	 *
+	 * @param string $path Absolute path to remove.
+	 * @return void
+	 */
+	private static function remove_directory_tree( $path ) {
+		if ( ! is_dir( $path ) || is_link( untrailingslashit( $path ) ) ) {
+			@unlink( untrailingslashit( $path ) ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+
+			return;
+		}
+
+		foreach ( scandir( $path ) as $entry ) {
+			if ( '.' === $entry || '..' === $entry ) {
+				continue;
+			}
+
+			$child = trailingslashit( $path ) . $entry;
+
+			if ( is_dir( $child ) && ! is_link( $child ) ) {
+				self::remove_directory_tree( $child );
+				continue;
+			}
+
+			@unlink( $child ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+		}
+
+		@rmdir( $path ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
 	}
 }

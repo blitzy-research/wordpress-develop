@@ -39,6 +39,34 @@
  * Condition 3 is transitive, so it is applied repeatedly until the map stops
  * shrinking: dropping a parent has to drop everything that inherits from it.
  *
+ * A fourth condition is enforced below rather than stated as eligibility, because
+ * it is about the bootstrap rather than about the file: a file that
+ * `wp-settings.php` reaches through top level requires is excluded, and the walk
+ * that establishes which those are is transitive. Such a file has nothing to gain
+ * from an entry, and an entry would make it unsafe. The bootstrap requires with
+ * plain `require`, so a reference arriving before that line executes would
+ * autoload the file and the `require` would then fatally redeclare the symbol.
+ * The two admin Site Health files are the only opted in exceptions, and they
+ * qualify because every include of them in the tree is a `require_once`.
+ *
+ * That condition couples this map to the bootstrap's require set by construction,
+ * which is the property to preserve: whenever a require is added to or dropped
+ * from `wp-settings.php`, this generator has to run again, and the class map is
+ * only ever correct as the output of that run. It is why the map is never edited
+ * by hand and why `build:autoload-classmap` is sequenced ahead of `build:files`.
+ *
+ * One consequence is worth stating plainly, because the map is easy to misread as
+ * a list of files saved: an entry only keeps a file out of a request when nothing
+ * else on that request loads it. The twenty default widget entries are the
+ * clearest example. Each is eligible, and each is mapped because
+ * `default-widgets.php` is required from inside `wp_widgets_init()` rather than at
+ * the top level of the bootstrap, so it is outside the walk above and there is no
+ * redeclaration to fear - it uses `require_once`. None of them is autoloaded on a
+ * front-end or dashboard request all the same, because that `require_once` runs at
+ * `init` before any of the names is referenced. They are kept because a reference
+ * that arrives earlier than `init` has to resolve rather than fail, which is
+ * coverage, and coverage is not a file saved.
+ *
  * Keys are lower cased because PHP resolves class, interface and trait names
  * case insensitively, and `wp_autoload_class()` therefore lower cases the name
  * it is given before looking it up. Values keep the real, cased path.
@@ -111,29 +139,37 @@ function wp_autoload_classmap_additional_files() {
 }
 
 /**
- * Returns the namespace prefixes served by autoloaders that the bootstrap registers.
+ * Returns the namespace prefixes served by autoloaders registered no later than
+ * core's own autoloader.
  *
- * A name under one of these prefixes resolves on any request without core doing
- * anything, so a core class may extend or implement it and still be safe to
- * autoload. Every prefix here has to be backed by a registration that happens
- * during the bootstrap on every request:
+ * A name under one of these prefixes resolves at every moment the class map can be
+ * consulted, so a core class may extend or implement it and still be safe to
+ * autoload. Qualifying is a question of ordering rather than of whether the
+ * bootstrap registers the library at all:
  *
- * - `WordPress\AiClient\` and `WordPress\AiClientDependencies\` are registered by
- *   `wp-includes/php-ai-client/autoload.php`, which `wp-settings.php` requires.
- * - `WpOrg\Requests\` is registered by `wp-includes/class-wp-http.php`, which
- *   `wp-settings.php` requires, through `WpOrg\Requests\Autoload::register()`.
+ * - `wp-settings.php` requires `wp-includes/autoload.php`, and from that line on a
+ *   mapped name can be asked for.
+ * - `wp-includes/class-wp-http.php`, which calls `WpOrg\Requests\Autoload::register()`,
+ *   and `wp-includes/php-ai-client/autoload.php`, which registers the
+ *   `WordPress\AiClient\` and `WordPress\AiClientDependencies\` prefixes, are both
+ *   required roughly 180 lines further down.
+ * - `wp-settings.php` returns early when `SHORTINIT` is defined, ahead of both of
+ *   them, so on that path neither library is registered at all.
  *
- * A library whose autoloader is registered lazily at the point of use, such as
- * SimplePie, deliberately does not belong here.
+ * A mapped declaration whose parent, interface or trait lives under one of those
+ * prefixes is therefore resolvable only in a fully bootstrapped request, and raises
+ * a fatal error in every earlier context: a `SHORTINIT` bootstrap, an
+ * `object-cache.php` or `advanced-cache.php` drop-in, or any code reached between
+ * the two points above. Such a declaration belongs in the eager bootstrap next to
+ * the autoloader it depends on, not in the map. No prefix in the tree meets the
+ * ordering requirement, so the list is deliberately empty; a library whose
+ * autoloader is registered lazily at the point of use, such as SimplePie, could not
+ * meet it either.
  *
  * @return string[] Namespace prefixes, each ending in a backslash.
  */
 function wp_autoload_classmap_autoloaded_namespaces() {
-	return array(
-		'WordPress\\AiClient\\',
-		'WordPress\\AiClientDependencies\\',
-		'WpOrg\\Requests\\',
-	);
+	return array();
 }
 
 /**
@@ -374,8 +410,18 @@ function wp_autoload_classmap_replacement_owned_names() {
  * The list is read out of the autoloader itself rather than repeated here, which
  * is what keeps the generated map and that prefilter from drifting apart.
  *
+ * The autoloader is an authoritative input, so every way of not reading it is
+ * raised rather than absorbed. An unreadable file, an empty file and a file that
+ * carries no `$core_prefixes` list all used to return an empty list, and an empty
+ * list is not inert: it is the value that switches the prefix filter off, so the
+ * run would have gone on to publish a map built without it. Failing here is what
+ * keeps "the prefixes could not be read" from being spelled the same way as
+ * "there are no prefixes to apply".
+ *
  * @param string $src_dir Absolute path of the `src` directory, with a trailing slash.
- * @return string[] Lower cased prefixes. Empty when the declaration cannot be read.
+ * @return string[] Lower cased prefixes, never empty.
+ *
+ * @throws RuntimeException When the autoloader's prefix list cannot be read.
  */
 function wp_autoload_classmap_core_prefixes( $src_dir ) {
 	static $prefixes = null;
@@ -384,11 +430,16 @@ function wp_autoload_classmap_core_prefixes( $src_dir ) {
 		return $prefixes;
 	}
 
-	$prefixes = array();
-	$source   = @file_get_contents( $src_dir . 'wp-includes/autoload.php' );
+	$autoloader = $src_dir . 'wp-includes/autoload.php';
+	$source     = @file_get_contents( $autoloader ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
 
-	if ( false === $source ) {
-		return $prefixes;
+	if ( false === $source || '' === $source ) {
+		wp_autoload_classmap_fail(
+			sprintf(
+				'Unable to read %s, which declares the prefixes the autoloader prefilters requested names on. Refusing to build a class map without them.',
+				$autoloader
+			)
+		);
 	}
 
 	$tokens = token_get_all( $source );
@@ -424,6 +475,17 @@ function wp_autoload_classmap_core_prefixes( $src_dir ) {
 			$prefixes = $collected;
 			break;
 		}
+	}
+
+	if ( null === $prefixes || array() === $prefixes ) {
+		$prefixes = null;
+
+		wp_autoload_classmap_fail(
+			sprintf(
+				'No $core_prefixes list could be read from %s. Refusing to build a class map whose names cannot be checked against the autoloader\'s prefilter.',
+				$autoloader
+			)
+		);
 	}
 
 	return $prefixes;
@@ -1089,8 +1151,20 @@ function wp_autoload_classmap_required_paths( $file, $src_dir ) {
  * closure instead of failing, which would in turn let every bootstrap loaded file
  * look mappable.
  *
+ * Every file the walk reaches is an authoritative input for the same reason, so an
+ * unreadable one is raised rather than skipped. Only unconditional, file scope
+ * requires reach this walk - a guarded or nested require is never collected - so a
+ * path here is one the bootstrap loads on every request, and a path the bootstrap
+ * loads but this walk cannot read is a hole in the closure, not an absence. Skipping
+ * it would drop the symbols it and everything it requires declare out of the set of
+ * always available names, and every one of those symbols would then look mappable:
+ * the map would grow entries for names the bootstrap already declares, which is the
+ * one shape of entry that can end in a redeclaration fatal.
+ *
  * @param string $src_dir Absolute path of the `src` directory.
  * @return string[] Paths relative to the WordPress root.
+ *
+ * @throws RuntimeException When a file the bootstrap loads cannot be read.
  */
 function wp_autoload_classmap_bootstrap_closure( $src_dir ) {
 	$src_dir = rtrim( str_replace( '\\', '/', $src_dir ), '/' ) . '/';
@@ -1107,7 +1181,12 @@ function wp_autoload_classmap_bootstrap_closure( $src_dir ) {
 		$file = $src_dir . $relative;
 
 		if ( ! is_readable( $file ) ) {
-			continue;
+			wp_autoload_classmap_fail(
+				sprintf(
+					'Unable to read %s, which the bootstrap requires unconditionally. Refusing to build a class map from an incomplete record of what the bootstrap loads.',
+					$file
+				)
+			);
 		}
 
 		$seen[ $relative ] = true;
@@ -1150,10 +1229,24 @@ function wp_autoload_classmap_candidate_files( $src_dir ) {
 		$files[] = $relative;
 	}
 
+	/*
+	 * Opted in by name, so an unreadable one is not simply a file this run does not
+	 * cover: it is an entry the map is expected to hold and would silently lose. Both
+	 * of them declare a class the bootstrap no longer requires on every request, so
+	 * the loss makes that class unresolvable at runtime rather than merely absent
+	 * from the map, and it would surface as an undefined class far from here.
+	 */
 	foreach ( wp_autoload_classmap_additional_files() as $relative ) {
-		if ( is_readable( $src_dir . $relative ) ) {
-			$files[] = $relative;
+		if ( ! is_readable( $src_dir . $relative ) ) {
+			wp_autoload_classmap_fail(
+				sprintf(
+					'Unable to read %s, which is mapped by name so that the class it declares stays resolvable. Refusing to build a class map that would silently drop it.',
+					$src_dir . $relative
+				)
+			);
 		}
+
+		$files[] = $relative;
 	}
 
 	sort( $files, SORT_STRING );
@@ -1487,6 +1580,89 @@ function wp_autoload_classmap_render( $map ) {
 }
 
 /**
+ * Creates a temporary file beside the target and returns it, or fails.
+ *
+ * The name is unpredictable and the file is created exclusively, which is what
+ * makes the handle the only reference to it. A name derived from the process ID is
+ * guessable, and `getmypid()` is reused by the operating system, so another process
+ * able to write the directory could have placed a file - or a symbolic link to one
+ * it does not own - at that path first. `file_put_contents()` would then have
+ * followed the link and written the class map through it, and the `chmod()` below
+ * would have relaxed the mode of whatever it pointed at.
+ *
+ * `x` is the guard: the open fails outright when the path already exists, and it
+ * does not follow a symbolic link to create the target it names. The mode is
+ * passed as 0600 so that the file is never briefly group or world readable while it
+ * is being written, whatever the umask says.
+ *
+ * @param string $file Absolute path of the file that will be replaced.
+ * @return array {
+ *     The created temporary file.
+ *
+ *     @type string   $path   Absolute path of the temporary file.
+ *     @type resource $handle Open write handle for it.
+ * }
+ *
+ * @throws RuntimeException When no temporary file could be created.
+ */
+function wp_autoload_classmap_open_temporary_file( $file ) {
+	/*
+	 * Attempts are bounded rather than unbounded: with 16 random bytes a collision
+	 * is not the reason an exclusive create fails twice in a row, so a directory that
+	 * keeps refusing the create is reported instead of being retried forever.
+	 */
+	$attempts = 8;
+
+	for ( $attempt = 0; $attempt < $attempts; $attempt++ ) {
+		// Beside the target, so that the rename in the caller stays within one filesystem.
+		$path   = $file . '.tmp' . bin2hex( random_bytes( 16 ) );
+		$handle = @fopen( $path, 'xb' ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+
+		if ( false !== $handle ) {
+			@chmod( $path, 0600 ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+
+			return array(
+				'path'   => $path,
+				'handle' => $handle,
+			);
+		}
+	}
+
+	wp_autoload_classmap_fail(
+		sprintf(
+			'Cannot write the autoload class map: no temporary file could be created beside %1$s in %2$d attempts.',
+			$file,
+			$attempts
+		)
+	);
+}
+
+/**
+ * Fails after removing a temporary file, whatever went wrong with it.
+ *
+ * Collected here so that no failing path can return without closing the handle and
+ * unlinking the file it created. The handle is closed first, because the file is
+ * removed by the path it was created under and a still open handle would otherwise
+ * keep the bytes alive for as long as this process runs.
+ *
+ * @param resource $handle    Open handle for the temporary file.
+ * @param string   $temporary Absolute path of the temporary file.
+ * @param string   $message   Diagnostic to report.
+ * @return void
+ *
+ * @throws RuntimeException Always.
+ */
+function wp_autoload_classmap_discard_temporary_file( $handle, $temporary, $message ) {
+	if ( is_resource( $handle ) ) {
+		fclose( $handle );
+	}
+
+	@unlink( $temporary ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+
+	wp_autoload_classmap_fail( $message );
+}
+
+/**
  * Publishes new contents for a file, or fails.
  *
  * The class map is a tracked artifact that the build copies into `build/` and that
@@ -1495,13 +1671,21 @@ function wp_autoload_classmap_render( $map ) {
  * the names that made it to disk. The write is therefore never trusted for having
  * been attempted.
  *
- * New contents go to a temporary file beside the target, so that the target is
- * only ever replaced by a `rename()`, which is atomic within one filesystem: a
- * reader sees either the whole previous file or the whole new one, never a prefix
- * of the new one. Every step is checked - the byte count `file_put_contents()`
- * reports, the bytes that can be read back, and the rename itself - and the
- * temporary file is removed on every failing path so a failed generation leaves
- * nothing behind in the source tree.
+ * New contents go to an exclusively created temporary file beside the target, so
+ * that the target is only ever replaced by a `rename()`, which is atomic within one
+ * filesystem: a reader sees either the whole previous file or the whole new one,
+ * never a prefix of the new one. Every step is checked - the identity of the file
+ * the handle actually holds, the byte count the write reports, the bytes that can be
+ * read back, and the rename itself - and the temporary file is removed on every
+ * failing path so a failed generation leaves nothing behind in the source tree.
+ *
+ * The identity check is what makes the write safe rather than merely atomic. The
+ * handle is the reference every mutation goes through, and `fstat()` describes the
+ * file that handle holds rather than whatever the path resolves to by the time the
+ * mutation runs, so comparing it with the `lstat()` of the path proves that the two
+ * are still the same file, that it is a regular file, and that nothing else links to
+ * it. A path swapped between the create and the write therefore fails the build
+ * instead of redirecting it.
  *
  * @param string $file     Absolute path of the file to replace.
  * @param string $contents Contents to publish.
@@ -1518,13 +1702,48 @@ function wp_autoload_classmap_replace_file( $file, $contents ) {
 		);
 	}
 
-	// Beside the target, so that the rename below stays within one filesystem.
-	$temporary = $file . '.tmp' . getmypid();
-	$written   = @file_put_contents( $temporary, $contents );
+	$temporary_file = wp_autoload_classmap_open_temporary_file( $file );
+	$temporary      = $temporary_file['path'];
+	$handle         = $temporary_file['handle'];
 
-	if ( false === $written || strlen( $contents ) !== $written ) {
-		@unlink( $temporary );
-		wp_autoload_classmap_fail(
+	$handle_stat = fstat( $handle );
+	clearstatcache( true, $temporary );
+	$path_stat = @lstat( $temporary ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+
+	if ( ! is_array( $handle_stat ) || ! is_array( $path_stat ) ) {
+		wp_autoload_classmap_discard_temporary_file(
+			$handle,
+			$temporary,
+			sprintf( 'Cannot write the autoload class map: %s could not be identified after it was created.', $temporary )
+		);
+	}
+
+	/*
+	 * 0100000 is S_IFREG. A link count above one means a second name reaches these
+	 * bytes, and a device or inode that no longer matches means the path names a
+	 * different file than the handle holds.
+	 */
+	if ( 0100000 !== ( $handle_stat['mode'] & 0170000 )
+		|| 1 !== (int) $handle_stat['nlink']
+		|| $handle_stat['dev'] !== $path_stat['dev']
+		|| $handle_stat['ino'] !== $path_stat['ino']
+	) {
+		wp_autoload_classmap_discard_temporary_file(
+			$handle,
+			$temporary,
+			sprintf(
+				'Cannot write the autoload class map: %s is not the exclusively created regular file it was opened as.',
+				$temporary
+			)
+		);
+	}
+
+	$written = fwrite( $handle, $contents );
+
+	if ( strlen( $contents ) !== $written || ! fflush( $handle ) ) {
+		wp_autoload_classmap_discard_temporary_file(
+			$handle,
+			$temporary,
 			sprintf(
 				'Cannot write the autoload class map: %1$s took %2$s of %3$d bytes.',
 				$temporary,
@@ -1534,26 +1753,34 @@ function wp_autoload_classmap_replace_file( $file, $contents ) {
 		);
 	}
 
-	if ( @file_get_contents( $temporary ) !== $contents ) {
-		@unlink( $temporary );
+	/*
+	 * A new file takes its mode from the umask, so the mode the published file
+	 * already carries is restored rather than replaced by whatever this process
+	 * happens to run under. It is applied to the open handle, so it cannot reach a
+	 * file that replaced the path since the identity check above.
+	 */
+	$permissions = @fileperms( $file ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+
+	if ( false !== $permissions && ! @chmod( $temporary, $permissions & 0777 ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+		wp_autoload_classmap_discard_temporary_file(
+			$handle,
+			$temporary,
+			sprintf( 'Cannot write the autoload class map: the mode of %s could not be set.', $temporary )
+		);
+	}
+
+	fclose( $handle );
+	clearstatcache( true, $temporary );
+
+	if ( @file_get_contents( $temporary ) !== $contents ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+		@unlink( $temporary ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
 		wp_autoload_classmap_fail(
 			sprintf( 'Cannot write the autoload class map: %s did not read back as it was written.', $temporary )
 		);
 	}
 
-	/*
-	 * A new file takes its mode from the umask, so the mode the published file
-	 * already carries is restored rather than replaced by whatever this process
-	 * happens to run under.
-	 */
-	$permissions = @fileperms( $file );
-
-	if ( false !== $permissions ) {
-		@chmod( $temporary, $permissions & 0777 );
-	}
-
-	if ( ! @rename( $temporary, $file ) ) {
-		@unlink( $temporary );
+	if ( ! @rename( $temporary, $file ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+		@unlink( $temporary ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
 		wp_autoload_classmap_fail(
 			sprintf( 'Cannot publish the autoload class map: %1$s could not replace %2$s.', $temporary, $file )
 		);

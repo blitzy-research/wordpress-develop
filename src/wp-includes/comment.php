@@ -388,10 +388,6 @@ function get_lastcommentmodified( $timezone = 'server' ) {
  * Retrieves the total comment counts for the whole site or a single post.
  *
  * @since 2.0.0
- * @since 7.0.0 The counts are retrieved with a single grouped query, cached in the
- *              'comment-queries' group, unless a comment query hook is in use.
- *
- * @global wpdb $wpdb WordPress database abstraction object.
  *
  * @param int $post_id Optional. Restrict the comment counts to the given post. Default 0, which indicates that
  *                     comment counts for the whole site will be retrieved.
@@ -408,8 +404,6 @@ function get_lastcommentmodified( $timezone = 'server' ) {
  * }
  */
 function get_comment_count( $post_id = 0 ) {
-	global $wpdb;
-
 	$post_id = (int) $post_id;
 
 	$comment_count = array(
@@ -438,90 +432,8 @@ function get_comment_count( $post_id = 0 ) {
 		'post-trashed'        => 'post-trashed',
 	);
 	$comment_count = array();
-
-	/*
-	 * One grouped query in place of one count query per status.
-	 *
-	 * Every status below resolves to a single comment_approved value, so the five
-	 * counts are five reads of the same rows: on a site without a persistent object
-	 * cache this costs five queries on every request that renders the admin bar.
-	 * Grouping by comment_approved answers all five in one round trip, and examines
-	 * the same rows in total because each row belongs to exactly one status.
-	 *
-	 * The result is stored in the same 'comment-queries' cache group under the same
-	 * wp_cache_get_last_changed( 'comment' ) salt that WP_Comment_Query uses, so a
-	 * persistent cache still serves repeat calls without any query and any comment
-	 * change still invalidates it.
-	 *
-	 * The per-status path is kept, and is used verbatim whenever a callback is
-	 * attached to one of the hooks that shapes a comment query. Those hooks are the
-	 * documented way to alter which comments are counted, and they only fire when
-	 * the query actually runs, so the grouped query is only ever taken where core
-	 * itself is the sole authority on the result.
-	 */
-	$counts_by_approval = null;
-
-	if ( ! has_action( 'parse_comment_query' )
-		&& ! has_action( 'pre_get_comments' )
-		&& ! has_filter( 'comments_pre_query' )
-		&& ! has_filter( 'comments_clauses' )
-	) {
-		$last_changed       = wp_cache_get_last_changed( 'comment' );
-		$cache_key          = "get_comment_count:$post_id";
-		$counts_by_approval = wp_cache_get_salted( $cache_key, 'comment-queries', $last_changed );
-
-		if ( false === $counts_by_approval ) {
-			/*
-			 * The 'note' comment type is excluded to match the default WP_Comment_Query
-			 * behavior, which adds it to 'type__not_in' unless it is requested.
-			 */
-			if ( $post_id > 0 ) {
-				$totals = $wpdb->get_results(
-					$wpdb->prepare(
-						"SELECT comment_approved, COUNT( * ) AS total FROM $wpdb->comments WHERE comment_type NOT IN ( %s ) AND comment_post_ID = %d GROUP BY comment_approved",
-						'note',
-						$post_id
-					),
-					ARRAY_A
-				);
-			} else {
-				$totals = $wpdb->get_results(
-					$wpdb->prepare(
-						"SELECT comment_approved, COUNT( * ) AS total FROM $wpdb->comments WHERE comment_type NOT IN ( %s ) GROUP BY comment_approved",
-						'note'
-					),
-					ARRAY_A
-				);
-			}
-
-			$counts_by_approval = array();
-
-			foreach ( (array) $totals as $row ) {
-				$counts_by_approval[ $row['comment_approved'] ] = $row['total'];
-			}
-
-			wp_cache_set_salted( $cache_key, $counts_by_approval, 'comment-queries', $last_changed );
-		}
-	}
-
-	if ( null === $counts_by_approval ) {
-		foreach ( $mapping as $key => $value ) {
-			$comment_count[ $key ] = get_comments( array_merge( $args, array( 'status' => $value ) ) );
-		}
-	} else {
-		// The comment_approved value each status maps to in WP_Comment_Query.
-		$approved_values = array(
-			'approve'      => '1',
-			'hold'         => '0',
-			'spam'         => 'spam',
-			'trash'        => 'trash',
-			'post-trashed' => 'post-trashed',
-		);
-
-		foreach ( $mapping as $key => $value ) {
-			$approved              = $approved_values[ $value ];
-			$comment_count[ $key ] = isset( $counts_by_approval[ $approved ] ) ? $counts_by_approval[ $approved ] : 0;
-		}
+	foreach ( $mapping as $key => $value ) {
+		$comment_count[ $key ] = get_comments( array_merge( $args, array( 'status' => $value ) ) );
 	}
 
 	$comment_count['all']            = $comment_count['approved'] + $comment_count['awaiting_moderation'];

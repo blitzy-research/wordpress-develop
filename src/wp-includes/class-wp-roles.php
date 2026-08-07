@@ -191,16 +191,6 @@ class WP_Roles {
 		}
 		$this->role_objects[ $role ] = new WP_Role( $role, $capabilities );
 		$this->role_names[ $role ]   = $display_name;
-
-		/*
-		 * Discard the request-scoped map_meta_cap() memo. The mapping reads role
-		 * capabilities through is_super_admin() and user_can(), and the write above
-		 * only reaches 'updated_option' when $use_db is true and the stored value
-		 * actually changed, so the memo is discarded here rather than left to depend
-		 * on the persistence path.
-		 */
-		_wp_reset_map_meta_cap_memo();
-
 		return $this->role_objects[ $role ];
 	}
 
@@ -227,15 +217,6 @@ class WP_Roles {
 		if ( get_option( 'default_role' ) === $role ) {
 			update_option( 'default_role', 'subscriber' );
 		}
-
-		/*
-		 * Discard the request-scoped map_meta_cap() memo. The mapping reads role
-		 * capabilities through is_super_admin() and user_can(), and the write above
-		 * only reaches 'updated_option' when $use_db is true and the stored value
-		 * actually changed, so the memo is discarded here rather than left to depend
-		 * on the persistence path.
-		 */
-		_wp_reset_map_meta_cap_memo();
 	}
 
 	/**
@@ -257,15 +238,6 @@ class WP_Roles {
 		if ( $this->use_db ) {
 			update_option( $this->role_key, $this->roles );
 		}
-
-		/*
-		 * Discard the request-scoped map_meta_cap() memo. The mapping reads role
-		 * capabilities through is_super_admin() and user_can(), and the write above
-		 * only reaches 'updated_option' when $use_db is true and the stored value
-		 * actually changed, so the memo is discarded here rather than left to depend
-		 * on the persistence path.
-		 */
-		_wp_reset_map_meta_cap_memo();
 	}
 
 	/**
@@ -285,15 +257,6 @@ class WP_Roles {
 		if ( $this->use_db ) {
 			update_option( $this->role_key, $this->roles );
 		}
-
-		/*
-		 * Discard the request-scoped map_meta_cap() memo. The mapping reads role
-		 * capabilities through is_super_admin() and user_can(), and the write above
-		 * only reaches 'updated_option' when $use_db is true and the stored value
-		 * actually changed, so the memo is discarded here rather than left to depend
-		 * on the persistence path.
-		 */
-		_wp_reset_map_meta_cap_memo();
 	}
 
 	/**

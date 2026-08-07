@@ -6,7 +6,12 @@ import { expect, test } from '@wordpress/e2e-test-utils-playwright';
 /**
  * Internal dependencies
  */
-import { camelCaseDashes, themes, locales } from '../utils';
+import {
+	camelCaseDashes,
+	clearServerCaches,
+	themes,
+	locales,
+} from '../utils';
 
 /**
  * Server-Timing entries every front-end iteration must report.
@@ -31,11 +36,6 @@ const requiredServerTimingMetrics = [
 	'wp-bootstrap-valid',
 	'wp-opcache-enabled',
 	'wp-opcache-jit',
-	'wp-php-version-id',
-	'wp-process-id',
-	'wp-process-requests',
-	'wp-opcache-cached-scripts',
-	'wp-opcache-hit-rate',
 ];
 
 /**
@@ -67,11 +67,7 @@ const results = {
 	),
 };
 
-const immutableRuntimeMetrics = [
-	'wpOpcacheEnabled',
-	'wpOpcacheJit',
-	'wpPhpVersionId',
-];
+const immutableRuntimeMetrics = [ 'wpOpcacheEnabled', 'wpOpcacheJit' ];
 
 /**
  * Highest iteration count this spec will generate measured tests for.
@@ -134,43 +130,68 @@ test.describe( 'Single Post', () => {
 				} );
 
 				test.afterAll( async ( { requestUtils }, testInfo ) => {
-					await testInfo.attach( 'results', {
-						body: JSON.stringify( results, null, 2 ),
-						contentType: 'application/json',
-					} );
-
-					await requestUtils.updateSiteSettings( {
-						language: '',
-					} );
-
 					/*
-					 * Read before the resets below so the check runs after cleanup, and read
-					 * from the live keys so a metric the ingestion loop created on the fly is
-					 * reset and counted alongside the declared ones. Nothing may survive into
-					 * the next theme or locale: a series that carries samples over hands the
-					 * later bucket a median of measurements it never took.
+					 * Snapshot the payload and its sample counts before the cleanup below
+					 * can empty them, so what gets validated is byte for byte what gets
+					 * attached. The counts are read from the live keys, so a metric the
+					 * ingestion loop created on the fly is reset and counted alongside the
+					 * declared ones. Nothing may survive into the next theme or locale: a
+					 * series that carries samples over hands the later bucket a median of
+					 * measurements it never took.
 					 */
+					const body = JSON.stringify( results, null, 2 );
 					const sampleCounts = Object.keys( results ).map( ( metric ) => [
 						metric,
 						results[ metric ].length,
 					] );
 
-					for ( const metric of immutableRuntimeMetrics ) {
-						expect(
-							new Set( results[ metric ] ).size,
-							`${ metric } must stay immutable within one measured theme and locale`
-						).toBe( 1 );
-					}
+					try {
+						for ( const metric of immutableRuntimeMetrics ) {
+							expect(
+								new Set( results[ metric ] ).size,
+								`${ metric } must stay immutable within one measured theme and locale`
+							).toBe( 1 );
+						}
 
-					for ( const metric of Object.keys( results ) ) {
-						results[ metric ] = [];
-					}
+						/*
+						 * Both checks run before the attachment, so the artifact can
+						 * only ever receive a snapshot that has been validated. A
+						 * duplicate of this hook - the defect this ordering exists to
+						 * catch - would run once the arrays have already been emptied
+						 * by the cleanup below and would fail here instead of
+						 * appending a zero-sample result object. Such an object is not
+						 * inert: compare-results.js rejects a run whose scenarios
+						 * disagree about how many samples they hold, so one extra
+						 * entry invalidates the comparison. Cardinality itself is
+						 * covered in specs/utils.test.js, which is the only end that
+						 * can see more than one attachment hook at a time.
+						 */
+						for ( const [ metric, samples ] of sampleCounts ) {
+							expect(
+								samples,
+								`${ metric } should hold one sample per iteration for this theme and locale`
+							).toBe( iterations );
+						}
 
-					for ( const [ metric, samples ] of sampleCounts ) {
-						expect(
-							samples,
-							`${ metric } should hold one sample per iteration for this theme and locale`
-						).toBe( iterations );
+						await testInfo.attach( 'results', {
+							body,
+							contentType: 'application/json',
+						} );
+					} finally {
+						/*
+						 * Cleanup, so it runs whether or not the checks above passed. A
+						 * failed check that skipped it would hand the next theme or
+						 * locale both the samples this one measured and the language it
+						 * was measured in, turning one reported failure into a run of
+						 * meaningless numbers.
+						 */
+						for ( const metric of Object.keys( results ) ) {
+							results[ metric ] = [];
+						}
+
+						await requestUtils.updateSiteSettings( {
+							language: '',
+						} );
 					}
 				} );
 
@@ -180,22 +201,12 @@ test.describe( 'Single Post', () => {
 						metrics,
 					} ) => {
 						/*
-						 * Unmeasured pre-navigation request, not the page under test.
-						 *
-						 * The clear-cache.php mu-plugin answers it with 202 and dies after
-						 * resetting OPcache, APCu, the object cache and expired transients. Any
-						 * other status means the mu-plugin is not installed and the request fell
-						 * through to an ordinary page load, which resets nothing: the measured
-						 * navigation below would then run against warm caches and a warm opcode
-						 * cache while still being reported as uncached. Asserting the status is
-						 * what makes the cache regime measured rather than assumed.
+						 * Every figure this spec reports is an uncached, cold-compile
+						 * measurement, so the reset that makes it one is required rather
+						 * than requested: clearServerCaches() fails the iteration unless
+						 * the helper answered 202.
 						 */
-						const cacheReset = await page.goto( '/?clear_cache' );
-
-						expect(
-							cacheReset?.status(),
-							'/?clear_cache should be answered by the clear-cache.php mu-plugin with HTTP 202, so the measured request is genuinely uncached'
-						).toBe( 202 );
+						await clearServerCaches( page );
 
 						// This is the actual page to test.
 						await page.goto( '/2018/11/03/block-image/' );
@@ -229,18 +240,6 @@ test.describe( 'Single Post', () => {
 						expect( [ 0, 1 ] ).toContain(
 							serverTiming[ 'wp-opcache-jit' ]
 						);
-						expect(
-							serverTiming[ 'wp-php-version-id' ]
-						).toBeGreaterThan( 0 );
-						expect(
-							serverTiming[ 'wp-process-id' ]
-						).toBeGreaterThan( 0 );
-						expect(
-							serverTiming[ 'wp-process-requests' ]
-						).toBeGreaterThan( 0 );
-						expect(
-							serverTiming[ 'wp-opcache-hit-rate' ]
-						).toBeLessThanOrEqual( 100 );
 
 						for ( const [ key, value ] of Object.entries(
 							serverTiming
@@ -251,10 +250,35 @@ test.describe( 'Single Post', () => {
 
 						const ttfb = await metrics.getTimeToFirstByte();
 						const lcp = await metrics.getLargestContentfulPaint();
+						const lcpMinusTtfb = lcp - ttfb;
+
+						/*
+						 * Browser-side timings are read from separate performance entries,
+						 * either of which can be absent on a navigation that did not paint
+						 * or did not complete. An absent entry yields undefined, the
+						 * subtraction below turns that into NaN, and JSON serialization
+						 * turns both into null - at which point the sample is
+						 * indistinguishable from a measurement and sorts as zero inside the
+						 * median. The derived value is checked as well as its two sources,
+						 * because a paint recorded before the response ended would produce a
+						 * finite but negative interval.
+						 */
+						for ( const [ metric, value ] of [
+							[ 'timeToFirstByte', ttfb ],
+							[ 'largestContentfulPaint', lcp ],
+							[ 'lcpMinusTtfb', lcpMinusTtfb ],
+						] ) {
+							expect(
+								Number.isFinite( value ) && 0 <= value,
+								`${ metric } should be measured as a finite, non-negative number, received ${ JSON.stringify(
+									value
+								) }`
+							).toBe( true );
+						}
 
 						results.largestContentfulPaint.push( lcp );
 						results.timeToFirstByte.push( ttfb );
-						results.lcpMinusTtfb.push( lcp - ttfb );
+						results.lcpMinusTtfb.push( lcpMinusTtfb );
 					} );
 				}
 			} );

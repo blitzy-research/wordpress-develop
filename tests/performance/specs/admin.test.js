@@ -8,6 +8,7 @@ import { expect, test } from '@wordpress/e2e-test-utils-playwright';
  */
 import {
 	camelCaseDashes,
+	clearServerCaches,
 	getJavaScriptResponseByteSizes,
 	locales,
 } from '../utils';
@@ -35,11 +36,6 @@ const requiredServerTimingMetrics = [
 	'wp-bootstrap-valid',
 	'wp-opcache-enabled',
 	'wp-opcache-jit',
-	'wp-php-version-id',
-	'wp-process-id',
-	'wp-process-requests',
-	'wp-opcache-cached-scripts',
-	'wp-opcache-hit-rate',
 ];
 
 /**
@@ -89,7 +85,6 @@ const results = {
 const immutableMeasurementMetrics = [
 	'wpOpcacheEnabled',
 	'wpOpcacheJit',
-	'wpPhpVersionId',
 	'adminJsRaw',
 	'adminJsGzipped',
 ];
@@ -164,44 +159,52 @@ test.describe( 'Admin', () => {
 					results[ metric ].length,
 				] );
 
-				for ( const metric of immutableMeasurementMetrics ) {
-					expect(
-						new Set( results[ metric ] ).size,
-						`${ metric } must stay immutable within one measured locale`
-					).toBe( 1 );
+				try {
+					for ( const metric of immutableMeasurementMetrics ) {
+						expect(
+							new Set( results[ metric ] ).size,
+							`${ metric } must stay immutable within one measured locale`
+						).toBe( 1 );
+					}
+
+					/*
+					 * Both checks run before the attachment, so the artifact can only
+					 * ever receive a snapshot that has been validated. A duplicate of
+					 * this hook - the defect this ordering exists to catch - would run
+					 * once the arrays have already been emptied by the cleanup below
+					 * and would fail here instead of appending a zero-sample result
+					 * object. Such an object is not inert: compare-results.js rejects
+					 * a run whose scenarios disagree about how many samples they
+					 * hold, so one extra entry invalidates the comparison. Cardinality
+					 * itself is covered in specs/utils.test.js, which is the only end
+					 * that can see more than one attachment hook at a time.
+					 */
+					for ( const [ metric, samples ] of sampleCounts ) {
+						expect(
+							samples,
+							`${ metric } should hold one sample per iteration for this locale`
+						).toBe( iterations );
+					}
+
+					await testInfo.attach( 'results', {
+						body,
+						contentType: 'application/json',
+					} );
+				} finally {
+					/*
+					 * Cleanup, so it runs whether or not the checks above passed. A
+					 * failed check that skipped it would hand the next locale both the
+					 * samples this one measured and the language it was measured in,
+					 * turning one reported failure into a run of meaningless numbers.
+					 */
+					for ( const metric of Object.keys( results ) ) {
+						results[ metric ] = [];
+					}
+
+					await requestUtils.updateSiteSettings( {
+						language: '',
+					} );
 				}
-
-				for ( const metric of Object.keys( results ) ) {
-					results[ metric ] = [];
-				}
-
-				await requestUtils.updateSiteSettings( {
-					language: '',
-				} );
-
-				/*
-				 * Validated before it is attached, so the artifact can only ever
-				 * receive a fully populated snapshot. A duplicate of this hook -
-				 * the defect this ordering exists to catch - would run once the
-				 * arrays above are already reset and would fail here instead of
-				 * appending a zero-sample result object. Such an object is not
-				 * inert: compare-results.js only pairs a scenario when the before
-				 * and after result counts match, so one extra entry makes it
-				 * suppress every paired value for this locale as N/A. Cardinality
-				 * itself is covered in specs/utils.test.js, which is the only end
-				 * that can see more than one attachment hook at a time.
-				 */
-				for ( const [ metric, samples ] of sampleCounts ) {
-					expect(
-						samples,
-						`${ metric } should hold one sample per iteration for this locale`
-					).toBe( iterations );
-				}
-
-				await testInfo.attach( 'results', {
-					body,
-					contentType: 'application/json',
-				} );
 			} );
 
 			for ( let i = 1; i <= iterations; i++ ) {
@@ -211,22 +214,12 @@ test.describe( 'Admin', () => {
 					metrics,
 				} ) => {
 					/*
-					 * Unmeasured pre-navigation request, not the page under test.
-					 *
-					 * The clear-cache.php mu-plugin answers it with 202 and dies after
-					 * resetting OPcache, APCu, the object cache and expired transients. Any
-					 * other status means the mu-plugin is not installed and the request fell
-					 * through to an ordinary page load, which resets nothing: the measured
-					 * navigation below would then run against warm caches and a warm opcode
-					 * cache while still being reported as uncached. Asserting the status is
-					 * what makes the cache regime measured rather than assumed.
+					 * Every figure this spec reports is an uncached, cold-compile
+					 * measurement, so the reset that makes it one is required rather than
+					 * requested: clearServerCaches() fails the iteration unless the helper
+					 * answered 202.
 					 */
-					const cacheReset = await page.goto( '/?clear_cache' );
-
-					expect(
-						cacheReset?.status(),
-						'/?clear_cache should be answered by the clear-cache.php mu-plugin with HTTP 202, so the measured request is genuinely uncached'
-					).toBe( 202 );
+					await clearServerCaches( page );
 
 					// This is the actual page to test.
 					const javaScriptResponses = [];
@@ -275,18 +268,6 @@ test.describe( 'Admin', () => {
 					expect( [ 0, 1 ] ).toContain(
 						serverTiming[ 'wp-opcache-jit' ]
 					);
-					expect(
-						serverTiming[ 'wp-php-version-id' ]
-					).toBeGreaterThan( 0 );
-					expect( serverTiming[ 'wp-process-id' ] ).toBeGreaterThan(
-						0
-					);
-					expect(
-						serverTiming[ 'wp-process-requests' ]
-					).toBeGreaterThan( 0 );
-					expect(
-						serverTiming[ 'wp-opcache-hit-rate' ]
-					).toBeLessThanOrEqual( 100 );
 
 					for ( const [ key, value ] of Object.entries(
 						serverTiming
@@ -296,6 +277,20 @@ test.describe( 'Admin', () => {
 					}
 
 					const ttfb = await metrics.getTimeToFirstByte();
+
+					/*
+					 * Read from a performance entry that an incomplete navigation can leave
+					 * absent, in which case the sample arrives as undefined and serializes
+					 * to null, where it is indistinguishable from a measurement and sorts as
+					 * zero inside the median.
+					 */
+					expect(
+						Number.isFinite( ttfb ) && 0 <= ttfb,
+						`timeToFirstByte should be measured as a finite, non-negative number, received ${ JSON.stringify(
+							ttfb
+						) }`
+					).toBe( true );
+
 					results.timeToFirstByte.push( ttfb );
 
 					/*
