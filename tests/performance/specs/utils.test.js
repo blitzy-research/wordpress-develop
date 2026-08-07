@@ -15,6 +15,8 @@ import PerformanceReporter from '../config/performance-reporter';
 import performanceConfig from '../playwright.config';
 import {
 	CACHE_RESET_STATUS,
+	CACHE_RESET_TOKEN_HEADER,
+	CACHE_RESET_TOKEN_PATTERN,
 	accumulateValues,
 	camelCaseDashes,
 	formatValue,
@@ -37,6 +39,17 @@ const producerSource = readFileSync(
 	join( __dirname, '..', 'wp-content', 'mu-plugins', 'server-timing.php' ),
 	'utf8'
 );
+
+/**
+ * Source of the helpers the specs reach the server through.
+ *
+ * The cache reset is a state-changing operation whose transport is a contract between
+ * this side and the mu-plugin: the request has to be a POST and the secret has to travel
+ * in a header. Neither property can be observed from a return value, and a regression in
+ * either would surface as a warm sample published under an uncached label rather than as
+ * a failure, so both are read off the source itself.
+ */
+const callerSource = readFileSync( join( __dirname, '..', 'utils.js' ), 'utf8' );
 
 /**
  * Sources of the specs that attach measured results to the run.
@@ -699,6 +712,46 @@ test.describe( 'Performance report utilities', () => {
 			).toMatch(
 				new RegExp( `status_header\\(\\s*${ CACHE_RESET_STATUS }\\s*\\)` )
 			);
+
+			/*
+			 * The reset discards the opcode cache, the object cache and the expired
+			 * transients for the whole installation, so the query argument may only
+			 * select the endpoint. Authorization is a secret in a request header,
+			 * presented on a POST, and every other shape has to be refused. Losing any
+			 * of these would leave a reachable, unauthenticated way to force a cold
+			 * cache on whatever host the harness is installed on.
+			 */
+			expect(
+				producerSource,
+				'the reset must accept POST only, so it cannot be reached by a navigation, a prefetch or an embedded resource'
+			).toContain( "'POST' !== strtoupper( $method )" );
+
+			expect(
+				producerSource,
+				'the presented secret must be compared with hash_equals(), so the comparison is not a timing oracle'
+			).toContain( 'hash_equals( $token, $presented )' );
+
+			expect(
+				producerSource,
+				`the secret must be read from the ${ CACHE_RESET_TOKEN_HEADER } request header, which a cross-origin form cannot set`
+			).toContain(
+				`$_SERVER['HTTP_${ CACHE_RESET_TOKEN_HEADER.toUpperCase().replaceAll(
+					'-',
+					'_'
+				) }']`
+			);
+
+			expect(
+				producerSource,
+				'the secret grammar must be the one this side writes, or a provisioned token would leave the endpoint disabled'
+			).toContain( CACHE_RESET_TOKEN_PATTERN.source );
+
+			for ( const refusal of [ 404, 405, 403 ] ) {
+				expect(
+					producerSource,
+					`the control plane must fail closed with ${ refusal } rather than fall through to the reset`
+				).toMatch( new RegExp( `\\breturn ${ refusal };` ) );
+			}
 		} );
 
 		test( 'every measured navigation is preceded by an asserted reset', () => {
@@ -713,6 +766,42 @@ test.describe( 'Performance report utilities', () => {
 					`${ name } should not request /?clear_cache without checking the response`
 				).not.toMatch( /goto\(\s*'\/\?clear_cache'\s*\)/ );
 			}
+
+			/*
+			 * The reset is requested rather than navigated to, and the secret is carried
+			 * in a header rather than in the URL: a secret in an address is sent by
+			 * anything that copies it and is recorded in the access log, the referrer and
+			 * the browser history.
+			 */
+			expect(
+				callerSource,
+				'clearServerCaches() should POST the reset through the request API rather than navigate to it'
+			).toContain( "page.request.post( '/?clear_cache', {" );
+
+			expect(
+				callerSource,
+				'clearServerCaches() should present the secret in the reset token header'
+			).toContain( '[ CACHE_RESET_TOKEN_HEADER ]: cacheResetToken()' );
+
+			expect(
+				callerSource,
+				'clearServerCaches() should not navigate to the reset URL'
+			).not.toMatch( /goto\(\s*'\/\?clear_cache'/ );
+
+			expect(
+				callerSource,
+				'no secret may be interpolated into the reset URL'
+			).not.toMatch( /clear_cache=\$\{/ );
+
+			/*
+			 * The suite's logs and its artifacts are uploaded wholesale by the
+			 * performance workflow, so a diagnostic that quoted the secret would publish
+			 * it. Every failure message names the path instead of the value.
+			 */
+			expect(
+				callerSource,
+				'no diagnostic may quote the secret; report the path it was read from instead'
+			).not.toMatch( /\$\{\s*cacheResetToken\(\)\s*\}/ );
 		} );
 
 		test( 'the regime each sample was taken in is reported with it', () => {
@@ -1103,24 +1192,50 @@ test.describe( 'Performance evidence hygiene', () => {
 		expect( performanceConfig.globalTeardown ).toBeTruthy();
 	} );
 
-	test( 'deletes the authenticated session once the run is over', () => {
+	test( 'deletes the run secrets once the run is over', () => {
 		const directory = mkdtempSync(
-			join( tmpdir(), 'wp-performance-storage-state-' )
+			join( tmpdir(), 'wp-performance-run-secrets-' )
 		);
 		const storageState = join( directory, 'admin.json' );
+		const tokenFile = join( directory, 'performance-cache-reset-token' );
 
 		writeFileSync(
 			storageState,
 			JSON.stringify( { cookies: [], origins: [] } )
 		);
+		writeFileSync( tokenFile, 'a'.repeat( 64 ) );
 
-		globalTeardown( { projects: [ { use: { storageState } } ] } );
+		/*
+		 * Both secrets are redirected into the sandbox for the duration of the call.
+		 * The teardown withdraws the cache reset token from wherever this variable
+		 * points, and this suite runs in the same worker as the measuring specs, so
+		 * leaving it pointed at the run's own token would revoke the endpoint those
+		 * specs are still resetting through.
+		 */
+		const configured = process.env.WP_PERF_CACHE_RESET_TOKEN_FILE;
+		process.env.WP_PERF_CACHE_RESET_TOKEN_FILE = tokenFile;
 
-		expect( existsSync( storageState ) ).toBe( false );
+		try {
+			globalTeardown( { projects: [ { use: { storageState } } ] } );
 
-		// A missing file is the desired end state, so running twice is not an error.
-		expect( () =>
-			globalTeardown( { projects: [ { use: { storageState } } ] } )
-		).not.toThrow();
+			expect( existsSync( storageState ) ).toBe( false );
+
+			/*
+			 * The token is what enables the mu-plugin's reset endpoint at all, so
+			 * withdrawing it is what keeps that endpoint from outliving the run.
+			 */
+			expect( existsSync( tokenFile ) ).toBe( false );
+
+			// A missing file is the desired end state, so running twice is not an error.
+			expect( () =>
+				globalTeardown( { projects: [ { use: { storageState } } ] } )
+			).not.toThrow();
+		} finally {
+			if ( undefined === configured ) {
+				delete process.env.WP_PERF_CACHE_RESET_TOKEN_FILE;
+			} else {
+				process.env.WP_PERF_CACHE_RESET_TOKEN_FILE = configured;
+			}
+		}
 	} );
 } );

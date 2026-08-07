@@ -109,7 +109,7 @@ in §*Prioritized opportunities discovered but not implemented*. The consequence
 
 ### 3. Five harness metrics were withdrawn
 
-The mu-plugin declares **8 helpers** and emits **14 metrics**. `php-version-id`, `process-id`,
+The mu-plugin declares **10 helpers** and emits **14 metrics** (it declared 8 before the cache-reset control plane added its token resolver and its status function; see §*Hardening the performance harness cache-reset control plane*). `php-version-id`, `process-id`,
 `process-requests`, `opcache-cached-scripts` and `opcache-hit-rate` are gone, and
 `tests/phpunit/tests/performance/serverTimingMetrics.php` asserts their absence. The OPcache regime is
 derived from **configuration alone** — `wp-opcache-enabled` and `wp-opcache-jit` — which is the more
@@ -172,12 +172,20 @@ The cold-compile discipline is implemented **inside `tests/performance/wp-conten
 not in a second mu-plugin, and that placement is deliberate: the performance workflows provision exactly
 one file (`.github/workflows/reusable-performance.yml:226` and
 `.github/workflows/reusable-performance-test-v2.yml:250` both copy `server-timing.php` alone), so any
-reset that lived elsewhere would silently not run in CI. Requesting `/?clear_cache` calls
+reset that lived elsewhere would silently not run in CI. An **authorized `POST` to `/?clear_cache`** calls
 `opcache_reset()`, `apcu_clear_cache()`, `wp_cache_flush()` and `delete_expired_transients( true )`, then
 answers **HTTP 202** — a distinct status precisely so that a spec can *require* the reset to have
 happened instead of accepting the ordinary 200 that WordPress would return for an unrecognised query
-argument. The pre-existing `clear-cache.php` mu-plugin remains in the tree byte-identical to base and is
-not provisioned by these workflows.
+argument. Authorization is mandatory and fail-closed: the endpoint does not exist at all (**404**) unless a
+32-to-128-character alphanumeric secret has been provisioned out of band, any method other than `POST` is
+refused (**405**) before the secret is even read, and a `POST` presenting no secret or the wrong one is
+refused (**403**) after a `hash_equals()` comparison. The secret travels **only** in the
+`X-WP-Perf-Cache-Reset-Token` request header — never in the URL, the request body, a log or an artifact —
+and the `X-WP-Perf-Cache-Reset` response header is emitted **only** on the authorized 202. The mechanism,
+its threat model and its wire-level proof are set out in §*Hardening the performance harness cache-reset
+control plane*. The pre-existing `clear-cache.php` mu-plugin remains in the tree byte-identical to base,
+is **not** provisioned by these workflows, and deliberately does **not** carry this authorization — which is
+exactly why the workflows must keep copying `server-timing.php` alone.
 
 **Both arms of the canonical pair were produced on the delivered tree by one identical harness**, and it
 is the single source of every measured figure below:
@@ -189,7 +197,7 @@ is the single source of every measured figure below:
 | Harness | `tests/performance/**` is **identical in both arms** — 13 tracked files, manifest digest `340e9185cda03f11…`. That is what makes this a comparison of code rather than of instruments |
 | Interpreter | PHP 8.5.9 (php-fpm), Xdebug absent; `opcache.enable=1`, `opcache.enable_cli=0`, `opcache.jit=disable`, `jit_buffer_size=64M`, `memory_consumption=128`, `max_accelerated_files=10000`, `interned_strings_buffer=8`, `validate_timestamps=1`, `revalidate_freq=2`. Identical in both arms and asserted per request as `wpOpcacheEnabled`/`wpOpcacheJit` |
 | Services | MySQL 8.4.11; no external object cache — `wpExtObjCache = 0` in all 18 scenarios of both arms, which is the plan's "backend absent" condition |
-| Cold-compile discipline | Both arms required an HTTP **202** from `/?clear_cache`, handled inside `server-timing.php`, before **every** measured navigation |
+| Cold-compile discipline | Both arms required an HTTP **202** from `/?clear_cache`, handled inside `server-timing.php`, before **every** measured navigation. Both arms obtained that 202 over the transport in force when they were run — an unauthenticated `GET` navigation — whereas the reset is now an authenticated `POST`. Only the authorization wrapper changed; `wp_perf_reset_caches()` and therefore the reset payload are unchanged, and the cold regime the 202 produces was re-measured directly across both transports and found equivalent (§*Hardening the performance harness cache-reset control plane*, `S03`) |
 | Process generation | php-fpm restarted between code states, so neither arm was measured on a worker that had served the other arm's code |
 | Samples | `TEST_RUNS=20`, `repeatEach=2` → 2 repetitions × 20 samples = **40 samples per scenario per metric**; medians reported |
 | Scenarios | **18** — 2 admin locales, 8 homepage theme×locale, 8 single-post theme×locale |
@@ -470,7 +478,20 @@ with a suffix — `A37-phase-trace-raw.json`, `B01-…console.log` and `B01-…j
 The **A series** is the measurement evidence: the before/after arms, the isolated single-file A/B runs, and
 the analyses derived from the two JSON artifacts. The **B series** is the verification evidence: the test,
 lint, type-check and build runs that discharge the quality gates, every one of them executed on the
-delivered tree.
+delivered tree. The **S series** is the security-remediation evidence added when the cache-reset control
+plane was hardened, and it includes the re-measurement of every figure that hardening perturbed.
+
+**One transport caveat that applies to the whole A series, stated here rather than repeated in each row.**
+Every A-series entry below that describes obtaining a 202 from `/?clear_cache` — `A03`, `A06`, `A24`, `A25`,
+`A28`, `A32`, `A36` and the two arms they bracket — obtained it over the transport in force when it ran: an
+**unauthenticated `GET`** (in some rows a `curl -I`, i.e. a `HEAD`). Those command lines are left exactly as
+they were run, because rewriting them to today's syntax would misdescribe what actually produced the
+numbers. The reset is now an authenticated `POST`, and under it a `GET` or `HEAD` is refused with 405. What
+that does *not* change is the measurement: the authorization wrapper sits in front of an unchanged
+`wp_perf_reset_caches()`, so an authorized 202 performs byte-for-byte the same four resets, and the cold
+regime it produces was re-measured across both transports and found equivalent (`S03`). Anyone reproducing
+an A-series row on the delivered tree must provision a secret and send the `POST` form documented in
+§*Hardening the performance harness cache-reset control plane*; the older command lines will now return 405.
 
 | Tag | What it establishes | Command and conditions |
 |---|---|---|
@@ -536,6 +557,12 @@ The B series — verification runs, all on the delivered tree:
 | `B16` | **Headless-Chrome regression sweep after the rebuild** — that the rebuilt site still behaves, and an independent three-method reproduction of all four command-palette gating outcomes and the emoji gate | six screens driven with a `readyState==='complete'` + 1500 ms quiesce gate; console and network captured per screen; Performance-API status sweep over all 230 editor subresources; cache-bypassing `curl` over 13 regenerated assets; server-side `curl` grep of the delivered HTML; 7 screenshots and 2 recordings retained under `runtime-after-rebuild/` |
 | `B17` | **Finding-resolution and zero-new-issues verification** — 50 mechanical assertions over the eight review findings, plus the regression check that no compilation error, lint violation, warning, test failure or placeholder was introduced | `scripts/vrf1.py` evaluated against the current document text and the current repository state; the log also records that the script's **first** run reported 5 of 8 unresolved across 12 assertions, that all 12 were defects in the assertions, and what each one taught |
 | `B18` | **Environment restoration**, and the triage that shows the single `src/wp-content/debug.log` entry left by turning `WP_DEBUG` back on is the no-outbound-network condition rather than anything this work introduced | `wp-config.php` restored byte-identically to the handover original and re-verified by `sha256sum`; the warning reproduced on the **base** tree with the 8 runtime files parked and `src/wp-content/debug.log` truncated first; the log also records a `git checkout HEAD --` mistake that discarded an uncommitted edit, and how it was recovered and verified three ways |
+| `S01` | **The cache-reset wire matrix** — that the hardened control plane answers 404 while no secret is provisioned and 405/403/202 once one is, for every request shape, with no body and no vocabulary header on any refusal | the harness installed into `src/wp-content/mu-plugins/`, a secret provisioned through the caller's own `cacheResetToken()`, then `curl` over the disabled and enabled matrices capturing status, full response headers and body byte count per shape; includes the host/container token-identity proof and the two transport-layer notes (HTTP OWS stripping, and nginx pre-empting non-canonical methods) — `scripts/cache_reset_matrix.sh` |
+| `S02` | **That only the authorized POST actually resets anything** — the functional counterpart to `S01`, which only reads status codes | `wp-bootstrap` from the `Server-Timing` header used as an OPcache-recompile detector: five warm samples, then one authorized 202, then three samples; repeated with each of the four refusal shapes substituted for the 202 — `scripts/cache_reset_functional.sh` |
+| `S03` | **Transport equivalence** — that moving the reset from an unauthenticated `GET` navigation to an authenticated `POST` does not change the measured regime, which is what licenses the A series to stand | the same cold-regime probe driven once per transport on the delivered tree, php-fpm restarted at the start of each arm so no worker generation is shared, ten reset-then-measure cycles per arm and medians reported; **replicated**, and the arm-to-arm difference flips sign between replications while the one-file/824-byte offset from the extra mu-plugin reproduces exactly, which is the experiment's own internal control; plus one full measured scenario (`home.test.js`, `TEST_RUNS=2`) run through `clearServerCaches()` to confirm every sample lands in the cold band — `scripts/transport_ab.sh` |
+| `S04` | **The re-measured PHPUnit counts** the hardening perturbed — the `Tests_Performance_ServerTimingMetrics` class, the ten-class sum, and the full single-site and Multisite totals | each class filtered on `/^<Class>::/` one per invocation, then both full suites, with the performance mu-plugins removed and `src/wp-content/uploads` cleared beforehand |
+| `S05` | **The static sweep over the remediation change set** | `php -l` and `phpcs --standard=phpcs.xml.dist` over the changed PHP, `node --check`, `npm run typecheck:js`, `grunt jshint`, PHPStan and `grunt verify:build-guards` |
+| `S06` | **Headless-Chrome proof that the hardened plane is unreachable from a browser**, including a CSRF-shaped form POST carrying an administrator's `HttpOnly` session cookies | two independent browser sessions: front end and single-content render with console and network audit, then the admin dashboard, posts list and settings screens plus a nine-step refusal battery and a seven-probe same-origin `fetch` matrix; screenshots and recordings retained under `runtime-cache-reset-hardening/` |
 
 **Reproduction scripts.** Where a run used a script rather than a single command, the log's own header or
 `REPRODUCE` block names it, and a copy of every such script is retained inside the evidence tree at
@@ -853,7 +880,7 @@ either the producing end (PHP) or the reporting end (JavaScript).
 **Change**: `tests/performance/wp-content/mu-plugins/server-timing.php` now emits `memory-peak`
 (via `memory_get_peak_usage( false )`), `files-loaded`, `cache-hits`, `cache-misses`, `bootstrap` and
 `bootstrap-valid`, plus a two-metric regime block — `opcache-enabled` and `opcache-jit`.
-The delivered harness declares **8 helper functions** and emits **14 metrics** in total; five metric
+The delivered harness declares **10 helper functions** — 8 of them for measurement, plus the two the hardened cache-reset control plane adds — and emits **14 metrics** in total; five metric
 names that an earlier arm of this work also emitted — `php-version-id`, `process-id`,
 `process-requests`, `opcache-cached-scripts` and `opcache-hit-rate` — were withdrawn, and
 `tests/phpunit/tests/performance/serverTimingMetrics.php` now asserts their **absence**. The reasoning
@@ -877,9 +904,11 @@ and are never read by the harness.**
 emits **6** metrics on the front end — `before-template`, `template`, `total`, `memory-usage`,
 `db-queries`, `ext-obj-cache` — and only 4 in the admin path. Its memory reading is
 `memory_get_usage()` at base lines 30 and 74: current usage, not peak. The delivered harness is
-613 lines with **8** named helper functions and emits **14** metrics. Both arms of the canonical pair
-ran the delivered harness, which is why the before arm carries the new metrics too — the comparison is
-of code, not of instruments.
+**811** lines with **10** named helper functions and emits **14** metrics. It was 613 lines with 8
+helpers until the cache-reset control plane was hardened; the two functions added there are
+authorization, not measurement, and they emit no metric. Both arms of the canonical pair ran the
+measurement half of the delivered harness, which is why the before arm carries the new metrics too —
+the comparison is of code, not of instruments.
 
 Captured live on the **delivered** tree from the canonical context — anonymous
 `http://localhost:8889/`, active theme `twentytwentyfive`, each of 10 iterations preceded by a
@@ -971,6 +1000,228 @@ it — six concurrent loaders, 60 reset-then-measure cycles — produced `wp-opc
 `tests/phpunit/tests/performance/serverTimingMetrics.php`, which asserts that an inactive accelerator
 changes nothing about the regime values, that a directive resolves from the snapshot before `ini_get()`,
 and that all sixteen boolean spellings normalize correctly.
+
+---
+
+## Hardening the performance harness cache-reset control plane
+
+**Bottleneck**: The instrument that makes the cold regime reproducible was itself an unauthenticated
+remote control. `tests/performance/wp-content/mu-plugins/server-timing.php` registered a
+`plugins_loaded` priority-1 callback whose entire trigger was `isset( $_GET['clear_cache'] )`, and on that
+condition alone it called `opcache_reset()`, `apcu_clear_cache()`, `wp_cache_flush()`,
+`delete_expired_transients( true )` and `clearstatcache( true )`, answered **HTTP 202**, and ended the
+request. Any method satisfied it, no credential was required, and no nonce was checked — so a link, an
+image tag or a form on an unrelated site was sufficient. **The cost of one such request is measured, not
+asserted**: a single reset moves the very next front-end request's `wp-bootstrap` from a warm band of
+**25.32–33.36 ms** on this host (median 26.97 ms) to **308.78 ms** — an **11.4×** amplification, repeatable at
+whatever rate the caller chooses (`S02`). That figure was taken through the *authorized* path on the hardened
+build, which is the only way to obtain a reset now; since `wp_perf_reset_caches()` is byte-for-byte what it
+was, it is the cost of the reset itself and therefore also the cost that any anonymous GET could previously
+buy. Two
+smaller edges came with it: the fixed
+`X-WP-Perf-Cache-Reset: opcache,object-cache,transients,stat` response header was emitted on **every**
+answered request and enumerated the cache layers present, and the caller reached the endpoint by
+navigating the page under test (`page.goto( '/?clear_cache' )`), which put the trigger in the browser's own
+history and address bar. The classes are CWE-306 (missing authentication for a critical function),
+CWE-352 (cross-site request forgery), CWE-400 (uncontrolled resource consumption) and CWE-20 (improper
+input validation).
+
+**Root Cause**: The endpoint was written as a convenience for a private, throwaway Docker environment,
+where "nobody else can reach port 8889" was true and therefore felt like a control. It is not one. The
+file is **tracked**, and two CI workflows copy it into a live WordPress install
+(`.github/workflows/reusable-performance.yml:226` and
+`.github/workflows/reusable-performance-test-v2.yml:250`), so the code path exists wherever the harness is
+provisioned, on whatever host that happens to be. Nothing in the file distinguished "the measurement
+harness asked for a reset" from "something on the internet asked for a reset", because the query argument
+was doing double duty as both the selector *and* the credential — and a query argument cannot be a
+credential, since it is not secret, not method-bound and not resistant to being followed by a browser.
+
+**Change**: Three files gained the control plane and three more pin it. The reset payload itself is
+untouched, which is what keeps the measurement comparable.
+
+- **Producer** — `tests/performance/wp-content/mu-plugins/server-timing.php`, which grows from 613 to
+  **811 lines**:
+  - A token resolver at
+    `tests/performance/wp-content/mu-plugins/server-timing.php:46` takes the secret from, in
+    order, a `WP_PERF_CACHE_RESET_TOKEN` constant, the same-named environment variable, or a token file
+    whose path comes from `WP_PERF_CACHE_RESET_TOKEN_FILE` or defaults to
+    `dirname( rtrim( ABSPATH, '/\\' ) ) . '/.cache/performance-cache-reset-token'` — **beside** the
+    document root, never inside it, so the secret is not web-fetchable. Every candidate must match
+    `/^[A-Za-z0-9]{32,128}$/`; anything absent, empty, short or non-string resolves to `''`. It uses
+    language functions only, so the isolated probe can call it with WordPress never loaded.
+  - A pure decision function at
+    `tests/performance/wp-content/mu-plugins/server-timing.php:131` is the fail-closed ladder:
+    no secret → **404**, so an un-provisioned harness has no endpoint at all rather than an unprotected
+    one; method not `POST` after `strtoupper()` → **405**, decided *before* the secret is read; a failed
+    `hash_equals()` at
+    `tests/performance/wp-content/mu-plugins/server-timing.php:142` → **403**, with no timing
+    oracle; otherwise **202**.
+  - The rewritten callback occupies
+    `tests/performance/wp-content/mu-plugins/server-timing.php:245-278`. It keeps
+    `isset( $_GET['clear_cache'] )` as the endpoint selector and nothing more, reads the method through
+    `sanitize_key( wp_unslash( … ) )`, reads the secret at
+    `tests/performance/wp-content/mu-plugins/server-timing.php:257-259` through
+    `sanitize_text_field( wp_unslash( $_SERVER['HTTP_X_WP_PERF_CACHE_RESET_TOKEN'] ) )` — both WordPress
+    sanitizers being non-scalar-safe — calls the reset only on 202 at
+    `tests/performance/wp-content/mu-plugins/server-timing.php:263-266`, and otherwise answers
+    with the bare status and `die` at
+    `tests/performance/wp-content/mu-plugins/server-timing.php:273-275`: no body, no reset
+    vocabulary header, no echo of what was presented, and no hint as to which step refused.
+  - The `X-WP-Perf-Cache-Reset` header is now written at exactly one place,
+    `tests/performance/wp-content/mu-plugins/server-timing.php:212`, reachable only from the
+    202 branch — which is what closes the cache-layer enumeration edge.
+- **Caller** — `tests/performance/utils.js`, using Node built-ins only so the dependency diff stays at
+  zero. `tests/performance/utils.js:79` and `tests/performance/utils.js:88` hold the
+  header name and the token grammar identically to the PHP side; the path resolver at
+  `tests/performance/utils.js:103` works from `__dirname` rather than `process.cwd()`; the
+  minter at `tests/performance/utils.js:130` produces
+  `randomBytes( 32 ).toString( 'hex' )` and writes it with `flag: 'wx'`, so a race cannot leave two
+  processes disagreeing, at `mode: 0o644` because php-fpm runs as a different uid and the file sits
+  outside the document root; and `tests/performance/utils.js:188` revokes it.
+  `clearServerCaches()` at `tests/performance/utils.js:211` now issues
+  `page.request.post( '/?clear_cache', { headers: { [ CACHE_RESET_TOKEN_HEADER ]: cacheResetToken() } } )`
+  at `tests/performance/utils.js:213-214` — **no navigation at all**, so nothing reaches
+  history or the address bar — requires 202, and explains 404/405/403 distinctly while **never
+  interpolating the secret** into any message.
+  `tests/performance/config/global-teardown.js:33` revokes the token first and unconditionally, ahead of
+  the storage-state branch, so the endpoint cannot outlive the run.
+- **Tests** — `tests/phpunit/data/isolated/server-timing-probe.php` gained three fixtures
+  (`cache-reset-disabled`, `cache-reset-weak-token`, `cache-reset-enabled`) that unset the ambient
+  environment, point the token path at an unreachable file, and measure **18 request shapes** per fixture,
+  reporting only `token_resolved` and `token_length` so a retained probe report carries no secret.
+  `tests/phpunit/tests/performance/serverTimingMetrics.php` gained two methods and extended four, and
+  `tests/performance/specs/utils.test.js` extended its two existing contract bodies — no new test case, so
+  the suite's declared count is unchanged — to pin POST-only, `hash_equals`, the three fail-closed
+  statuses, the `$_SERVER` key **derived from the exported header name** so a rename on either side fails
+  the test, and the caller's non-navigating, non-interpolating POST.
+
+One thing deliberately **not** changed: the pre-existing `tests/performance/wp-content/mu-plugins/clear-cache.php`
+is left byte-identical to base. It is outside this work's scope and neither workflow provisions it. But it
+is the same unauthenticated reset at the same hook and priority, and it sorts first by filename, so
+provisioning it beside `server-timing.php` would pre-empt the gate entirely. The PHPUnit class therefore
+asserts that neither workflow copies it and that it contains no `hash_equals()` of its own — the exposure is
+closed by *provisioning discipline that is now tested*, rather than by an out-of-scope edit.
+
+**Measurement**: Before/after by the same method, at three levels.
+
+*Wire level* (`S01`), with the harness installed and the secret provisioned through the caller's own
+`cacheResetToken()`, so the production provisioning path is what was exercised. The container was first
+proved to read what the host wrote — the `ABSPATH`-derived path resolved to
+`/var/www/.cache/performance-cache-reset-token`, `is_readable()` true, and the SHA-256 prefix identical on
+both sides.
+
+| Request shape | Before | After, no secret provisioned | After, secret provisioned |
+|---|---|---|---|
+| `GET /?clear_cache` | **202** + reset performed | **404** | **405** |
+| `GET` carrying the correct secret | 202 | 404 | **405** |
+| `HEAD /?clear_cache` | 202 | 404 | **405** |
+| `GET /?clear_cache&token=<secret>` | 202 | 404 | **405** |
+| `POST` with no secret | 202 | 404 | **403** |
+| `POST` with a wrong, truncated, extended, case-flipped, interior-spaced or empty secret | 202 | 404 | **403** |
+| `POST` with the secret in the URL or body only | 202 | 404 | **403** |
+| **`POST` with the correct secret in the header** | 202 | 404 | **202** |
+
+Every refusal returned **0 bytes** and carried **no** `X-WP-Perf-Cache-Reset` header and no echo of the
+presented value; the header appeared on the authorized 202 alone.
+
+*Functional level* (`S02`) — status codes alone would not prove the refusals are inert, so the same
+`wp-bootstrap` recompile detector was read after each outcome:
+
+| After this request | Next request's `wp-bootstrap` |
+|---|---|
+| five warm baseline samples | 28.96, 25.90, 26.97, 25.32, 33.36 ms — band **25.32–33.36**, median **26.97** |
+| **authorized 202** | **308.78 ms**, then 25.41, then 26.54 |
+| `GET` with the correct secret → 405 | 32.00 ms |
+| `POST` with no secret → 403 | 27.31 ms |
+| `POST` with a wrong secret → 403 | 24.73 ms |
+| `GET` with the secret in the query string → 405 | 29.11 ms |
+
+The **shape** of the middle row is the proof, not only its magnitude: one request pays the full recompile cost
+and the next two are warm again, which is what a single OPcache reset looks like and what a cosmetic 202 could
+not produce. Every refusal's next sample lands inside the warm band established before the run, so the
+refusals do not reset anything — not partially, not the object cache, not the stat cache. This probe was run
+twice on this tree; an earlier replication produced the same shape at slightly different absolutes (warm band
+23.28–30.67 ms, one 296.57 ms spike, all four refusals warm), and the retained run is the one tabulated
+because it is the one whose raw capture is kept.
+
+*Transport equivalence* (`S03`) — the canonical arms obtained their 202 over the old GET navigation, so the
+question of whether the new transport still produces the same regime is answered by measurement rather than
+by assertion. The A/B holds the **instrument** and the **reset payload** identical and varies only the
+transport: both arms run the delivered `server-timing.php`, so all 14 metrics are emitted in both; the GET
+arm additionally installs the untouched `clear-cache.php`, which registers the same `plugins_loaded`
+priority-1 hook, sorts first by filename, performs the same resets and answers 202 for any request carrying
+the query argument — so a plain GET reproduces the legacy transport exactly. php-fpm was restarted at the
+start of each arm so neither arm ran on a worker generation that had served the other. Ten reset-then-measure
+cycles per arm, every reset returning 202, medians reported. The experiment was **replicated**, and because
+the site's active theme differed between the two replications the absolute levels differ while the
+arm-to-arm comparison — the only thing being asked about — does not:
+
+| Measured on the request after the reset | Replication 1 (`twentytwentyfive`) | | Replication 2 (`twentytwentyone`) | |
+|---|---:|---:|---:|---:|
+| | legacy `GET` | hardened `POST` | legacy `GET` | hardened `POST` |
+| `wp-bootstrap` median | 304.48 ms | 306.40 ms | 309.01 ms | 301.24 ms |
+| — arm-to-arm difference | | **+1.92 ms (+0.63 %)** | | **−7.77 ms (−2.51 %)** |
+| `wp-total` median | 60.16 ms | 61.47 ms | 41.92 ms | 41.03 ms |
+| `wp-memory-peak` median | 5,779,824 B | 5,779,000 B | 4,034,464 B | 4,033,640 B |
+| — arm-to-arm difference | | **−824 B** | | **−824 B** |
+| `wp-files-loaded` | 384 | 383 | 397 | 396 |
+| — arm-to-arm difference | | **−1** | | **−1** |
+
+Three things in that table settle the question. First, **all four bootstrap medians sit deep in the cold
+band** — the warm median on this host is ~25 ms — so both transports demonstrably produce the regime the
+measurement depends on. Second, **the sign of the arm-to-arm difference flips between replications**
+(+0.63 % then −2.51 %), and each difference is far inside its own arm's spread (replication 1 GET
+294.85–332.80 against POST 297.66–339.38; replication 2 GET 299.52–345.47 against POST 294.43–316.64,
+overlapping throughout) — which is what a null difference looks like, and is stronger evidence than a single
+small delta in one direction would have been. Third, the two non-time rows are the experiment's **internal
+control**: the GET arm loads one extra mu-plugin file, and it reports exactly −1 file and exactly
+−824 bytes of peak in *both* replications, independently of theme. An instrument that reproduces an 824-byte
+offset to the byte across two runs is measuring what it claims to measure. The theme difference itself is
+incidental — the performance suite activates `twentytwentyfive` for its own scenarios and the environment
+returns to `twentytwentyone` afterwards — and it is reported rather than smoothed over because the
+`wp-total`, `wp-memory-peak` and `wp-files-loaded` levels move with it. Corroborating this at suite level, one full measured scenario (`home.test.js`, `TEST_RUNS=2`, 34 passed)
+driven through `clearServerCaches()` put **every** sample in the cold band at `wpBootstrap` ≈ **289–296 ms**,
+with all extended metrics captured; and because `clearServerCaches()` throws on any non-202, a
+silently-skipped reset is not a reachable state. The comparator- and reporter-contract suite is
+**98 passed / 0 failed**, unchanged.
+
+*Browser level* (`S06`) — the CSRF class is the one a wire test cannot settle, because it turns on what a
+browser attaches automatically. Logged in as an administrator: `GET /?clear_cache` → **405**;
+`GET /?clear_cache&token=…` → **405**, *identical* to the previous row, which proves the method gate runs
+before the credential is read and is why the query string is not a credential channel at all;
+`GET /wp-admin/?clear_cache` → **405** with no admin render; and a real `HTMLFormElement` POST built in the
+live admin document, carrying the `HttpOnly` session cookies with `origin`/`referer` same-origin and
+`sec-fetch-mode: navigate` → **403**. Seven same-origin `fetch` probes reported `anyReturned202: false` and
+`anyExposedResetHeader: false`, including a wrong value in the *correct* header name (so the value is
+validated, not merely the header's presence), the secret in the query only, and the secret in the body
+only. A seven-verb `curl` matrix gave GET/HEAD/PUT/DELETE/PATCH/OPTIONS → 405 and POST → 403. Object-cache
+counters were unchanged across the whole battery (hits 1611 → 1611 → 1609, misses 108 → 108 → 108), the
+session survived, and the post-battery dashboard screenshot is **byte-identical** to the pre-attack capture.
+The front end and the three admin screens loaded at **HTTP 200** with **zero** console errors and **zero**
+uncaught exceptions under instrumented pre-script hooks, and all seven extended metrics were present on
+every screen.
+
+Two transport facts are recorded because they would otherwise look like discrepancies between the probe and
+the wire. Leading or trailing whitespace around the header value yields **202** over HTTP, because RFC 7230
+§3.2.4 optional whitespace is stripped before `$_SERVER` is populated — the decision function itself returns
+**403** for a padded string, which the probe proves, and an **interior** space returns 403 over the wire too.
+And nginx pre-empts `PUT`/`DELETE`/`OPTIONS` with its own 405 and a non-canonical method token such as
+`post` with 400, so those shapes never reach PHP on this host; the probe proves PHP's own decision for each
+of them independently, and in no case is the wire more permissive than the application.
+
+**Value**: A remotely triggerable, credential-free cache-flush and OPcache-reset amplifier — worth a
+measured **11.4×** slowdown of the following request per anonymous call, at unbounded frequency — is gone
+from every host the harness can be provisioned on, and is replaced by a control plane that does not exist
+until a secret is deliberately provisioned. Concretely: the number of request shapes that can trigger a
+reset falls from **all of them** to exactly one (`POST` with the correct secret in the correct header), the
+number that can do so *from a browser* falls to **zero** (no navigation and no HTML form can set a request
+header), and the number of responses that disclose the cache-layer inventory falls from every answered
+request to only the authorized 202. Because `wp_perf_reset_caches()` is unchanged and the transport was
+proved equivalent, the hardening costs the measurement programme nothing: the cold-compile discipline every
+figure in this document depends on still holds, and the perf, contract and PHPUnit suites all remain green.
+The real-world reach is the CI surface itself — two workflows provision this file into a running install on
+shared runners, and a tracked file that flushes caches for anyone who asks is a liability wherever it lands,
+not only where it was first convenient.
 
 ---
 
@@ -2453,8 +2704,16 @@ misleading number be reported as a result — which is why they are listed indiv
 summarised.
 
 1. **The saved baseline workflow did not install `clear-cache.php`**, so its `/?clear_cache` navigation
-   returned 200 and left OPcache warm. Both arms of the canonical pair now install both tracked
-   mu-plugins, and all three specs require HTTP 202 before every measured request.
+   returned 200 and left OPcache warm. Both arms of the canonical pair were therefore run with both
+   tracked mu-plugins installed, and all three specs require HTTP 202 before every measured request.
+   *That provisioning choice is now superseded and must not be repeated.* Since the reset was hardened,
+   only `server-timing.php` may be installed — which is what both performance workflows have always
+   done. `clear-cache.php` registers the same `plugins_loaded` priority-1 hook, sorts first by filename,
+   and resets then `die`s for **any** request carrying the query argument with no authorization
+   whatsoever, so provisioning it beside `server-timing.php` would pre-empt the authenticated gate and
+   reinstate exactly the exposure that was removed. It is left byte-identical to base rather than
+   edited, because it falls outside this work's scope, and `Tests_Performance_ServerTimingMetrics` now
+   asserts both that neither workflow copies it and that it contains no `hash_equals()` of its own.
 2. **The front-end result objects did not declare the new Server-Timing metrics**, so values such as
    `wpDbQueries` accumulated across theme and locale buckets — the `twentytwentyfive`/`en_US` baseline
    contains 140 query samples per repetition rather than 20. The specs now reset every declared metric
@@ -3082,14 +3341,14 @@ suite (`ob_start()` in `server-timing.php` makes the ajax group risky, and uploa
 
 | Gate | Result |
 |---|---|
-| Zero test regressions | Every figure in this row is the exact result line of a log retained in `artifacts/qa-logs/`, named beside it, and every one was produced on the **delivered** tree. Single-site PHPUnit `Tests: 29555, Assertions: 3542245, Warnings: 86, Skipped: 50`, 0 failures, 0 errors, 0 risky, rc=0 — run twice, both runs agreeing on all four counts, and cross-checked against its own JUnit XML, which carries exactly 86 `<warning>`, 50 `<skipped>`, **0 `<failure>` and 0 `<error>`** elements (`B01`). Multisite `Tests: 30348, Assertions: 3544280, Warnings: 86, Skipped: 52`, 0 failures, rc=0 (`B02`). `--group capabilities` → `OK (933 tests, 3378 assertions)`, rc=0, with no warning, skip or risky marker of any kind (`B03`). `--group ajax`, which the shipped config excludes from the default suite and which therefore has to be run separately or the gate has a hole in it → `Tests: 180, Assertions: 1132, Skipped: 1`, rc=0 (`B04`). Every class in `tests/phpunit/tests/load/` → `Tests: 293, Assertions: 2160, Skipped: 1`, rc=0 (`A26`). The ten added or changed PHPUnit classes, run **one per invocation** because a bare path argument returns `No tests executed!` through this wrapper, sum to **622 tests / 101,866 assertions**, 0 failures, 0 errors, 0 skipped (`B05`). QUnit **456 tests, 0 failed, 0 skipped, 0 todo**, rc=0, across both `compiled.html` and `index.html` in one invocation (`B06`). `grunt verify:build-guards` **15/15 pass, 0 fail**, rc=0 (`B08`). PHPCS **0 errors, 0 warnings** over 19 of the change set's 31 PHP files, the other 12 excluded by the shipped `phpcs.xml.dist:86` and `:91` and covered instead by `php -l` (`B09`). PHPStan **`[OK] No errors`** over 1,414 files against an **empty** baseline, so nothing is being suppressed (`B10`). The performance suite declares **824 tests in 4 files** (`B11`) and 824 passed / 0 failed in each measurement arm (`A04`, `A07`). **E2E is the one suite that does not exit 0, and it is reported as it is rather than as one would like it:** 38 declared, **37 passed, 1 failed, 0 flaky, rc=1** — identically in two full runs (`B07`). The failure is `install.test.js:34`, and it is **not attributable to this change set**: with the 8 delivered runtime files parked to base `5e9d05d7dd` and php-fpm restarted, it fails **3 out of 3** there too, while `git diff 5e9d05d7dd..HEAD -- src/wp-settings.php` contains no added or removed line matching `/install/` and `wp_not_installed()` is still called, only at a shifted line (180 → 231). Its two causes are diagnosed in `B07` from the nginx access log and a deliberate OPcache-window reproduction. All **13** tests this change set adds to E2E pass, individually confirmed from the list reporter (11 in `command-palette.test.js`, 2 in `emoji-detection.test.js`). **No new skip was added to make anything pass, and this is decided from the diff rather than asserted.** `tests/phpunit/tests/cache.php` is the only changed test file containing any `markTestSkipped`; its diff is `1 file changed, 877 insertions(+)` with **zero deletions**, its guard count goes 3 → 23, and its test methods go 25 → 47 with **none removed**. The 3 methods base guarded — `test_is_valid_key`, `test_flush`, `test_switch_to_blog` — keep their guards unchanged, and all **20** added guards sit on 20 of the 22 **newly added** methods, behind the same `wp_using_ext_object_cache()` predicate and the same message base already used. **No pre-existing test method acquired a skip**, and in this environment the predicate is false, so all 20 are inert: `Tests_Cache` appears **zero** times in the 50-skip inventory and runs 58 tests / 183 assertions with 0 skipped. The other modified test file adds 0 guards, and the 8 new test classes contain 0 `markTestSkipped` and 0 `@requires` between them. Both remaining skips are named: the load-directory one is `Test_WP_Debug_Mode` (it needs `WP_DEBUG_*` constants set in `wp-tests-config.php`), and the ajax one is `Tests_Ajax_wpAjaxResponse::test_response_charset_in_header`, skipped by its own `@requires function xdebug_get_headers` at `tests/phpunit/tests/ajax/wpAjaxResponse.php:76` because Xdebug is absent; `git diff 5e9d05d7dd..HEAD --name-only \| grep -i ajax` returns nothing. *Six figures an earlier draft carried are withdrawn because no run on this tree produces them: single-site `Tests: 29481, Assertions: 3542452` (the true count is 74 tests higher and 207 assertions lower), multisite `Tests: 30274, Assertions: 3544489`, `--group capabilities` `OK (888 tests, 3842 assertions)`, the load directory `Tests: 270, Assertions: 2001`, the ten-class totals `557 tests / 102,120 assertions` and `627 tests / 101,904 assertions`, and the performance suite's `786`. The E2E account is corrected more substantially: there is no clean run here, the residual-`wp_e2e_*`-tables explanation does not apply — 0 such tables existed before or after — and the failure is deterministic rather than a flake.* Two further suites complete the picture. The comparator and reporter **contract** suite — the guard that a missing baseline stays fatal and that the reporter refuses to write an incomplete run — is **98 passed / 0 failed**, rc=0, run with `WP_ARTIFACTS_PATH` redirected to a sandbox so it could not overwrite the three retained artifacts, whose byte-identity was re-verified afterwards (`B12`). And the syntax floor is checked where the sniffer does not reach: **`php -l` passes on 31 of 31** changed PHP files, including all 12 the sniffer excludes, and **`node --check` passes on 13 of 13** changed JavaScript files, with `npm run typecheck:js` rc=0 and `grunt jshint` reporting every tracked target **lint free** — grunt 1/1, tests 32/32, themes 45/45, media 98/98, core 97/97. The one failing jshint target, `jshint:plugins`, was isolated with the target's own `--dir` filter: `--dir=wordpress-importer` is clean and `--dir=gutenberg` carries **all** 52,959 errors, in files of which **0 of 163 are tracked by git** — `src/wp-content/plugins` is gitignored at `.gitignore:57`, holds the environment's prebuilt Gutenberg artifact, and is empty in CI; the Gruntfile's jshint configuration is untouched by this work (`B14`).|
+| Zero test regressions | Every figure in this row is the exact result line of a log retained in `artifacts/qa-logs/`, named beside it, and every one was produced on the **delivered** tree. Single-site PHPUnit `Tests: 29557, Assertions: 3542336, Warnings: 86, Skipped: 50`, 0 failures, 0 errors, 0 risky, rc=0, cross-checked against its own JUnit XML, whose root `testsuite` element carries the same four counts and which contains exactly 86 `<warning>`, 50 `<skipped>`, **0 `<failure>` and 0 `<error>`** elements (`S04`). Multisite `Tests: 30350, Assertions: 3544371, Warnings: 86, Skipped: 52`, 0 failures, rc=0, with its own JUnit XML agreeing on all four counts and carrying 0 `<failure>` and 0 `<error>` (`S04`). **Both totals were re-measured after the cache-reset control plane was hardened, and both moved by exactly the coverage that hardening added: +2 tests and +91 assertions each.** The pre-remediation figures — single-site `Tests: 29555, Assertions: 3542245` run twice with both runs agreeing on all four counts (`B01`), and multisite `Tests: 30348, Assertions: 3544280` (`B02`) — are superseded rather than removed, and the delta reconciles against the ten-class table exactly. `--group capabilities` → `OK (933 tests, 3378 assertions)`, rc=0, with no warning, skip or risky marker of any kind (`B03`, re-run unchanged in `S04`). `--group ajax`, which the shipped config excludes from the default suite and which therefore has to be run separately or the gate has a hole in it → `Tests: 180, Assertions: 1132, Skipped: 1`, rc=0 (`B04`). Every class in `tests/phpunit/tests/load/` → `Tests: 293, Assertions: 2160, Skipped: 1`, rc=0 (`A26`). The ten added or changed PHPUnit classes, run **one per invocation** because a bare path argument returns `No tests executed!` through this wrapper, sum to **624 tests / 101,957 assertions**, 0 failures, 0 errors, 0 skipped (`S04`; the pre-remediation sum of 622 / 101,866 is `B05`). QUnit **456 tests, 0 failed, 0 skipped, 0 todo**, rc=0, across both `compiled.html` and `index.html` in one invocation (`B06`). `grunt verify:build-guards` **15/15 pass, 0 fail**, rc=0 (`B08`). PHPCS **0 errors, 0 warnings** over 19 of the change set's 31 PHP files, the other 12 excluded by the shipped `phpcs.xml.dist:86` and `:91` and covered instead by `php -l` (`B09`, re-verified in `S05` with the same 19/12 split and the same zero totals). PHPStan **`[OK] No errors`** over 1,414 files against an **empty** baseline, so nothing is being suppressed (`B10`, re-verified in `S05`). The performance suite declares **824 tests in 4 files** (`B11`) and 824 passed / 0 failed in each measurement arm (`A04`, `A07`). **E2E is the one suite that does not exit 0, and it is reported as it is rather than as one would like it:** 38 declared, **37 passed, 1 failed, 0 flaky, rc=1** — identically in two full runs (`B07`). The failure is `install.test.js:34`, and it is **not attributable to this change set**: with the 8 delivered runtime files parked to base `5e9d05d7dd` and php-fpm restarted, it fails **3 out of 3** there too, while `git diff 5e9d05d7dd..HEAD -- src/wp-settings.php` contains no added or removed line matching `/install/` and `wp_not_installed()` is still called, only at a shifted line (180 → 231). Its two causes are diagnosed in `B07` from the nginx access log and a deliberate OPcache-window reproduction. All **13** tests this change set adds to E2E pass, individually confirmed from the list reporter (11 in `command-palette.test.js`, 2 in `emoji-detection.test.js`). **No new skip was added to make anything pass, and this is decided from the diff rather than asserted.** `tests/phpunit/tests/cache.php` is the only changed test file containing any `markTestSkipped`; its diff is `1 file changed, 877 insertions(+)` with **zero deletions**, its guard count goes 3 → 23, and its test methods go 25 → 47 with **none removed**. The 3 methods base guarded — `test_is_valid_key`, `test_flush`, `test_switch_to_blog` — keep their guards unchanged, and all **20** added guards sit on 20 of the 22 **newly added** methods, behind the same `wp_using_ext_object_cache()` predicate and the same message base already used. **No pre-existing test method acquired a skip**, and in this environment the predicate is false, so all 20 are inert: `Tests_Cache` appears **zero** times in the 50-skip inventory and runs 58 tests / 183 assertions with 0 skipped. The other modified test file adds 0 guards, and the 8 new test classes contain 0 `markTestSkipped` and 0 `@requires` between them. Both remaining skips are named: the load-directory one is `Test_WP_Debug_Mode` (it needs `WP_DEBUG_*` constants set in `wp-tests-config.php`), and the ajax one is `Tests_Ajax_wpAjaxResponse::test_response_charset_in_header`, skipped by its own `@requires function xdebug_get_headers` at `tests/phpunit/tests/ajax/wpAjaxResponse.php:76` because Xdebug is absent; `git diff 5e9d05d7dd..HEAD --name-only \| grep -i ajax` returns nothing. *Six figures an earlier draft carried are withdrawn because no run on this tree produces them: single-site `Tests: 29481, Assertions: 3542452` (the true count is 74 tests higher and 207 assertions lower), multisite `Tests: 30274, Assertions: 3544489`, `--group capabilities` `OK (888 tests, 3842 assertions)`, the load directory `Tests: 270, Assertions: 2001`, the ten-class totals `557 tests / 102,120 assertions` and `627 tests / 101,904 assertions`, and the performance suite's `786`. The E2E account is corrected more substantially: there is no clean run here, the residual-`wp_e2e_*`-tables explanation does not apply — 0 such tables existed before or after — and the failure is deterministic rather than a flake.* Two further suites complete the picture. The comparator and reporter **contract** suite — the guard that a missing baseline stays fatal and that the reporter refuses to write an incomplete run — is **98 passed / 0 failed**, rc=0, run with `WP_ARTIFACTS_PATH` redirected to a sandbox so it could not overwrite the three retained artifacts, whose byte-identity was re-verified afterwards (`B12`). And the syntax floor is checked where the sniffer does not reach: **`php -l` passes on 31 of 31** changed PHP files, including all 12 the sniffer excludes, and **`node --check` passes on 13 of 13** changed JavaScript files, with `npm run typecheck:js` rc=0 and `grunt jshint` reporting every tracked target **lint free** — grunt 1/1, tests 32/32, themes 45/45, media 98/98, core 97/97. The one failing jshint target, `jshint:plugins`, was isolated with the target's own `--dir` filter: `--dir=wordpress-importer` is clean and `--dir=gutenberg` carries **all** 52,959 errors, in files of which **0 of 163 are tracked by git** — `src/wp-content/plugins` is gitignored at `.gitignore:57`, holds the environment's prebuilt Gutenberg artifact, and is empty in CI; the Gruntfile's jshint configuration is untouched by this work (`B14`).|
 | Warnings accounted for | All 86 PHPUnit warnings are the framework's own PHPUnit-9→10 forward-compatibility notices, in exactly four texts — "Expecting E_DEPRECATED and E_USER_DEPRECATED is deprecated…" ×35, "Expecting E_ERROR and E_USER_ERROR…" ×24, "Expecting E_STRICT, E_NOTICE, and E_USER_NOTICE…" ×15, "Expecting E_WARNING and E_USER_WARNING…" ×12 — raised by **22** distinct test classes, **none of which is a file this change set touches**. The tally is not read off by eye: the `There were 86 warnings:` listing of each retained console log was parsed programmatically, its numbered blocks counted (**86 parsed, matching the 86 declared in the header**, so the listing is complete and gap-free), and each block's class and message shape tallied. The four texts, their four counts and the 22-class breakdown are **identical between the single-site and multisite runs** — a machine equality check on both the shape tally and the class tally returned true for each. All 22 classes were then located under `tests/phpunit/tests/` (**22 classes, 22 files, 0 unlocatable**) and intersected with `git diff --name-only 5e9d05d7dd..HEAD`; the intersection is **empty**. Every warning is therefore pre-existing framework noise about the tests' own expectation style, not anything this work introduced. Parse basis: the console logs retained beside `B01` and `B02`. |
 | Performance proof | The canonical before/after pair was produced by swapping only the in-scope `src/` files between the delivered tree and base `5e9d05d7dd`, with hash verification in both directions (`A02` parking, `A05` restore, both per-file) and `git status` confirmed unchanged afterwards, then running the identical harness in each state on equally young php-fpm worker generations — the worker-generation symmetry the OPcache Measurement Law requires (`A03`, `A06`). What each arm attests is its own result set, and both are complete: **18 result entries × 2 repetitions × 20 samples per metric series**, verified directly from the two JSON artifacts, together with scenario-title equality and identical metric-slug sets across arms (`A14`). The suite declares **824 tests in 4 files** (`B11`) and **824 passed / 0 failed** in each arm (`A04` before, `A07` after), so neither arm ran a reduced suite. `tests/performance/compare-results.js` exits **0** over that pair across all 18 scenarios (`A08`). The four failed targets are reported as failures from that same data rather than being substituted with a more favourable measurement; the isolated single-file A/B runs quoted earlier (`A25`, `A28`, `A32`, `A36`) are corroboration, not the primary proof. |
 | Value documentation | This document. |
 | No speculative optimization | N+1 priming, customizer JS and webpack splitting were rejected during discovery; the admin-JS target was re-aimed from `common.js` (0.75 % of payload) to the Command Palette (91.2 %); the final bootstrap option-primer was removed after measuring 0 saved front-end queries and +1 admin query. |
 | Minimal diff | No file deletions. Gates added inside callbacks, never by removing a registration. `ajax-actions.php` left alone because deferring its 94 handlers forces ~3,496 lines of whitespace-only diff. The diff is also verified to be *only* what was intended: a full `npm run build` (53 tasks, including `clean:files`, `webpack:prod` and `verify:build-guards` at 15/15) followed by `npm run build:dev` leaves `git diff --exit-code` at **0 over the whole tree** once the intentional paths are excluded — **zero bytes of build-induced drift** — and `build:autoload-classmap` regenerates `src/wp-includes/autoload-classmap.php` to the **byte-identical committed blob** `8e1ab4f79daa317bfafde378c30e34662a1c4f10`, so the shipped map is genuinely generated rather than hand-maintained, which is what AAP §0.8.1 requires of it (`B13`). |
 | Backward compatibility | `/wp/v2` still registers **108** routes on this host — **106 unconditional plus the 2 that register only where `wp_is_client_side_media_processing_enabled()` is true**, so 106 and a root index of 131 are the correct expectations on a host without a secure context — and 108 of 108 carry their `methods` and `endpoints` schemas; the root index still exposes 133 routes across 6 namespaces here. Front-end HTML differs from base by exactly **one contiguous removal and zero inserted bytes** — 13,700 B at `SCRIPT_DEBUG=true`, 3,324 B at `false` — verified by prefix-plus-suffix arithmetic on all four page × flag combinations (`A28`). Public signatures, hook names and argument counts are unchanged; the `map_meta_cap` memo is bypassed for any branch that emits `_doing_it_wrong()` and for any non-core filter callback; `$cache_hits` and `$cache_misses` remain the same public integers. Headless-Chrome validation on the delivered tree confirmed palette absence on non-editor screens (`A29`), palette presence and a working palette on the editor screens with Dashboard carried as the OFF side of the same gate (`A30`), and emoji-detection absence with the emoji *styles* intact on a provably logged-out front end (`A31`). All **13** E2E tests this change set adds pass, and the suite's one failure is pre-existing and reproduces 3/3 on base (`B07`). A later sweep re-established all four gating outcomes on a freshly rebuilt tree by **three independent methods at once** — browser DOM query, `window.wp` runtime-key inspection, and a server-side `curl` grep of the HTML nginx/PHP actually delivers — agreeing on every screen: `commands` occurs **0** times in the delivered HTML of `/`, `/wp-admin/` and `/wp-admin/options-general.php`, and **11** times on `post-new.php`, where `window.wp` also exposes `["commands","coreCommands"]` and the `Ctrl+K` affordance is visible. On the Dashboard the absence was proved to be real rather than a concatenation artifact by enumerating every `load[]` chunk of both `load-styles.php` and `load-scripts.php` alongside all 39 `script[src]` URLs and all 4 stylesheets. The same sweep found **zero** responses ≥ 400 across roughly 600 requests over six screens, **zero** console errors and **zero** warnings, and the block editor mounting and interactive with 220 block types rendering on demand — and it confirmed the emoji outcome is gating rather than breakage, since `wp-emoji-release.min.js` itself serves **200 at 22,762 bytes** while appearing **0** times in the front-end HTML (`B16`). |
-| Security invariant | `wp_authenticate`, `check_ajax_referer`, `wp_verify_nonce`, `current_user_can` and `auth_redirect` remain eagerly available on every request path. The palette gate only ever *reduces* what a context receives. REST permission callbacks are registered inside `create_initial_rest_routes()`, which runs in full whenever a REST route is dispatched. |
+| Security invariant | `wp_authenticate`, `check_ajax_referer`, `wp_verify_nonce`, `current_user_can` and `auth_redirect` remain eagerly available on **every full-bootstrap request path** — front end, `wp-admin`, `admin-ajax.php`, cron, REST, XML-RPC and Multisite alike — and none of the five was moved into the class map or behind a deferred load. Four of them are declared in `src/wp-includes/pluggable.php` (`wp_authenticate` at `:684`, `auth_redirect` at `:1280`, `check_ajax_referer` at `:1417`, `wp_verify_nonce` at `:2470`), which `src/wp-settings.php:606` still requires unconditionally; the fifth, `current_user_can`, is declared at `src/wp-includes/capabilities.php:972` and its file is still required unconditionally at `src/wp-settings.php:234`. **The one path on which those five are not available is `SHORTINIT`, and that was equally true before this work**: `src/wp-settings.php:220-222` returns early, ahead of both the capability/role/user block at `:234-237` and the pluggable block at `:605-607`. All three constructs occur exactly once in base `5e9d05d7dd` and exactly once here, differing only in line number (`if ( SHORTINIT ) {` 169 → 220, the `capabilities.php` require 185 → 234, the `pluggable.php` require 608 → 606), so the ordering — and therefore the boundary — is unchanged, and a `SHORTINIT` consumer that wants those primitives must load them itself exactly as it always had to. An earlier draft of this row claimed availability on "every request path", which overstated the guarantee by silently folding `SHORTINIT` into it; the claim is narrowed here rather than defended. The palette gate only ever *reduces* what a context receives. REST permission callbacks are registered inside `create_initial_rest_routes()`, which runs in full whenever a REST route is dispatched. The performance harness's cache-reset control plane is authenticated, POST-only and fail-closed — see *Hardening the performance harness cache-reset control plane* below. |
 
 ### Coverage added or extended by this change set
 
@@ -3099,14 +3358,16 @@ modified test files, and each declares exactly one class. Their counts come from
 per class**, because a bare path argument returns `No tests executed!` through this project's PHPUnit
 wrapper; each invocation therefore filters on `/^<Class>::/`, anchored so no sibling class name is swept
 in. The **total** row is the sum of those ten, not a figure any single run printed. Every figure was
-measured on the **delivered** tree, and all ten exit 0 with 0 failures, 0 errors, 0 warnings and 0 skips
-(`B05`).
+measured on the **delivered** tree, and all ten exit 0 with 0 failures, 0 errors, 0 warnings and 0 skips.
+The whole set was **re-run after the cache-reset control plane was hardened**, because the coverage that
+hardening added changes two of these numbers and therefore the total; the figures below are that
+re-run (`S04`), and the `B05` run they supersede is recorded immediately after the table.
 
 | Test class | Tests | Assertions | What it pins |
 |---|---:|---:|---|
 | `Tests_Load_wpAutoloadClass` | 208 | 1,922 | every one of the 143 class-map entries resolves to a readable file; the generator reads a PHP 7.4-alike token stream; an unusable or malformed entry is refused rather than emitted |
 | `Tests_User_MapMetaCapMemo` | 144 | 375 | 24 methods over 3 data providers: memo admission (no arguments, integer user, string capability), suppression while a `map_meta_cap` or `all` callback is registered, and the whole-array reset at the entry bound |
-| `Tests_Performance_ServerTimingMetrics` | 78 | 668 | the new harness metrics are always integers, produce no output and raise no diagnostic; the withdrawn metric names are absent |
+| `Tests_Performance_ServerTimingMetrics` | 80 | 759 | the new harness metrics are always integers, produce no output and raise no diagnostic; the withdrawn metric names are absent; and the hardened cache-reset control plane answers 404 while no secret is provisioned or a weak one is, 405 for every non-`POST` shape even carrying the correct secret, 403 for a `POST` presenting none or the wrong one, and 202 only for the authorized `POST` — asserted over 18 request shapes per fixture |
 | `Tests_Cache` | 58 | 183 | per-group counters stay off by default, stay bounded by `$max_tracked_groups` in both the tracked and the untracked-group direction, and leave `$cache_hits` / `$cache_misses` exact |
 | `Tests_Formatting_Emoji` | 41 | 292 | the gated detection script prints exactly once when asked for, and `_wp_emoji_list()` always returns arrays |
 | `Tests_Dependencies_CommandPalette` | 38 | 123 | the gate's screen-based default, that the filter receives it, and that delivery follows the filtered value |
@@ -3114,7 +3375,15 @@ measured on the **delivered** tree, and all ten exit 0 with 0 failures, 0 errors
 | `Tests_Load_wpSiteHealthLoader` | 8 | 31 | the deferred Site Health class loads on the paths that need it |
 | `Tests_Formatting_EmojiArrays` | 7 | 98,097 | every entry of the relocated arrays matches the generator's contract |
 | `Tests_REST_RouteInventory` | 4 | 9 | the route split the deferral must preserve: `UNCONDITIONAL_WP_V2_ROUTES` holds 106 names, `CONDITIONAL_WP_V2_ROUTES` holds the 2 that appear only where `wp_is_client_side_media_processing_enabled()` is true, and the root-index totals are 131 / 133 accordingly |
-| **total** | **622** | **101,866** | |
+| **total** | **624** | **101,957** | |
+
+`Tests_Performance_ServerTimingMetrics` is the only row the security remediation moved. `B05` measured it
+at **78 tests / 668 assertions** and the ten-class total at **622 / 101,866**; the two test methods and four
+extended methods the hardened cache-reset control plane needed take it to **80 / 759**, and the total to
+**624 / 101,957** — a delta of exactly **+2 tests / +91 assertions** in both places, which is the
+arithmetic check that nothing else in the set drifted. The superseded pair is left on the record here rather
+than deleted, because a total that changes without an explanation is indistinguishable from a total that was
+wrong.
 
 Two of those counts look wrong and are not. `Tests_Formatting_EmojiArrays` reports 7 tests but **98,097
 assertions** because it walks the relocated data entry by entry, so its assertion count tracks the data set

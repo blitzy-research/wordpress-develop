@@ -339,6 +339,9 @@ function wp_perf_probe_fixture( $fixture ) {
 			return array( true, new WP_Perf_Probe_Public_Counters( 12, 'many' ) );
 		case 'bootstrap-duration':
 		case 'measurement-metadata':
+		case 'cache-reset-disabled':
+		case 'cache-reset-weak-token':
+		case 'cache-reset-enabled':
 			return array( false, null );
 	}
 
@@ -380,7 +383,19 @@ $wp_perf_probe_fixtures = array(
 	'mixed-counters',
 	'bootstrap-duration',
 	'measurement-metadata',
+	'cache-reset-disabled',
+	'cache-reset-weak-token',
+	'cache-reset-enabled',
 );
+
+/**
+ * The secret the cache reset fixtures provision, and the shape of a real one.
+ *
+ * 64 alphanumeric characters, the same shape `tests/performance/utils.js` writes, so the
+ * fixtures exercise the grammar the mu-plugin actually enforces rather than a value that
+ * only happens to pass.
+ */
+define( 'WP_PERF_PROBE_TOKEN', str_repeat( 'a1B2c3D4', 8 ) );
 
 if ( 'list' === $argv[2] ) {
 	echo wp_perf_probe_encode( array( 'fixtures' => $wp_perf_probe_fixtures ) );
@@ -562,6 +577,63 @@ if ( 'measurement-metadata' === $argv[2] ) {
 	);
 }
 
+$wp_perf_probe_cache_reset = array();
+
+if ( 0 === strpos( $argv[2], 'cache-reset-' ) ) {
+	/*
+	 * The resolver reads a constant, then an environment variable, then a token file, and
+	 * the ambient environment could satisfy any of the three. Both variables are unset and
+	 * the file is pointed at a path that cannot exist, so what each fixture below decides
+	 * is a property of the fixture rather than of the machine the probe happens to run on.
+	 * ABSPATH is never defined in this process, so the resolver's default path is not
+	 * reachable either.
+	 */
+	putenv( 'WP_PERF_CACHE_RESET_TOKEN' );
+	putenv( 'WP_PERF_CACHE_RESET_TOKEN_FILE' );
+	define( 'WP_PERF_CACHE_RESET_TOKEN_FILE', '/nonexistent/wp-perf-probe/no-such-token-file' );
+
+	if ( 'cache-reset-enabled' === $argv[2] ) {
+		define( 'WP_PERF_CACHE_RESET_TOKEN', WP_PERF_PROBE_TOKEN );
+	} elseif ( 'cache-reset-weak-token' === $argv[2] ) {
+		/*
+		 * Provisioned but far below the required 32 characters. The endpoint must stay
+		 * disabled rather than come up protected by something guessable.
+		 */
+		define( 'WP_PERF_CACHE_RESET_TOKEN', 'short' );
+	}
+
+	$wp_perf_probe_resolved = wp_perf_cache_reset_token();
+
+	/*
+	 * Only the length and whether anything resolved at all are reported. The value never
+	 * leaves this process, so a probe report kept as evidence carries no secret.
+	 */
+	$wp_perf_probe_cache_reset = array(
+		'token_resolved' => '' !== $wp_perf_probe_resolved,
+		'token_length'   => strlen( $wp_perf_probe_resolved ),
+		'statuses'       => array(
+			'get_without_token'                 => wp_perf_cache_reset_status( 'GET', '' ),
+			'get_with_correct_token'            => wp_perf_cache_reset_status( 'GET', WP_PERF_PROBE_TOKEN ),
+			'head_with_correct_token'           => wp_perf_cache_reset_status( 'HEAD', WP_PERF_PROBE_TOKEN ),
+			'put_with_correct_token'            => wp_perf_cache_reset_status( 'PUT', WP_PERF_PROBE_TOKEN ),
+			'delete_with_correct_token'         => wp_perf_cache_reset_status( 'DELETE', WP_PERF_PROBE_TOKEN ),
+			'options_with_correct_token'        => wp_perf_cache_reset_status( 'OPTIONS', WP_PERF_PROBE_TOKEN ),
+			'empty_method_with_correct_token'   => wp_perf_cache_reset_status( '', WP_PERF_PROBE_TOKEN ),
+			'nonstring_method'                  => wp_perf_cache_reset_status( array( 'POST' ), WP_PERF_PROBE_TOKEN ),
+			'post_without_token'                => wp_perf_cache_reset_status( 'POST', '' ),
+			'post_with_wrong_token'             => wp_perf_cache_reset_status( 'POST', str_repeat( 'b2C3d4E5', 8 ) ),
+			'post_with_truncated_token'         => wp_perf_cache_reset_status( 'POST', substr( WP_PERF_PROBE_TOKEN, 0, 63 ) ),
+			'post_with_extended_token'          => wp_perf_cache_reset_status( 'POST', WP_PERF_PROBE_TOKEN . 'a' ),
+			'post_with_case_changed_token'      => wp_perf_cache_reset_status( 'POST', strtolower( WP_PERF_PROBE_TOKEN ) ),
+			'post_with_padded_token'            => wp_perf_cache_reset_status( 'POST', ' ' . WP_PERF_PROBE_TOKEN . ' ' ),
+			'post_with_nonstring_token'         => wp_perf_cache_reset_status( 'POST', array( WP_PERF_PROBE_TOKEN ) ),
+			'post_with_null_token'              => wp_perf_cache_reset_status( 'POST', null ),
+			'post_with_correct_token'           => wp_perf_cache_reset_status( 'POST', WP_PERF_PROBE_TOKEN ),
+			'lowercased_post_with_correct_token' => wp_perf_cache_reset_status( 'post', WP_PERF_PROBE_TOKEN ),
+		),
+	);
+}
+
 $wp_perf_probe_output = ob_get_clean();
 
 $wp_perf_probe_report = array(
@@ -575,6 +647,7 @@ $wp_perf_probe_report = array(
 	'registrations' => $GLOBALS['wp_perf_probe_registrations'],
 	'bootstrap'     => $wp_perf_probe_bootstrap,
 	'metadata'      => $wp_perf_probe_metadata,
+	'cache_reset'   => $wp_perf_probe_cache_reset,
 	'functions'     => array_values(
 		array_filter(
 			get_defined_functions()['user'],

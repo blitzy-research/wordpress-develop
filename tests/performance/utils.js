@@ -1,8 +1,15 @@
 /**
  * External dependencies.
  */
-const { readFileSync, existsSync } = require( 'node:fs' );
-const { join } = require( 'node:path' );
+const { randomBytes } = require( 'node:crypto' );
+const {
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} = require( 'node:fs' );
+const { dirname, join } = require( 'node:path' );
 const { gzipSync } = require( 'node:zlib' );
 
 process.env.WP_ARTIFACTS_PATH ??= join( process.cwd(), 'artifacts' );
@@ -47,16 +54,142 @@ const countMetrics = new Set( [
 const validityMetrics = new Set( [ 'wpBootstrapValid' ] );
 
 /**
- * Status the cache-reset helper answers with, and nothing else does.
+ * Status the cache-reset helper answers an authorized reset with, and nothing else does.
  *
- * `tests/performance/wp-content/mu-plugins/server-timing.php` and
- * `clear-cache.php` both answer `?clear_cache` with 202 after discarding the opcode
- * cache, the object cache and the expired transients. WordPress itself never sends
- * 202 for that URL, so requiring it is what distinguishes a request that was
- * actually reset from a front page that merely returned 200 because no reset helper
- * was installed.
+ * `tests/performance/wp-content/mu-plugins/server-timing.php` answers an authorized
+ * `POST /?clear_cache` with 202 after discarding the opcode cache, the object cache and
+ * the expired transients. WordPress itself never sends 202 for that URL, and neither
+ * does any status the reset refuses with, so requiring it is what distinguishes a
+ * request that was actually reset from one that was refused, or from a front page that
+ * merely returned 200 because no reset helper was installed.
  */
 const CACHE_RESET_STATUS = 202;
+
+/**
+ * Header the cache-reset secret is presented in.
+ *
+ * A header rather than a query argument, because a reset changes server state for the
+ * whole installation: a secret in the URL would be sent by any navigation, prefetch or
+ * embedded resource that copied the address, and would be recorded in the access log,
+ * the referrer and the browser history. A custom header cannot be set by a cross-origin
+ * form or an `img` tag at all, which is what makes the endpoint unreachable by tricking
+ * a browser. PHP exposes this name as `$_SERVER['HTTP_X_WP_PERF_CACHE_RESET_TOKEN']`,
+ * which is where the mu-plugin reads it.
+ */
+const CACHE_RESET_TOKEN_HEADER = 'X-WP-Perf-Cache-Reset-Token';
+
+/**
+ * Grammar the mu-plugin requires of the secret before it will enable the reset at all.
+ *
+ * Kept identical to the pattern in `server-timing.php` on purpose: a token this side
+ * writes but that side would reject leaves the endpoint disabled, and the failure would
+ * surface as an unexplained 404 in the middle of a measured run rather than here.
+ */
+const CACHE_RESET_TOKEN_PATTERN = /^[A-Za-z0-9]{32,128}$/;
+
+/**
+ * Where the per-run secret is kept.
+ *
+ * Beside the installation directory rather than inside it, so it is not served over
+ * HTTP: the WordPress document root is `<repo>/src` or `<repo>/build`, and this sits in
+ * `<repo>/.cache`, which is git-ignored. Resolved from this file's own location rather
+ * than from `process.cwd()` so that it is the same path no matter which directory the
+ * suite was started from, and it is the same path the mu-plugin derives from `ABSPATH`.
+ * `WP_PERF_CACHE_RESET_TOKEN_FILE` overrides it, and the mu-plugin honours the same
+ * variable, for a deployment whose installation is not inside this repository.
+ *
+ * @return {string} Absolute path of the token file.
+ */
+function cacheResetTokenPath() {
+	return (
+		process.env.WP_PERF_CACHE_RESET_TOKEN_FILE ||
+		join( __dirname, '..', '..', '.cache', 'performance-cache-reset-token' )
+	);
+}
+
+/**
+ * Provisions the secret that authorizes this run's cache resets.
+ *
+ * The mu-plugin has no reset endpoint until this file exists, so writing it is the
+ * explicit, deliberate enable step for the control plane, and `globalTeardown` deletes
+ * it again once the workers are done. Nothing is provisioned for an installation that
+ * merely has the mu-plugin present.
+ *
+ * Created exclusively, so that two processes reaching this at the same time cannot end
+ * up disagreeing about the secret: whoever loses the race reads the winner's file
+ * instead of overwriting it. The mode is deliberately world readable, because PHP-FPM
+ * runs as a different user than the test runner and has to read it; the file is outside
+ * the document root, so the value is reachable by a local process and by nothing over
+ * the network.
+ *
+ * The value itself is never returned to a caller that logs, never interpolated into a
+ * URL and never attached to a test result.
+ *
+ * @return {string} The secret for this run.
+ */
+function cacheResetToken() {
+	if ( cacheResetToken.token ) {
+		return cacheResetToken.token;
+	}
+
+	const path = cacheResetTokenPath();
+
+	const readProvisioned = () => {
+		const provisioned = readFileSync( path, 'utf8' ).trim();
+
+		if ( ! CACHE_RESET_TOKEN_PATTERN.test( provisioned ) ) {
+			throw new Error(
+				`The cache reset token at ${ path } does not match ${ CACHE_RESET_TOKEN_PATTERN }, so tests/performance/wp-content/mu-plugins/server-timing.php will refuse every reset and leave the caches warm. Delete the file and run the suite again.`
+			);
+		}
+
+		return provisioned;
+	};
+
+	if ( existsSync( path ) ) {
+		cacheResetToken.token = readProvisioned();
+
+		return cacheResetToken.token;
+	}
+
+	mkdirSync( dirname( path ), { recursive: true } );
+
+	try {
+		// 32 random bytes, hex encoded, so the value satisfies the grammar above.
+		const token = randomBytes( 32 ).toString( 'hex' );
+
+		writeFileSync( path, token, { encoding: 'utf8', flag: 'wx', mode: 0o644 } );
+
+		cacheResetToken.token = token;
+	} catch ( error ) {
+		if ( 'EEXIST' !== error.code ) {
+			throw error;
+		}
+
+		// Another process provisioned it first; its value is the one the server will accept.
+		cacheResetToken.token = readProvisioned();
+	}
+
+	return cacheResetToken.token;
+}
+
+/**
+ * Withdraws the secret, and with it the reset endpoint.
+ *
+ * Called from the global teardown so the control plane exists for exactly the duration
+ * of one measured run. The next run provisions a fresh secret, so no value outlives the
+ * run that created it.
+ *
+ * Only the file is removed. Its directory holds other build caches, so removing the
+ * directory could take something else with it.
+ *
+ * @return {void}
+ */
+function revokeCacheResetToken() {
+	delete cacheResetToken.token;
+
+	rmSync( cacheResetTokenPath(), { force: true } );
+}
 
 /**
  * Discards the caches the next measured navigation would otherwise be served from.
@@ -66,26 +199,45 @@ const CACHE_RESET_STATUS = 202;
  * the response let a missing mu-plugin publish warm samples under an uncached label,
  * so the status is asserted here, once, for every spec.
  *
- * @param {import('@playwright/test').Page} page Page to navigate.
+ * A POST through the request API rather than a navigation, because the reset is a
+ * state-changing operation that has to be unreachable from anything a browser will do
+ * on its own. The page is deliberately left where it is: the caller navigates to the
+ * URL it means to measure immediately afterwards, so a navigation here would only add a
+ * document nobody looks at.
+ *
+ * @param {import('@playwright/test').Page} page Page whose request context to use.
  * @return {Promise<void>} Resolves once the caches have been discarded.
  */
 async function clearServerCaches( page ) {
 	// Not actually loading a page: the response body is empty by design.
-	const response = await page.goto( '/?clear_cache' );
-
-	if ( null === response ) {
-		throw new Error(
-			'Requesting /?clear_cache produced no response, so the caches were not discarded and no measurement taken after it is uncached.'
-		);
-	}
+	const response = await page.request.post( '/?clear_cache', {
+		headers: { [ CACHE_RESET_TOKEN_HEADER ]: cacheResetToken() },
+	} );
 
 	const status = response.status();
 
-	if ( CACHE_RESET_STATUS !== status ) {
-		throw new Error(
-			`Requesting /?clear_cache answered ${ status } where ${ CACHE_RESET_STATUS } was required. The cache reset helper in tests/performance/wp-content/mu-plugins/ is not installed, so the opcode cache, object cache and transients were not discarded and every sample taken after this point would be warm.`
-		);
+	if ( CACHE_RESET_STATUS === status ) {
+		return;
 	}
+
+	/*
+	 * Each refusal has one cause, and the mu-plugin answers each with a status of its
+	 * own, so the reason is reported rather than guessed. The secret is never included
+	 * in any of these messages: the failures are all explained by which file exists and
+	 * which method was used, and a message that quoted the value would put it into the
+	 * run's log and its uploaded artifacts.
+	 */
+	const reasons = {
+		404: `no cache reset endpoint answered. Either tests/performance/wp-content/mu-plugins/server-timing.php is not installed in the WordPress tree under test, or it could not read the token at ${ cacheResetTokenPath() } — check that the path is beside the installation directory and readable by the web server user.`,
+		405: 'the cache reset endpoint refused the request method. It accepts POST only, so this helper must not navigate to the URL.',
+		403: `the cache reset endpoint refused the presented token. The value at ${ cacheResetTokenPath() } is not the one the server resolved; a WP_PERF_CACHE_RESET_TOKEN constant or environment variable takes precedence over the file and may be stale.`,
+	};
+
+	throw new Error(
+		`Requesting a cache reset answered ${ status } where ${ CACHE_RESET_STATUS } was required: ${
+			reasons[ status ] ?? 'the request was not answered by the cache reset endpoint.'
+		} The opcode cache, object cache and transients were therefore not discarded, and every sample taken after this point would be warm.`
+	);
 }
 
 /**
@@ -514,6 +666,11 @@ function accumulateValues( results ) {
 
 module.exports = {
 	CACHE_RESET_STATUS,
+	CACHE_RESET_TOKEN_HEADER,
+	CACHE_RESET_TOKEN_PATTERN,
+	cacheResetTokenPath,
+	cacheResetToken,
+	revokeCacheResetToken,
 	clearServerCaches,
 	invalidSeriesReason,
 	validateResults,

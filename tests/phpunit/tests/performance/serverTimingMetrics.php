@@ -332,6 +332,8 @@ class Tests_Performance_ServerTimingMetrics extends WP_UnitTestCase {
 
 		$expected = array(
 			'wp_perf_bootstrap_duration',
+			'wp_perf_cache_reset_status',
+			'wp_perf_cache_reset_token',
 			'wp_perf_object_cache_counters',
 			'wp_perf_opcache_directive',
 			'wp_perf_opcache_flag',
@@ -831,14 +833,194 @@ class Tests_Performance_ServerTimingMetrics extends WP_UnitTestCase {
 			$source,
 			'The reset must end the request rather than go on to render a page.'
 		);
+
+		/*
+		 * The query argument selects the endpoint and must authorize nothing. Reading it
+		 * for anything other than an isset() test would put the decision back on data an
+		 * attacker supplies in a URL.
+		 */
+		$this->assertSame(
+			1,
+			preg_match_all( "/\\\$_GET\\[\\s*'clear_cache'\\s*\\]/", $source ),
+			'The clear_cache query argument must be read exactly once, by the isset() test that selects the endpoint.'
+		);
+
+		$this->assertMatchesRegularExpression(
+			"/isset\(\s*\\\$_GET\[\s*'clear_cache'\s*\]\s*\)/",
+			$source,
+			'The clear_cache query argument must only ever be tested with isset(), never compared against a secret.'
+		);
+
+		$this->assertStringContainsString(
+			'\'POST\' !== strtoupper( $method )',
+			$source,
+			'The reset must accept POST only, so it cannot be reached by a navigation, a prefetch or an embedded resource.'
+		);
+
+		$this->assertStringContainsString(
+			'hash_equals( $token, $presented )',
+			$source,
+			'The presented secret must be compared with hash_equals(), so the comparison is not a timing oracle.'
+		);
+
+		$this->assertStringContainsString(
+			"\$_SERVER['HTTP_X_WP_PERF_CACHE_RESET_TOKEN']",
+			$source,
+			'The secret must be read from the X-WP-Perf-Cache-Reset-Token request header, which a cross-origin form cannot set.'
+		);
+
+		foreach ( array( 404, 405, 403 ) as $refusal ) {
+			$this->assertMatchesRegularExpression(
+				'/\breturn ' . $refusal . ';/',
+				$source,
+				"The control plane must fail closed with {$refusal} rather than fall through to the reset."
+			);
+		}
+	}
+
+	/**
+	 * Tests that the cache reset control plane does not exist until a secret is provisioned.
+	 *
+	 * The reset discards the opcode cache, the object cache and the expired transients for
+	 * the whole installation, so an installation that merely has this mu-plugin present must
+	 * have no reset endpoint at all: 404, disclosing nothing, not even which cache layers
+	 * the host runs. A provisioned but unusable secret has to fail the same way rather than
+	 * bring the endpoint up protected by something guessable, which is what the weak-token
+	 * fixture measures.
+	 */
+	public function test_the_cache_reset_control_plane_is_disabled_without_a_provisioned_secret() {
+		foreach ( array( 'cache-reset-disabled', 'cache-reset-weak-token' ) as $fixture ) {
+			$result = $this->probe( $fixture );
+
+			$this->assertFalse(
+				$result['cache_reset']['token_resolved'],
+				"The {$fixture} fixture must resolve no secret, so the endpoint does not exist."
+			);
+
+			$this->assertSame(
+				0,
+				$result['cache_reset']['token_length'],
+				"The {$fixture} fixture must report an empty secret rather than a short one."
+			);
+
+			$this->assertNotEmpty(
+				$result['cache_reset']['statuses'],
+				"The {$fixture} fixture must measure the request shapes rather than none of them."
+			);
+
+			foreach ( $result['cache_reset']['statuses'] as $shape => $status ) {
+				$this->assertSame(
+					404,
+					$status,
+					"With no secret provisioned, {$shape} must be answered 404: the endpoint does not exist."
+				);
+			}
+		}
+	}
+
+	/**
+	 * Tests that a provisioned reset is reachable only by a POST presenting the secret.
+	 *
+	 * Every refusal is measured, not inferred: the decision is a pure function of the method
+	 * and the presented secret, so each request shape is put to it directly. A GET carrying
+	 * the correct secret is included deliberately, because that is the shape a secret in the
+	 * URL would take, and it must still be refused.
+	 */
+	public function test_the_cache_reset_requires_an_authenticated_post() {
+		$result = $this->probe( 'cache-reset-enabled' );
+
+		$this->assertTrue(
+			$result['cache_reset']['token_resolved'],
+			'The enabled fixture must resolve the secret it provisions.'
+		);
+
+		$this->assertSame(
+			64,
+			$result['cache_reset']['token_length'],
+			'The enabled fixture must provision a secret of the shape the harness writes.'
+		);
+
+		$expected = array(
+			// Wrong method: refused whatever was presented, including the correct secret.
+			'get_without_token'                  => 405,
+			'get_with_correct_token'             => 405,
+			'head_with_correct_token'            => 405,
+			'put_with_correct_token'             => 405,
+			'delete_with_correct_token'          => 405,
+			'options_with_correct_token'         => 405,
+			'empty_method_with_correct_token'    => 405,
+			'nonstring_method'                   => 405,
+			// Right method, unacceptable secret.
+			'post_without_token'                 => 403,
+			'post_with_wrong_token'              => 403,
+			'post_with_truncated_token'          => 403,
+			'post_with_extended_token'           => 403,
+			'post_with_case_changed_token'       => 403,
+			'post_with_padded_token'             => 403,
+			'post_with_nonstring_token'          => 403,
+			'post_with_null_token'               => 403,
+			// The only shape that resets anything.
+			'post_with_correct_token'            => 202,
+			'lowercased_post_with_correct_token' => 202,
+		);
+
+		$this->assertSame(
+			$expected,
+			$result['cache_reset']['statuses'],
+			'A provisioned reset must answer exactly these statuses, in this order, for these request shapes.'
+		);
+
+		$this->assertSame(
+			405,
+			$result['cache_reset']['statuses']['get_with_correct_token'],
+			'A GET must be refused even when it presents the correct secret, so a secret placed in a URL cannot authorize a reset.'
+		);
+
+		$this->assertSame(
+			403,
+			$result['cache_reset']['statuses']['post_without_token'],
+			'An unauthenticated POST must be refused.'
+		);
+
+		$this->assertSame(
+			403,
+			$result['cache_reset']['statuses']['post_with_wrong_token'],
+			'A POST presenting the wrong secret must be refused.'
+		);
+
+		$this->assertSame(
+			202,
+			$result['cache_reset']['statuses']['post_with_correct_token'],
+			'A POST presenting the provisioned secret is the one shape that must be accepted.'
+		);
+
+		$this->assertSame(
+			array(),
+			$result['diagnostics'],
+			'Deciding any of these request shapes must raise no diagnostic, whatever was presented.'
+		);
+
+		$this->assertSame(
+			0,
+			$result['output_length'],
+			'Deciding a request shape must print nothing.'
+		);
 	}
 
 	/**
 	 * Tests that the reset is registered on the same boundary as the pre-existing helper.
 	 *
-	 * Both mu-plugins may be installed at once. Must-use plugins load in filename order, so
-	 * clear-cache.php registers first and exits first, and this callback never runs. That is
-	 * only true while the two share a hook and a priority, so the pairing is pinned here.
+	 * Must-use plugins load in filename order, so clear-cache.php registers first and would
+	 * exit first. That ordering is unchanged, and it is only meaningful while the two share a
+	 * hook and a priority, so the pairing is pinned here.
+	 *
+	 * What is no longer shared is the authorization. clear-cache.php runs the same reset for
+	 * any request carrying the query argument, so an installation holding both files would
+	 * let it answer first and reinstate the unauthenticated reset that server-timing.php
+	 * refuses. Only server-timing.php may be provisioned, which is what both performance
+	 * workflows already do: each copies that one file into the installed tree. The divergence
+	 * is asserted rather than described, so a future change that made the two behave alike
+	 * again has to be a deliberate one.
 	 */
 	public function test_the_cache_reset_matches_the_pre_existing_helper() {
 		$helper = file_get_contents( DIR_TESTROOT . '/../performance/wp-content/mu-plugins/clear-cache.php' );
@@ -855,6 +1037,41 @@ class Tests_Performance_ServerTimingMetrics extends WP_UnitTestCase {
 
 		$this->assertSame( 'plugins_loaded', $registration['hook'] );
 		$this->assertSame( 1, $registration['priority'] );
+
+		$this->assertStringNotContainsString(
+			'hash_equals',
+			$helper,
+			'The pre-existing helper authorizes nothing, which is why it must not be provisioned beside server-timing.php.'
+		);
+
+		$this->assertStringContainsString(
+			'hash_equals',
+			$this->mu_plugin_source(),
+			'server-timing.php is the file that authorizes the reset, and it is the only one the workflows install.'
+		);
+
+		foreach (
+			array(
+				'.github/workflows/reusable-performance.yml',
+				'.github/workflows/reusable-performance-test-v2.yml',
+			) as $workflow
+		) {
+			$provisioning = file_get_contents( DIR_TESTROOT . '/../../' . $workflow );
+
+			$this->assertIsString( $provisioning, "The {$workflow} workflow must be readable." );
+
+			$this->assertStringContainsString(
+				'cp ./tests/performance/wp-content/mu-plugins/server-timing.php',
+				$provisioning,
+				"The {$workflow} workflow must provision server-timing.php."
+			);
+
+			$this->assertStringNotContainsString(
+				'clear-cache.php',
+				$provisioning,
+				"The {$workflow} workflow must not provision clear-cache.php, which would reset the caches for any request."
+			);
+		}
 	}
 
 	/**
@@ -934,7 +1151,17 @@ class Tests_Performance_ServerTimingMetrics extends WP_UnitTestCase {
 
 		$this->assertFalse(
 			function_exists( 'wp_perf_reset_caches' ),
-			'The performance mu-plugin must not be loaded by the test suite: its output buffering makes other tests unreliable, and its cache reset would answer any request carrying a clear_cache query argument.'
+			'The performance mu-plugin must not be loaded by the test suite: its output buffering makes other tests unreliable, and its cache reset would answer any authorized request carrying a clear_cache query argument.'
+		);
+
+		$this->assertFalse(
+			function_exists( 'wp_perf_cache_reset_token' ),
+			'The performance mu-plugin must not be loaded by the test suite: its output buffering makes other tests unreliable, and its cache reset control plane belongs to the performance harness alone.'
+		);
+
+		$this->assertFalse(
+			function_exists( 'wp_perf_cache_reset_status' ),
+			'The performance mu-plugin must not be loaded by the test suite: its output buffering makes other tests unreliable, and its cache reset control plane belongs to the performance harness alone.'
 		);
 
 		$this->assertFalse(
@@ -952,7 +1179,13 @@ class Tests_Performance_ServerTimingMetrics extends WP_UnitTestCase {
 	public function test_every_probe_fixture_is_measured() {
 		$offered = $this->probe( 'list' );
 
-		$measured = array( 'bootstrap-duration', 'measurement-metadata' );
+		$measured = array(
+			'bootstrap-duration',
+			'measurement-metadata',
+			'cache-reset-disabled',
+			'cache-reset-weak-token',
+			'cache-reset-enabled',
+		);
 
 		foreach ( $this->data_object_cache_fixtures() as $arguments ) {
 			$measured[] = $arguments[0];

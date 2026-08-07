@@ -1,6 +1,152 @@
 <?php
 
 /**
+ * Resolves the secret that authorizes a cache reset, or reports that there is none.
+ *
+ * The reset is an expensive, unauthenticated-by-nature side effect: it discards the
+ * opcode cache, the object cache and the expired transient rows for the whole
+ * installation. Presence of a query argument is therefore not authorization, and this
+ * function is what the control plane below has instead. It reports the empty string
+ * whenever no usable secret has been provisioned, and the caller treats that as the
+ * endpoint not existing at all.
+ *
+ * Provisioning the secret is the explicit enable step, and it is the only one: the
+ * performance harness writes a fresh random token before its first measured iteration
+ * (`tests/performance/utils.js`) and its global teardown deletes the file again
+ * (`tests/performance/config/global-teardown.js`), so the control plane exists for
+ * exactly the duration of one measured run and nowhere else. An installation that
+ * merely has this mu-plugin present has no reset endpoint.
+ *
+ * Three sources are consulted, in this order, so that a deployment can choose whichever
+ * it can reach:
+ *
+ * 1. The `WP_PERF_CACHE_RESET_TOKEN` constant, for a `wp-config.php` deployment.
+ * 2. The `WP_PERF_CACHE_RESET_TOKEN` environment variable, for a container deployment.
+ * 3. A token file, which is what the harness itself uses. Its path comes from the
+ *    `WP_PERF_CACHE_RESET_TOKEN_FILE` constant or environment variable, and otherwise
+ *    defaults to `.cache/performance-cache-reset-token` beside the installation
+ *    directory rather than inside it, so the secret is never itself web readable.
+ *
+ * Every candidate must be at least 32 alphanumeric characters. That is a grammar check
+ * rather than a strength check, but it is enough to make the failure closed instead of
+ * open: a truncated file, an empty variable, a placeholder or a short hand-written
+ * value all resolve to no token, which disables the reset rather than protecting it
+ * with something guessable.
+ *
+ * Deliberately implemented with language functions only. It is called by
+ * `tests/phpunit/data/isolated/server-timing-probe.php` in a process where WordPress
+ * has never been loaded, which is what allows the whole decision to be unit tested.
+ *
+ * @ignore
+ * @since 7.0.0
+ * @access private
+ *
+ * @return string Token that authorizes a reset, or '' when resets are disabled.
+ */
+function wp_perf_cache_reset_token() {
+	static $token = null;
+
+	if ( null !== $token ) {
+		return $token;
+	}
+
+	$token = '';
+
+	$candidates = array();
+
+	if ( defined( 'WP_PERF_CACHE_RESET_TOKEN' ) ) {
+		$candidates[] = WP_PERF_CACHE_RESET_TOKEN;
+	}
+
+	$candidates[] = getenv( 'WP_PERF_CACHE_RESET_TOKEN' );
+
+	$file = null;
+
+	if ( defined( 'WP_PERF_CACHE_RESET_TOKEN_FILE' ) ) {
+		$file = WP_PERF_CACHE_RESET_TOKEN_FILE;
+	} else {
+		$configured = getenv( 'WP_PERF_CACHE_RESET_TOKEN_FILE' );
+
+		if ( is_string( $configured ) && '' !== $configured ) {
+			$file = $configured;
+		} elseif ( defined( 'ABSPATH' ) ) {
+			/*
+			 * Beside the installation directory, never inside it. ABSPATH is the document
+			 * root the web server serves, so a token kept under it would be fetchable over
+			 * HTTP by the very requests this token exists to keep out.
+			 */
+			$file = dirname( rtrim( ABSPATH, '/\\' ) ) . '/.cache/performance-cache-reset-token';
+		}
+	}
+
+	if ( is_string( $file ) && '' !== $file && is_readable( $file ) ) {
+		$contents = file_get_contents( $file );
+
+		if ( is_string( $contents ) ) {
+			$candidates[] = trim( $contents );
+		}
+	}
+
+	foreach ( $candidates as $candidate ) {
+		if ( is_string( $candidate ) && preg_match( '/^[A-Za-z0-9]{32,128}$/', $candidate ) ) {
+			$token = $candidate;
+			break;
+		}
+	}
+
+	return $token;
+}
+
+/**
+ * Decides what the cache reset control plane answers one reset request with.
+ *
+ * Separated from the request so that the decision is a pure function of the two things
+ * that may authorize a reset, which is what lets every branch be measured directly by
+ * `tests/phpunit/data/isolated/server-timing-probe.php` rather than inferred from a
+ * live response. It never resets anything itself.
+ *
+ * The ladder fails closed at each step, and each step answers with the status that
+ * describes only that step:
+ *
+ * - 404 when no token has been provisioned. The endpoint does not exist, and nothing
+ *   about the installation is disclosed, including which cache layers it runs.
+ * - 405 for any method other than POST. A reset changes server state, so it may not be
+ *   reachable by navigation, prefetch, image load or link preview.
+ * - 403 when the presented secret is absent or does not match, compared with
+ *   `hash_equals()` so the comparison is not a timing oracle.
+ * - 202 only when a POST presented the provisioned token.
+ *
+ * The token is read from a request header by the caller below, never from the URL, so
+ * it cannot be sent by a cross-origin form, an `img` tag or a navigation, and it does
+ * not reach the access log, the referrer or the browser history.
+ *
+ * @ignore
+ * @since 7.0.0
+ * @access private
+ *
+ * @param string $method    Request method, as reported by the server.
+ * @param string $presented Secret presented in the request header, or '' when absent.
+ * @return int HTTP status the request must be answered with: 404, 405, 403 or 202.
+ */
+function wp_perf_cache_reset_status( $method, $presented ) {
+	$token = wp_perf_cache_reset_token();
+
+	if ( '' === $token ) {
+		return 404;
+	}
+
+	if ( ! is_string( $method ) || 'POST' !== strtoupper( $method ) ) {
+		return 405;
+	}
+
+	if ( ! is_string( $presented ) || '' === $presented || ! hash_equals( $token, $presented ) ) {
+		return 403;
+	}
+
+	return 202;
+}
+
+/**
  * Discards every cache the next measured request would otherwise be served from.
  *
  * The measurement contract for this harness is that each sample is taken in the
@@ -15,11 +161,16 @@
  *
  * Answering the same request here puts the reset in the one file the workflow
  * installs, so the regime is a property of the harness rather than of how the
- * harness happened to be provisioned. Both mu-plugins may be installed together:
- * must-use plugins load in filename order, so `clear-cache.php` registers first,
- * runs first and exits, and this callback simply never runs. Either file alone
- * produces the identical outcome, which is what lets the specs require a 202 and
- * fail when neither is present.
+ * harness happened to be provisioned.
+ *
+ * Reached only from the control plane below, and only for a POST that presented the
+ * provisioned token. That is a deliberate divergence from `clear-cache.php`, which runs
+ * the same operations for any request carrying the query argument: the two files no
+ * longer behave identically, and only this one may be provisioned. Must-use plugins
+ * load in filename order, so an installation holding both would let `clear-cache.php`
+ * answer first and exit, reinstating an unauthenticated reset that this file refuses;
+ * the harness therefore installs this file alone, exactly as both performance workflows
+ * already do.
  *
  * @ignore
  * @since 7.0.0
@@ -53,28 +204,75 @@ function wp_perf_reset_caches() {
 
 	/*
 	 * Reported so a spec can assert on what was actually discarded rather than only
-	 * on the status code. The header carries a fixed vocabulary of operation names
-	 * and no request data.
+	 * on the status code. The header carries a fixed vocabulary of operation names,
+	 * no request data and no part of the token. It is sent on the authorized 202
+	 * only: an unauthenticated caller receives a bare 404, 405 or 403 and therefore
+	 * cannot use this vocabulary to learn which cache layers the host runs.
 	 */
 	header( 'X-WP-Perf-Cache-Reset: ' . implode( ',', $reset ) );
 
 	/*
 	 * 202 rather than 200, because nothing was rendered and the only thing the
 	 * caller may conclude is that the reset was accepted. No status WordPress
-	 * itself sends for this URL collides with it, so a spec that requires 202 fails
-	 * whenever the reset helper is absent instead of measuring a warm request.
+	 * itself sends for this URL collides with it, and neither does any status the
+	 * control plane refuses with, so a spec that requires 202 fails whenever the
+	 * reset helper is absent or its token was never provisioned instead of going on
+	 * to measure a warm request.
 	 */
 	status_header( 202 );
 
 	die;
 }
 
+/*
+ * The cache reset control plane.
+ *
+ * Registered at 'plugins_loaded' priority 1, early enough that nothing the request
+ * would otherwise be served from has been read yet, and matching the priority the
+ * pre-existing clear-cache.php uses so that the load order of the two files is
+ * unchanged.
+ *
+ * The `clear_cache` query argument selects the endpoint and authorizes nothing. It is
+ * not a secret and is deliberately left where it has always been, so the URL the
+ * workflows and the specs use does not change. Authorization is the token in the
+ * X-WP-Perf-Cache-Reset-Token request header, which arrives as
+ * $_SERVER['HTTP_X_WP_PERF_CACHE_RESET_TOKEN']: a header cannot be set by a
+ * cross-origin form, a navigation or an embedded resource, so no reset can be provoked
+ * by tricking a browser, and the secret never reaches a URL, an access log, a referrer
+ * or the browser history. Neither superglobal is trusted beyond an isset() test before
+ * it has been unslashed and sanitized.
+ */
 add_action(
 	'plugins_loaded',
 	static function () {
-		if ( isset( $_GET['clear_cache'] ) ) {
+		if ( ! isset( $_GET['clear_cache'] ) ) {
+			return;
+		}
+
+		// sanitize_key() also lower-cases; wp_perf_cache_reset_status() compares case-insensitively.
+		$method = isset( $_SERVER['REQUEST_METHOD'] )
+			? sanitize_key( wp_unslash( $_SERVER['REQUEST_METHOD'] ) )
+			: '';
+
+		$presented = isset( $_SERVER['HTTP_X_WP_PERF_CACHE_RESET_TOKEN'] )
+			? sanitize_text_field( wp_unslash( $_SERVER['HTTP_X_WP_PERF_CACHE_RESET_TOKEN'] ) )
+			: '';
+
+		$status = wp_perf_cache_reset_status( $method, $presented );
+
+		if ( 202 === $status ) {
+			// Sends the 202 and the reset vocabulary header itself, then ends the request.
 			wp_perf_reset_caches();
 		}
+
+		/*
+		 * Refused. Only the status is reported: no body, no reset vocabulary header, no
+		 * echo of what was presented and no hint about which step refused beyond the
+		 * status code itself.
+		 */
+		status_header( $status );
+
+		die;
 	},
 	1
 );
