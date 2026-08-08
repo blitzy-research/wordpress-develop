@@ -33,9 +33,9 @@
  * value all resolve to no token, which disables the reset rather than protecting it
  * with something guessable.
  *
- * Deliberately implemented with language functions only. It is called by
- * `tests/phpunit/data/isolated/server-timing-probe.php` in a process where WordPress
- * has never been loaded, which is what allows the whole decision to be unit tested.
+ * Deliberately implemented with language functions only, so that the whole decision can
+ * be reached, and checked, in a process where WordPress has never been loaded and no part
+ * of it can influence the answer.
  *
  * @ignore
  * @since 7.0.0
@@ -101,9 +101,9 @@ function wp_perf_cache_reset_token() {
  * Decides what the cache reset control plane answers one reset request with.
  *
  * Separated from the request so that the decision is a pure function of the two things
- * that may authorize a reset, which is what lets every branch be measured directly by
- * `tests/phpunit/data/isolated/server-timing-probe.php` rather than inferred from a
- * live response. It never resets anything itself.
+ * that may authorize a reset, which is what lets every branch be reached directly rather
+ * than inferred from a live response, over the whole request matrix rather than one shape
+ * at a time. It never resets anything itself.
  *
  * The ladder fails closed at each step, and each step answers with the status that
  * describes only that step:

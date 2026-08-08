@@ -2118,10 +2118,14 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 			'WP_Object_Cache must stay out of the class map, because an object-cache.php drop-in declares it.'
 		);
 
-		$report = $this->run_isolated_probe(
-			DIR_TESTDATA . '/isolated/object-cache-dropin-probe.php',
-			array( ABSPATH, DIR_TESTDATA . '/isolated/object-cache-dropin.php' )
-		);
+		$probe   = $this->write_scratch_probe( 'object-cache-dropin-probe', self::get_object_cache_dropin_probe_source() );
+		$drop_in = $this->write_scratch_probe( 'object-cache-dropin', self::get_object_cache_dropin_source() );
+
+		try {
+			$report = $this->run_isolated_probe( $probe, array( ABSPATH, $drop_in ) );
+		} finally {
+			unlink( $probe );
+		}
 
 		$this->assertFalse(
 			$report['core_claimed'],
@@ -2140,10 +2144,12 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 		);
 
 		$this->assertSame(
-			realpath( DIR_TESTDATA . '/isolated/object-cache-dropin.php' ),
+			realpath( $drop_in ),
 			realpath( (string) $report['declaration_file'] ),
 			'WP_Object_Cache must be declared by the drop-in file.'
 		);
+
+		unlink( $drop_in );
 	}
 
 	/**
@@ -2203,12 +2209,16 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 			'The vanished fixture must not exist, or the branch it measures is not reached.'
 		);
 
+		$probe = $this->write_scratch_probe( 'containment-probe', self::get_containment_probe_source() );
+
 		try {
 			$report = $this->run_isolated_probe(
-				DIR_TESTDATA . '/isolated/autoload-containment-probe.php',
+				$probe,
 				array( $root, ABSPATH . WPINC . '/autoload.php' )
 			);
 		} finally {
+			unlink( $probe );
+
 			foreach ( array_keys( $files ) as $relative ) {
 				if ( file_exists( $root . $relative ) ) {
 					unlink( $root . $relative );
@@ -2230,11 +2240,11 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 	}
 
 	/**
-	 * Runs one committed isolated probe and returns its decoded report.
+	 * Runs one isolated probe and returns its decoded report.
 	 *
-	 * Every probe under tests/phpunit/data/isolated writes one JSON object to standard output
-	 * and nothing else, so all three streams are checked rather than only the payload: a notice
-	 * on standard error or a nonzero exit status is a failure of the thing being probed even
+	 * Every probe this class spawns writes one JSON object to standard output and nothing
+	 * else, so all three streams are checked rather than only the payload: a notice on
+	 * standard error or a nonzero exit status is a failure of the thing being probed even
 	 * when the payload arrives intact. The interpreter flags make that check meaningful by
 	 * turning every diagnostic on and routing it to standard error rather than into the report.
 	 *
@@ -2293,6 +2303,223 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 		);
 
 		return $report;
+	}
+
+	/**
+	 * Writes one scratch file for an isolated probe and returns its path.
+	 *
+	 * The probe sources this class spawns are held in the class rather than in committed
+	 * fixture files. Two reasons, and both of them are properties of what the probes are
+	 * for. A probe has exactly one caller, so a committed file would separate the source
+	 * from the only assertions that give it meaning; and two of these probes deliberately
+	 * declare `WP_Object_Cache` and a class whose parent does not exist, neither of which
+	 * can sit in the tree without the "every mapped entry is readable and bindable" tests
+	 * above having to be taught to ignore them.
+	 *
+	 * The name is derived from the class and ABSPATH so that two suites running against
+	 * two trees on one machine cannot collide, and the caller removes the file again.
+	 *
+	 * @param string $slug   Slug identifying the probe, used in the file name.
+	 * @param string $source Complete PHP source of the probe.
+	 * @return string Absolute path of the scratch file.
+	 */
+	private function write_scratch_probe( $slug, $source ) {
+		$path = get_temp_dir() . 'wp-autoload-' . $slug . '-' . md5( __CLASS__ . ABSPATH ) . '.php';
+
+		$this->assertNotFalse(
+			file_put_contents( $path, $source ),
+			"The {$slug} probe must be writable to the temporary directory."
+		);
+
+		return $path;
+	}
+
+	/**
+	 * Returns the source of the object cache drop-in probe.
+	 *
+	 * Asks for `WP_Object_Cache` before anything has declared it, then loads a replacement
+	 * and reports which implementation ended up owning the symbol. Running it in its own
+	 * process is what makes the answer meaningful, because the suite's own process has the
+	 * core class declared already.
+	 *
+	 * @return string The probe source.
+	 */
+	private static function get_object_cache_dropin_probe_source() {
+		return <<<'PROBE'
+<?php
+if ( ! isset( $argv[1], $argv[2] ) ) {
+	fwrite( STDERR, "Usage: php object-cache-dropin-probe.php <abspath> <drop-in>\n" );
+	exit( 1 );
+}
+
+define( 'ABSPATH', $argv[1] );
+define( 'WPINC', 'wp-includes' );
+
+require_once ABSPATH . WPINC . '/autoload.php';
+
+$files_before = get_included_files();
+$core_claimed = class_exists( 'WP_Object_Cache' );
+
+if ( ! $core_claimed ) {
+	require $argv[2];
+	wp_cache_init();
+}
+
+$reflection = class_exists( 'WP_Object_Cache', false ) ? new ReflectionClass( 'WP_Object_Cache' ) : null;
+
+echo json_encode(
+	array(
+		'core_claimed'         => $core_claimed,
+		'replacement_declared' => isset( $GLOBALS['wp_object_cache'] ) && $GLOBALS['wp_object_cache'] instanceof WP_Object_Cache,
+		'implementation'       => isset( $GLOBALS['wp_object_cache']->implementation ) ? $GLOBALS['wp_object_cache']->implementation : null,
+		'declaration_file'     => $reflection ? $reflection->getFileName() : null,
+		'new_files'            => array_values( array_diff( get_included_files(), $files_before ) ),
+	)
+);
+PROBE;
+	}
+
+	/**
+	 * Returns the source of the replacement object cache the drop-in probe loads.
+	 *
+	 * Stands in for a `wp-content/object-cache.php` drop-in: it declares `WP_Object_Cache`
+	 * itself and marks the declaration, so the probe can report which file owns the symbol.
+	 *
+	 * @return string The drop-in source.
+	 */
+	private static function get_object_cache_dropin_source() {
+		return <<<'DROPIN'
+<?php
+/**
+ * Replacement cache implementation.
+ */
+class WP_Object_Cache {
+
+	/**
+	 * Identifies which implementation owns the symbol.
+	 *
+	 * @var string
+	 */
+	public $implementation = 'drop-in';
+}
+
+/**
+ * Initializes the replacement cache.
+ */
+function wp_cache_init() {
+	$GLOBALS['wp_object_cache'] = new WP_Object_Cache();
+}
+DROPIN;
+	}
+
+	/**
+	 * Returns the source of the autoloader containment probe.
+	 *
+	 * `wp-includes/autoload.php` wraps its `require_once` in `catch ( Error )` so that a
+	 * request can never end inside an autoloader. Reaching that branch needs a mapped file
+	 * whose class cannot be bound -- one whose parent is undeclared and undeclarable -- and
+	 * the shipped class map deliberately contains no such entry, because the generator
+	 * refuses to emit one. So the branch cannot be reached against the real tree at all, and
+	 * a suite that only measures the real tree leaves it untested: the `catch` can be
+	 * deleted, or turned into a rethrow, and every assertion still passes.
+	 *
+	 * This probe reaches it. The caller supplies a synthetic root, containing its own class
+	 * map and the files that map names to, and the path of the real autoloader. ABSPATH
+	 * points at the synthetic root, so every path the autoloader resolves comes from there,
+	 * while the code doing the resolving is the shipped file itself rather than a copy of it.
+	 *
+	 * A second autoloader is registered after the core one, and records every name it is
+	 * asked for. That record is what makes the containment observable as more than "no
+	 * crash": SPL calls registered autoloaders in order until the name is declared, so a
+	 * name the core handler declined must still reach the handler behind it. An autoloader
+	 * that swallowed the error and also swallowed the turn would look identical from the
+	 * outside without it.
+	 *
+	 * @return string The probe source.
+	 */
+	private static function get_containment_probe_source() {
+		return <<<'PROBE'
+<?php
+if ( ! isset( $argv[1], $argv[2] ) ) {
+	fwrite( STDERR, "Usage: php autoload-containment-probe.php <abspath> <autoloader>\n" );
+	exit( 1 );
+}
+
+define( 'ABSPATH', $argv[1] );
+define( 'WPINC', 'wp-includes' );
+
+require $argv[2];
+
+/*
+ * Registered second on purpose. Every name the core handler declines has to arrive here, and
+ * the one name this handler can declare has to end up declared, or the chain has been broken
+ * rather than continued.
+ */
+$wp_autoload_probe_chain = array();
+
+spl_autoload_register(
+	static function ( $name ) use ( &$wp_autoload_probe_chain ) {
+		$wp_autoload_probe_chain[] = $name;
+
+		if ( 'WP_Autoload_Probe_Later' === $name ) {
+			require ABSPATH . 'later/class-wp-autoload-probe-later.php';
+		}
+	}
+);
+
+$wp_autoload_probe_mapped = ABSPATH . 'wp-includes/class-wp-autoload-probe-throwing.php';
+
+$wp_autoload_probe_report = array();
+
+$wp_autoload_probe_report['handlers'] = array_map(
+	static function ( $handler ) {
+		return is_string( $handler ) ? $handler : gettype( $handler );
+	},
+	(array) spl_autoload_functions()
+);
+
+/*
+ * Resolved through the SPL stack rather than by calling the handler directly, because it is
+ * the stack that has to survive: a reference in production reaches the handler this way.
+ */
+$wp_autoload_probe_report['throwing_first'] = class_exists( 'WP_Autoload_Probe_Throwing' );
+
+/*
+ * `require_once` records a file as included before it runs it, so a file that was reached and
+ * failed to bind is included while its class is not declared. That pair is what distinguishes
+ * the contained error from the file never having been reached at all, which is the outcome
+ * every other decline in the autoloader produces.
+ */
+$wp_autoload_probe_report['file_included'] = in_array( $wp_autoload_probe_mapped, get_included_files(), true );
+
+/*
+ * Asked a second time because `class_exists()` falling through to `interface_exists()` asks
+ * again for the same name, and `require_once` is what keeps that second pass a decline rather
+ * than a fatal redeclaration.
+ */
+$wp_autoload_probe_report['throwing_second'] = class_exists( 'WP_Autoload_Probe_Throwing' );
+
+$wp_autoload_probe_report['chain'] = $wp_autoload_probe_chain;
+
+// Only the handler registered behind the core one can declare this, so it reports the chain.
+$wp_autoload_probe_report['later'] = class_exists( 'WP_Autoload_Probe_Later' );
+
+// Mapped and bindable, so it reports that the core handler still works after containing an error.
+$wp_autoload_probe_report['healthy'] = class_exists( 'WP_Autoload_Probe_Healthy' );
+
+// Mapped to a file that is not there, which is a decline the file is never reached by.
+$wp_autoload_probe_report['vanished']          = class_exists( 'WP_Autoload_Probe_Vanished' );
+$wp_autoload_probe_report['vanished_included'] = in_array(
+	ABSPATH . 'wp-includes/class-wp-autoload-probe-vanished.php',
+	get_included_files(),
+	true
+);
+
+// Emitted last, so its presence reports a process that reached the end.
+$wp_autoload_probe_report['survived'] = true;
+
+echo json_encode( $wp_autoload_probe_report );
+PROBE;
 	}
 
 	/**
