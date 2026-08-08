@@ -321,8 +321,8 @@ the bootstrap grew to require everything anything might need.
 with `strtr()` (not `strtolower()`, which only became locale-independent in PHP 8.2 and would fold `I`
 outside ASCII under `tr_TR` on the 7.4 floor), strips exactly one leading namespace separator, prefilters
 on the core name prefixes, and resolves through a static map with no path derivation of any kind.
-`src/wp-includes/autoload-classmap.php` — the generated map: **143 entries, 13,195 bytes, sha256
-`8ba69d6920c1ad75ab319029fc8da50761aceae2fed34c72c249d6d47e5c5c98`**. `src/wp-settings.php` registers the
+`src/wp-includes/autoload-classmap.php` — the generated map: **143 entries, 13,196 bytes, sha256
+`d251ceb70bace3b73500e5d4616e2c4e1dcb493e7416bb626a3dcecba483391b`**. `src/wp-settings.php` registers the
 handler before its require region and now holds **216** include-family constructs, **107 fewer than base**
 (108 requires removed, 1 added for the autoloader itself).
 
@@ -492,7 +492,7 @@ in a diff.
 **Change**: `src/wp-includes/formatting.php` — the function hooked as `print_emoji_detection_script`
 consults a new filterable predicate before delegating to its private worker, and `_wp_emoji_list()` loads
 its data from a new file on demand. `src/wp-includes/emoji-arrays.php` — the relocated arrays as a
-`return`ed array, 142,440 bytes, carrying the same `// START: emoji arrays` / `// END: emoji arrays` marker
+`return`ed array, 142,289 bytes, carrying the same `// START: emoji arrays` / `// END: emoji arrays` marker
 contract the build depends on. `Gruntfile.js` — `replace:emoji-regex` is retargeted at the new file, and
 `verify:emoji-markers` refuses a data file with no marker region or with two, so the generator can never
 silently write nothing. These two edits are atomic with each other: relocating the arrays without
@@ -799,7 +799,7 @@ this change set removes 61 tests and adds none, and every removal was mandated r
 
 | Check                                                 | Result                                                                                                        |
 | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| `grunt build:autoload-classmap` on the delivered tree | reproduces the committed map **byte for byte** — 143 entries, 13,195 bytes, `sha256 8ba69d69…5c98`            |
+| `grunt build:autoload-classmap` on the delivered tree | reproduces the committed map **byte for byte** — 143 entries, 13,196 bytes, `sha256 d251ceb7…391b`            |
 | `grunt verify:build-guards`                           | **15 tests, 15 pass, 0 fail**                                                                                 |
 | `grunt verify:emoji-markers`                          | one marker region found, as required                                                                          |
 | `npm run build` then `npm run build:dev`              | both exit 0; afterwards the only modified tracked files are this change set's own — no generated file drifted |
@@ -1035,8 +1035,8 @@ measurement rather than from a hypothesis.
 | Path                                                          | Change                                                                                                                                                                                                                                                                                                                                                                                        |
 | ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `src/wp-includes/autoload.php`                                | **new** — the `spl_autoload_register()` handler: prefix prefilter, ASCII case fold, one leading-separator strip, static-map lookup, canonical-path guard, one `require_once`, silent miss                                                                                                                                                                                                     |
-| `src/wp-includes/autoload-classmap.php`                       | **new, generated** — 143 entries, 13,195 bytes, `sha256 8ba69d69…5c98`, reproduced byte for byte by `grunt build:autoload-classmap`                                                                                                                                                                                                                                                           |
-| `src/wp-includes/emoji-arrays.php`                            | **new, generated** — the relocated emoji arrays, 142,440 bytes, marker region intact                                                                                                                                                                                                                                                                                                          |
+| `src/wp-includes/autoload-classmap.php`                       | **new, generated** — 143 entries, 13,196 bytes, `sha256 d251ceb7…391b`, reproduced byte for byte by `grunt build:autoload-classmap`                                                                                                                                                                                                                                                           |
+| `src/wp-includes/emoji-arrays.php`                            | **new, generated** — the relocated emoji arrays, 142,289 bytes, marker region intact                                                                                                                                                                                                                                                                                                          |
 | `src/wp-settings.php`                                         | registers the autoloader; 216 include-family constructs, 107 fewer than base                                                                                                                                                                                                                                                                                                                  |
 | `src/wp-includes/script-loader.php`                           | adds `wp_should_load_command_palette_assets()` and consults it in `wp_enqueue_command_palette_assets()`                                                                                                                                                                                                                                                                                       |
 | `src/wp-includes/formatting.php`                              | gates the emoji detection script behind a filterable predicate; `_wp_emoji_list()` loads the relocated arrays on demand                                                                                                                                                                                                                                                                       |

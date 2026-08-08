@@ -44,45 +44,29 @@ require ABSPATH . WPINC . '/load.php';
  * read on the first autoload attempt for a name that could belong to core.
  *
  * Being covered by the class map is not on its own a reason to stop requiring a
- * file here. A name the request goes on to reference is loaded either way, and
- * reaching it through the autoloader costs a normalization, a map lookup and a
- * stat that the direct require does not, for no file saved. So a require is only
- * dropped where the name is not referenced at all on the request path this
- * bootstrap is measured on, and it is kept in every one of these cases:
+ * file here. A require below is dropped only where profiling showed the name is
+ * not referenced on the request path this bootstrap is measured on, and it is
+ * kept where any of these hold:
  *
- * - The name is referenced on a measured front-end request anyway, so deferring
- *   it would add autoload work without keeping the file out of that request.
- * - It declares functions, which an autoloader is never asked to resolve.
+ * - The name is referenced on the measured request anyway, so deferring it would
+ *   move the same work rather than remove it.
+ * - The file declares functions, which an autoloader is never asked to resolve.
  * - Including it has side effects, such as registering a block support or a
  *   second autoloader, that a reference to a class name would not trigger.
- * - The single name it declares is absent from the generated class map, because
- *   the generator rejected the file as ineligible.
- * - Code deliberately probes for the name with autoloading disabled, so the
- *   name has to be present before that probe runs.
+ * - The name it declares is absent from the generated class map, because the
+ *   generator rejected the file as ineligible.
+ * - Code probes for the name with autoloading disabled, so the name has to be
+ *   present before that probe runs.
  *
- * Two names are deferred even though a front-end request does resolve them,
- * because a mapped file has to be loadable on its own and these two are what
- * makes that true for others. Walker and WP_Widget are each the parent of
- * classes that stay mapped - four walkers and the twenty default widgets - so
- * requiring either one here would drop it from the class map and leave those
- * children unloadable in isolation. Making them eager instead would mean making
- * their children eager too, which costs a front-end request four files it never
- * uses in the walkers' case, and is not even available in the widgets' case
- * because default-widgets.php, not this file, is what requires them.
- *
- * What that leaves deferred is dominated by the REST API classes described
- * further down, alongside smaller groups a front-end request never names: the
- * site and network queries, the AJAX response, user requests and user queries,
- * oEmbed, the HTML processor's unsupported states, the non-default HTTP
- * transports, application passwords, the abilities and collaboration classes,
- * the sitemap stylesheet, the block editor context, the classic-to-block menu
- * converter and the plugin dependency resolver.
+ * A parent whose subclasses stay mapped is deferred even when the measured
+ * request does resolve it, because requiring it here would drop it from the map
+ * and leave those subclasses unloadable on their own.
  *
  * One conditional require is a deliberate exception: the WP_Site_Health branch
  * near the end of this file does name a mapped file, because the class lives
  * under wp-admin and the map is what keeps it reachable from here. That require
  * sits behind class_exists( 'WP_Site_Health' ), which autoloading answers first,
- * so it is reached only in a tree that carries no usable generated map.
+ * so it is a fallback for a tree that carries no usable generated map.
  */
 require ABSPATH . WPINC . '/autoload.php';
 
@@ -242,17 +226,11 @@ require ABSPATH . WPINC . '/class-wp-theme.php';
 require ABSPATH . WPINC . '/class-wp-theme-json-schema.php';
 require ABSPATH . WPINC . '/class-wp-theme-json-data.php';
 /*
- * WP_Theme_JSON is deliberately eager. It is 173,639 bytes, and every block theme
- * render resolves global styles through it, so deferring it does not stop it being
- * loaded - it only moves its compilation from here, where the request heap is
- * around 1.7 MB, to wp_head, where the resident heap is already around 7.2 MB. The
- * compiler's transient arena then stacks on top of the request's peak instead of
- * on top of its floor: measured on the canonical anonymous front end with a reset
- * opcode cache, deferring this file and the HTML API processor below raised
- * memory_get_peak_usage( false ) from 7,993,816 to 8,886,008 bytes (+11.2%) while
- * changing the loaded file count by nothing at all, because the render loads them
- * either way. Keeping the largest render path classes eager is therefore the
- * measured optimum for both metrics at once.
+ * WP_Theme_JSON is deliberately eager. Global styles resolve through it on the
+ * measured request, so deferring it would not stop it being loaded - it would only
+ * move its compilation from here to wp_head, where it lands on top of a larger
+ * resident heap rather than on top of the bootstrap's. Profiling showed that as a
+ * worse peak for no change in the loaded file count, so this class stays eager.
  */
 require ABSPATH . WPINC . '/class-wp-theme-json.php';
 require ABSPATH . WPINC . '/class-wp-theme-json-resolver.php';
@@ -320,15 +298,14 @@ require ABSPATH . WPINC . '/html-api/class-wp-html-text-replacement.php';
 require ABSPATH . WPINC . '/html-api/class-wp-html-decoder.php';
 require ABSPATH . WPINC . '/html-api/class-wp-html-tag-processor.php';
 /*
- * WP_HTML_Processor (215,460 bytes) is eager for the reason given above
- * WP_Theme_JSON: block rendering loads it on every front-end request, so it is only
- * ever deferred as far as wp_head, where its compilation lands on top of the
- * request's peak heap rather than its floor. Its parent WP_HTML_Tag_Processor
- * (167,558 bytes) is required on the line above for the same reason, and so that it,
- * and anything else that extends it, keeps resolving in a bootstrap that only
- * registers the autoloader. The rest of the HTML API - the stack classes and the
- * processor's own exception and state classes - stays deferred, because a request
- * that never parses markup never loads any of them.
+ * WP_HTML_Processor is eager for the reason given above WP_Theme_JSON: block
+ * rendering on the profiled block-theme front end loads it, so deferring it would
+ * only move its compilation to wp_head, on top of a larger resident heap. Its
+ * parent WP_HTML_Tag_Processor is required on the line above for the same reason,
+ * and so that it, and anything else that extends it, keeps resolving in a bootstrap
+ * that only registers the autoloader. The rest of the HTML API - the stack classes
+ * and the processor's own exception and state classes - stays deferred, because a
+ * request that never parses markup never loads any of them.
  */
 require ABSPATH . WPINC . '/html-api/class-wp-html-processor.php';
 require ABSPATH . WPINC . '/class-wp-http.php';
@@ -366,13 +343,15 @@ require ABSPATH . WPINC . '/collaboration.php';
 require ABSPATH . WPINC . '/rest-api.php';
 /*
  * The REST API infrastructure, controller, field and search handler classes are
- * resolved by the autoloader rather than required here. Nothing references them
- * before rest_get_server() runs: it constructs the server and then fires the
- * rest_api_init action, which is where create_initial_rest_routes() registers the
- * routes and instantiates their controllers. rest_get_server() is the only place
- * that action fires, so a request that never dispatches a REST route never
- * references any of these names. rest-api.php itself stays eager because it
- * declares the functions that default-filters.php registers by name.
+ * resolved by the autoloader rather than required here. Core's default bootstrap
+ * and request path do not reference them before rest_get_server() runs: it
+ * constructs the server and then fires the rest_api_init action, which is where
+ * create_initial_rest_routes() registers the routes and instantiates their
+ * controllers, and that action fires nowhere else. On a request that never
+ * dispatches a REST route, core therefore never asks for these names, and code
+ * that does ask for one gets it from the autoloader. rest-api.php itself stays
+ * eager because it declares the functions that default-filters.php registers by
+ * name.
  */
 require ABSPATH . WPINC . '/sitemaps.php';
 require ABSPATH . WPINC . '/sitemaps/class-wp-sitemaps.php';

@@ -35,14 +35,9 @@ const requiredServerTimingMetrics = [
  *
  * Every required Server-Timing metric is declared here, derived from the list above
  * so the two cannot drift, because being declared is what gets a metric reset
- * between buckets. A metric that only the ingestion loop creates keeps its samples
- * for the whole theme and locale matrix, and that accumulation has been measured
- * rather than assumed: in one admin run the de_DE bucket held twelve 'wpMemoryUsage'
- * samples for six iterations, the first three of each repetition byte-identical to
- * the en_US ones, and its reported median came out 4.0% below the locale's own
- * measurements. 'wpDbQueries' was one of the undeclared metrics, so the figure this
- * suite reports its database-query target from was a median mixed across every
- * theme and locale that had run before it.
+ * between buckets. A metric only the ingestion loop creates would keep its samples
+ * for the whole theme and locale matrix, and the median reported for a later bucket
+ * would then be taken over measurements from the buckets before it.
  *
  * The reset in `afterAll` reads these keys live rather than from a snapshot taken
  * here, so a metric that only starts arriving later is still reset and counted.
@@ -68,12 +63,11 @@ const results = {
  * registration loop below run forever and an astronomically large one runs long
  * enough to be indistinguishable from a hang, so collection never finishes and the
  * check never gets to report anything. An explicit ceiling makes that outcome
- * impossible while leaving ample headroom over the 20 runs
+ * impossible while leaving headroom over the run count
  * `tests/performance/playwright.config.js` defaults TEST_RUNS to.
  */
 const maxIterations = 1000;
 
-// Read once at module scope so test generation and validation use the same count.
 const iterations = Number( process.env.TEST_RUNS );
 
 /**
@@ -105,7 +99,6 @@ test.describe( 'Homepage', () => {
 	} );
 
 	if ( ! hasMeasurableIterations ) {
-		// Nothing measurable to register, and the check above already fails the run.
 		return;
 	}
 
@@ -136,17 +129,15 @@ test.describe( 'Homepage', () => {
 
 					try {
 						/*
-						 * Both checks run before the attachment, so the artifact can
-						 * only ever receive a snapshot that has been validated. A
-						 * duplicate of this hook - the defect this ordering exists to
-						 * catch - would run once the arrays have already been emptied
-						 * by the cleanup below and would fail here instead of
-						 * appending a zero-sample result object. Such an object is not
-						 * inert: compare-results.js rejects a run whose scenarios
-						 * disagree about how many samples they hold, so one extra
-						 * entry invalidates the comparison. Cardinality itself is
-						 * covered in specs/utils.test.js, which is the only end that
-						 * can see more than one attachment hook at a time.
+						 * The check runs before the attachment, so the artifact can
+						 * only ever receive a snapshot that has been validated, and a
+						 * hook that ran after the cleanup below fails here rather than
+						 * appending a zero-sample result object. compare-results.js
+						 * rejects a run whose scenarios disagree about how many samples
+						 * they hold, so one extra entry would invalidate the
+						 * comparison. How many attachment hooks this spec has is
+						 * enforced in specs/utils.test.js, which is the only end that
+						 * can see more than one at a time.
 						 */
 						for ( const [ metric, samples ] of sampleCounts ) {
 							expect(
@@ -183,10 +174,10 @@ test.describe( 'Homepage', () => {
 						metrics,
 					} ) => {
 						/*
-						 * Every figure this spec reports is an uncached, cold-compile
-						 * measurement, so the reset that makes it one is required rather
-						 * than requested: clearServerCaches() fails the iteration unless
-						 * the helper answered 202.
+						 * Every figure this spec reports is measured after a cache
+						 * reset, so the reset is required rather than requested:
+						 * clearServerCaches() fails the iteration unless the authorized
+						 * reset handler answered 202.
 						 */
 						await clearServerCaches( page );
 

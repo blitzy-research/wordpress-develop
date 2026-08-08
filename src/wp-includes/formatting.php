@@ -5927,7 +5927,7 @@ function wp_should_load_emoji_detection_script() {
 }
 
 /**
- * Prints the inline Emoji detection script if it is not already printed.
+ * Prints the inline emoji detection script if it is not already printed.
  *
  * @since 4.2.0
  * @since 7.0.0 The script is only printed when wp_should_load_emoji_detection_script() returns true.
@@ -6241,9 +6241,9 @@ function _wp_emoji_list( $type = 'entities' ) {
 
 	if ( null === $emoji_list ) {
 		/*
-		 * Seeded with empty arrays so that a missing or malformed data file degrades to an
-		 * empty list. Callers iterate over the return value directly, so this function must
-		 * never return null.
+		 * Seeded with empty arrays, so an absent data file, or one that returns something
+		 * other than the two expected arrays, degrades to an empty list. Callers iterate
+		 * over the return value directly, so this function returns an array either way.
 		 */
 		$emoji_list = array(
 			'entities' => array(),

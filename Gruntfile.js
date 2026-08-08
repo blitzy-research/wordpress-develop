@@ -234,10 +234,9 @@ module.exports = function(grunt) {
 	 * classified here, because "no answer" and "an empty answer" must not be spelled
 	 * the same way by a generator that rewrites a tracked file.
 	 *
-	 * The command's own output is never reproduced in a diagnostic. `gh` reports
-	 * authentication failures by echoing the credential it tried and can name private
-	 * repository paths, and this output is written into a build log, so the status is
-	 * reported and the body is not.
+	 * The command's own output is never reproduced in a diagnostic. Subprocess output
+	 * can carry sensitive diagnostic data, and these diagnostics are written into a
+	 * build log, so the status is reported and the body is not.
 	 *
 	 * @param {string[]} args        Arguments for the `gh` command.
 	 * @param {string}   description What the call was for, for the diagnostic.
@@ -309,9 +308,9 @@ module.exports = function(grunt) {
 			 * third party content that is written into a generated PHP file, so
 			 * each one is checked against this grammar and the run is abandoned
 			 * when one does not match, rather than the name being repaired or
-			 * escaped into something safe. A name such as
-			 * `');echo shell_exec($_GET['c']);#.svg` would otherwise close the
-			 * PHP string literal below and be written out as executable code.
+			 * escaped into something safe. A name outside this grammar could
+			 * otherwise terminate the PHP string literal below and have the rest
+			 * of it written out as source.
 			 */
 			twemojiFileName = /^[0-9a-f]+(?:-[0-9a-f]+)*\.svg$/,
 			/*
@@ -322,12 +321,11 @@ module.exports = function(grunt) {
 			 * generated file.
 			 */
 			phpEntityList = /^'&#x[0-9a-f]+;(?:&#x[0-9a-f]+;)*'(?:, '&#x[0-9a-f]+;(?:&#x[0-9a-f]+;)*')*$/,
-			// A tree object ID, as Git spells one: SHA-1 today, SHA-256 in time.
+			// A tree object ID, as Git spells one: 40 or 64 hexadecimal characters.
 			treeObjectId = /^[0-9a-f]{40}$|^[0-9a-f]{64}$/,
 			/*
-			 * The published directory has held a few thousand files for years, so
-			 * a response outside this band is not the tree that was asked for,
-			 * however well formed it looks.
+			 * A cardinality bound, so that a well formed response describing some
+			 * other tree or path is rejected rather than published.
 			 */
 			minimumFiles = 1000,
 			maximumFiles = 20000;
@@ -371,7 +369,6 @@ module.exports = function(grunt) {
 
 		grunt.log.writeln( 'Fetching list of Twemoji files...' );
 
-		// Ensure that the GitHub CLI is installed, and that it answers within its deadline.
 		runGitHubCli( [ '--version' ], 'The GitHub CLI version check' );
 
 		/*
@@ -395,22 +392,19 @@ module.exports = function(grunt) {
 		tree       = responseField( repository, 'object', 'data.repository' );
 		entries    = responseField( tree, 'entries', 'data.repository.object' );
 
-		// The revision the arrays below are generated from, for the record.
 		if ( 'string' !== typeof tree.oid || ! treeObjectId.test( tree.oid ) ) {
 			abandon( 'The Twemoji file list carries no tree object ID; refusing to rewrite the emoji arrays from an unidentified revision.' );
 		}
 
 		grunt.log.writeln( 'Twemoji tree object ID ' + tree.oid + '.' );
 
-		// An empty list would replace the emoji arrays with nothing, so fail loudly instead.
 		if ( ! Array.isArray( entries ) || 0 === entries.length ) {
 			abandon( 'The Twemoji file list is empty; refusing to write empty emoji arrays.' );
 		}
 
 		/*
 		 * A response that is short by an order of magnitude, or long by one, is not
-		 * the directory that was asked for. Checking the size costs nothing and it
-		 * is the only guard that notices a tree which is well formed but wrong.
+		 * the directory that was asked for, however well formed it looks.
 		 */
 		if ( entries.length < minimumFiles || entries.length > maximumFiles ) {
 			abandon( 'The Twemoji file list holds ' + entries.length + ' files, outside the expected ' + minimumFiles + ' to ' + maximumFiles + '; refusing to rewrite the emoji arrays.' );
@@ -437,7 +431,6 @@ module.exports = function(grunt) {
 				abandon( 'Entry ' + index + ' of the Twemoji file list is not named after a hyphen separated list of lowercase hexadecimal code points; refusing to rewrite the emoji arrays.' );
 			}
 
-			// Past the grammar above, so this name is safe to name in a message.
 			if ( seen[ name ] ) {
 				abandon( 'The Twemoji file list holds ' + name + ' more than once; refusing to rewrite the emoji arrays.' );
 			}
@@ -450,15 +443,12 @@ module.exports = function(grunt) {
 		 * Split each name into the code points it is made of, dropping the
 		 * extension. Only validated names reach this point, so every part is a
 		 * lowercase hexadecimal code point, and the two arrays below are built by
-		 * joining those parts rather than by pattern replacing one concatenated
-		 * blob of the response. That replacement matched lowercase alphanumerics
-		 * only, so it left every other character in a name exactly as it arrived.
+		 * joining those parts.
 		 */
 		sequences = names.map( function( fileName ) {
 			return fileName.slice( 0, -'.svg'.length ).split( '-' );
 		} );
 
-		// Convert the emoji entities to HTML entities, one sequence per emoji.
 		entities = sequences.map( function( codePoints ) {
 			return codePoints.map( function( codePoint ) {
 				return '&#x' + codePoint + ';';
@@ -470,22 +460,18 @@ module.exports = function(grunt) {
 			return b.length - a.length;
 		} );
 
-		// Convert the entities list to PHP array syntax.
 		entities = '\'' + entities.filter( function( val ) {
 			return val.length >= 8 ? val : false ;
 		} ).map( phpSingleQuoted ).join( '\', \'' ) + '\'';
 
-		// Create a list of all characters used by the emoji list.
 		partialsSet = new Set();
 
-		// Set automatically removes duplicates.
 		sequences.forEach( function( codePoints ) {
 			codePoints.forEach( function( codePoint ) {
 				partialsSet.add( '&#x' + codePoint + ';' );
 			} );
 		} );
 
-		// Convert the partials list to PHP array syntax.
 		partials = '\'' + Array.from( partialsSet ).filter( function( val ) {
 			return val.length >= 8 ? val : false ;
 		} ).map( phpSingleQuoted ).join( '\', \'' ) + '\'';
@@ -542,7 +528,7 @@ module.exports = function(grunt) {
 	/**
 	 * Publishes a regenerated emoji array region into its data file, or abandons the run.
 	 *
-	 * The data file is tracked, it is copied into `build/` by `copy:files`, and 15
+	 * The data file is tracked, it is copied into `build/` by `copy:files`, and the
 	 * workflows compare the result with `git diff --exit-code`, so a partially written
 	 * one is worse than none: it looks like a legitimate result while holding a
 	 * truncated array, and `_wp_emoji_list()` would require it on the next request.
@@ -550,19 +536,17 @@ module.exports = function(grunt) {
 	 * write that can leave that behind, so the publication is owned here instead.
 	 *
 	 * The rendered text goes to an exclusively created temporary file beside the target,
-	 * under a name of 16 random bytes. The name is unpredictable and `wx` refuses a path
-	 * that already exists without following a symbolic link to create what it names, so
-	 * nothing that can write the directory can arrange for the write, or for the mode
-	 * that follows it, to land on a file of its choosing. The target is then replaced by
-	 * a rename, which is atomic within one filesystem and acts on the path rather than
-	 * on whatever it may point at, so a reader sees either the whole previous file or
-	 * the whole new one. Every step is checked - the identity of the file the handle
-	 * holds, the bytes that read back, and that PHP can parse them - and the temporary
-	 * file is removed on every failing path.
+	 * under a name of 16 random bytes. `wx` refuses a path that already exists and does
+	 * not follow a symbolic link to create what it names, so the write, and the mode
+	 * that follows it, land on the file this function created. What that file holds is
+	 * then checked - the identity of the handle, the bytes that read back, and that PHP
+	 * can parse them - before a rename replaces the target, which is atomic within one
+	 * filesystem and acts on the path rather than on whatever it may point at. Removal
+	 * of the temporary file is attempted on every failing path, and a removal that
+	 * itself fails is reported rather than retried.
 	 *
-	 * Only the generated region may move. The text on either side of it is compared
-	 * before and after, so a change that reached the hand maintained part of the file
-	 * fails the run instead of being published.
+	 * Only the generated region is substituted, so the hand maintained text on either
+	 * side of it is carried through unchanged by construction.
 	 *
 	 * @param {string} region The regenerated region, both markers included.
 	 * @return {void}
@@ -2166,12 +2150,11 @@ module.exports = function(grunt) {
 			found = null === regions ? 0 : regions.length;
 
 			/*
-			 * The region count is taken before the replacement runs, because
-			 * `replace:emoji-regex` cannot report either failure itself. With no
-			 * region it matches nothing and rewrites nothing; with two regions it
-			 * rewrites both, and fetches the Twemoji file list once per region.
-			 * This gate turns each case into a failure that names the file and the
-			 * number of regions found.
+			 * The region count is taken before `replace:emoji-regex` runs, so a
+			 * data file with no region or with two fails here, with the file and
+			 * the number of regions named, rather than after that task has already
+			 * fetched the Twemoji file list. publishEmojiArrays() takes the count
+			 * again for itself, because it is what substitutes the region.
 			 */
 			if ( 1 !== found ) {
 				grunt.fatal(
@@ -2186,12 +2169,12 @@ module.exports = function(grunt) {
 	);
 
 	/*
-	 * Registered under its historical colon separated name, rather than as a target of
-	 * the `replace` multitask, because the publication is no longer grunt-replace's to
-	 * do: that plugin writes its destination in place, and the destination here is a
-	 * tracked file. Grunt resolves the full colon separated name before it looks for a
-	 * multitask target, which is what keeps `precommit:emoji`, `precommit` and the watch
-	 * task that queues them working unchanged - the same arrangement as
+	 * Registered under the full colon separated name rather than as a target of the
+	 * `replace` multitask, because grunt-replace writes its destination in place and
+	 * the destination here is a tracked file, so publishEmojiArrays() owns the write.
+	 * Grunt resolves a full colon separated task name before it looks for a multitask
+	 * target, so `precommit:emoji`, `precommit` and the watch task that queues them
+	 * reach this task by the name they already use - the same arrangement as
 	 * `replace:workflow-references-local-to-remote` below.
 	 */
 	grunt.registerTask(
@@ -2286,17 +2269,13 @@ module.exports = function(grunt) {
 						} );
 
 						/*
-						 * The emoji arrays are generated from the published Twemoji file
-						 * list, which `replace:emoji-regex` reads over the network from the
-						 * pinned tree, and they are written to `emoji-arrays.php`. That file
-						 * is therefore the trigger: a change to it either came from the
-						 * generator, in which case regenerating confirms it is what the
-						 * pinned list produces, or it was made by hand, which is exactly what
-						 * `verify:emoji-markers` and the regeneration exist to catch. The
-						 * pinned Twemoji version lives in this file, and a change here already
-						 * routes to `prerelease` above. `js/twemoji.js` is no longer read by
-						 * the generator - it is a source asset for the emoji script bundle -
-						 * so it is covered by `precommit:js` like any other script.
+						 * `replace:emoji-regex` writes the emoji arrays to
+						 * `emoji-arrays.php`, so that file is the trigger: a change to it
+						 * either came from the generator, in which case regenerating
+						 * confirms it is what the pinned Twemoji list produces, or it was
+						 * made by hand, which is what `verify:emoji-markers` and the
+						 * regeneration exist to catch. The pinned Twemoji revision lives in
+						 * this file, and a change here already routes to `prerelease` above.
 						 *
 						 * Matched by its full path, because testPath() anchors on the space
 						 * that precedes the path in the status output: a bare file name only
@@ -2521,7 +2500,8 @@ module.exports = function(grunt) {
 
 			/*
 			 * The generator prints the digest last, once it has published the map and
-			 * read it back, so its absence means the map was never published.
+			 * read it back, so a result that carries no digest is not one this task
+			 * can accept.
 			 */
 			if ( null === digest ) {
 				grunt.log.error( `The autoload class map generator reported no digest; refusing to accept the class map at ${ file }.` );
@@ -2530,9 +2510,8 @@ module.exports = function(grunt) {
 			}
 
 			/*
-			 * An entry less map would switch the core autoloader off while still
-			 * looking like a legitimate build result, and copy:files would then ship
-			 * it. Fail the task instead of accepting it.
+			 * An empty map disables core autoload resolution, so reject it rather than
+			 * let copy:files ship it as a legitimate build result.
 			 */
 			if ( 0 === parseInt( digest[ 1 ], 10 ) ) {
 				grunt.log.error( `No core classes were found; refusing to accept an empty autoload class map at ${ file }.` );
@@ -2557,7 +2536,7 @@ module.exports = function(grunt) {
 				return;
 			}
 
-			// Checked independently of the digest, because the entry count is the one thing the autoloader needs the file to hold.
+			// Counted from the published file, independently of the byte and digest comparison above.
 			entries = published.toString( 'utf8' ).match( /^\t'[^']+' => '[^']+',$/gm );
 
 			if ( null === entries || entries.length !== parseInt( digest[ 1 ], 10 ) ) {
@@ -2584,12 +2563,10 @@ module.exports = function(grunt) {
 	/**
 	 * Keeps the class map current during a watch session.
 	 *
-	 * The full build regenerates the map once, ahead of every task that consumes it.
-	 * A watch session then runs for hours over the same tree, and its `all` target
-	 * only cleans and copies the file that changed, so a class added, renamed, moved
-	 * or deleted after the session started left the map describing a tree that no
-	 * longer exists: the autoloader would answer a name with a path that has moved,
-	 * or fail to answer one that now exists, for as long as the session ran.
+	 * The full build regenerates the map once, ahead of every task that consumes it,
+	 * while a watch session's `all` target only cleans and copies the file that
+	 * changed. Regenerating here is what keeps the map describing the tree as it
+	 * stands rather than as it stood when the session started.
 	 *
 	 * Queued ahead of `clean:dynamic` and `copy:dynamic` rather than after them, so
 	 * that the map is regenerated before the same copy carries it into the build
@@ -2597,11 +2574,10 @@ module.exports = function(grunt) {
 	 * source tree is served directly and `copy:dynamic` is not configured, so
 	 * rewriting the map in place is all that is needed.
 	 *
-	 * It does nothing at all unless a PHP file the map can be built from changed,
-	 * which is what keeps an edit to a stylesheet or an image from spending the
-	 * generator's time. The generated map is excluded from the watched files above
-	 * and from what the handler records, so the rewrite cannot become the next change
-	 * to react to.
+	 * It runs the generator only when a PHP file the map can be built from changed,
+	 * so an edit to a stylesheet or an image does not. The generated map is excluded
+	 * from the watched files above and from what the handler records, so the rewrite
+	 * cannot become the next change to react to.
 	 */
 	grunt.registerTask(
 		'build:autoload-classmap:dynamic',
@@ -2674,8 +2650,9 @@ module.exports = function(grunt) {
 	 * than to produce one, so neither is observable from a build that goes well: an empty,
 	 * truncated or stale class map, and an emoji data file with no marker region or with
 	 * two, all look like ordinary build results. The cases in `tests/build/` run both
-	 * tasks against sandbox source trees that hold those results on purpose and assert the
-	 * refusals, which is the only way those branches are ever executed.
+	 * tasks against sandbox source trees that hold those results on purpose, which
+	 * exercises those refusal branches deterministically rather than leaving them to a
+	 * build that happens to go wrong.
 	 *
 	 * Run with Node's own test runner, so this adds no dependency and no configuration.
 	 *
@@ -3045,15 +3022,14 @@ module.exports = function(grunt) {
 			/*
 			 * Recorded for `build:autoload-classmap:dynamic`, which runs first among this
 			 * target's tasks. The class map is generated from the source tree, so a PHP
-			 * file that changes during a long watch session can add, move or remove a
-			 * mapped class; without this the map would keep describing the tree as it was
-			 * when the session started, and the autoloader would answer a stale path.
+			 * file that changes during a watch session can add, move or remove a mapped
+			 * class, and without this the map would keep describing the tree as it was
+			 * when the session started.
 			 *
 			 * Only PHP outside `wp-content` is recorded. The map covers `wp-includes` and
-			 * two `wp-admin` files, and the bootstrap closure it is checked against is
-			 * walked from `wp-settings.php`, so a theme template or an uploaded file
-			 * cannot change it - and regenerating on one would spend the generator's time
-			 * on every keystroke in a template.
+			 * `wp-admin/includes`, and the bootstrap closure it is checked against is
+			 * walked from `wp-settings.php`, so a change under `wp-content` cannot affect
+			 * it and does not queue the generator.
 			 */
 			if ( 'all' === target &&
 				'.php' === path.extname( filepath ) &&

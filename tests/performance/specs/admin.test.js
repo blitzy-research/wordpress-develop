@@ -40,31 +40,13 @@ const requiredServerTimingMetrics = [
  *
  * Every required Server-Timing metric is declared here, derived from the list above
  * so the two cannot drift, because being declared is what gets a metric reset
- * between locales. A metric that only the ingestion loop creates keeps its samples
- * across both locales, and that accumulation has been measured rather than assumed:
- * in one admin run the de_DE bucket held twelve 'wpMemoryUsage' samples for six
- * iterations, and the first three of each repetition were byte-identical to the
- * en_US ones, 6,745,720 and 6,746,360 against the locale's own 7,333,616. Its
- * reported median came out at 7,039,988, understating de_DE by 293,628 bytes, or
- * 4.0%. 'wpDbQueries' was undeclared too, so the figure this suite reports its
- * database-query target from was a median mixed across locales.
- *
- * The original five explicitly declared server metrics proved that the mixing they
- * prevent is real rather than hypothetical. In the same admin run, the metrics that
- * only the ingestion loop created showed it happening: the de_DE bucket held twelve
- * 'wpMemoryUsage' samples for six iterations, and the first three of each repetition
- * were byte-identical to the en_US ones, 6,745,720 and 6,746,360 against the locale's
- * own 7,333,616. Its reported median came out at 7,039,988, understating de_DE by
- * 293,628 bytes, or 4.0%. Every declared metric held exactly six. The deterministic
- * JavaScript byte totals follow the same reset contract.
- *
- * How wrong a mixed median can be is bounded by how far the locales really are
- * apart, and they are not close: 'wpMemoryPeak', which was already declared and
- * reset, measured a median of 7,305,568 bytes for en_US against 7,793,872 for
- * de_DE, a difference of 6.7%.
+ * between locales. A metric only the ingestion loop creates would keep its samples
+ * across both locales, and the median reported for the second locale would then be
+ * taken over measurements from both.
  *
  * The reset in `afterAll` reads these keys live rather than from a snapshot taken
- * here, so a metric that only starts arriving later is still reset and counted.
+ * here, so a metric that only starts arriving later is still reset and counted. The
+ * deterministic JavaScript byte totals follow the same reset contract.
  */
 const results = {
 	timeToFirstByte: [],
@@ -90,12 +72,11 @@ const immutableMeasurementMetrics = [ 'adminJsRaw', 'adminJsGzipped' ];
  * registration loop below run forever and an astronomically large one runs long
  * enough to be indistinguishable from a hang, so collection never finishes and the
  * check never gets to report anything. An explicit ceiling makes that outcome
- * impossible while leaving ample headroom over the 20 runs
+ * impossible while leaving headroom over the run count
  * `tests/performance/playwright.config.js` defaults TEST_RUNS to.
  */
 const maxIterations = 1000;
 
-// Read once at module scope so test generation and validation use the same count.
 const iterations = Number( process.env.TEST_RUNS );
 
 /**
@@ -123,7 +104,6 @@ test.describe( 'Admin', () => {
 	} );
 
 	if ( ! hasMeasurableIterations ) {
-		// Nothing measurable to register, and the check above already fails the run.
 		return;
 	}
 
@@ -161,15 +141,13 @@ test.describe( 'Admin', () => {
 
 					/*
 					 * Both checks run before the attachment, so the artifact can only
-					 * ever receive a snapshot that has been validated. A duplicate of
-					 * this hook - the defect this ordering exists to catch - would run
-					 * once the arrays have already been emptied by the cleanup below
-					 * and would fail here instead of appending a zero-sample result
-					 * object. Such an object is not inert: compare-results.js rejects
-					 * a run whose scenarios disagree about how many samples they
-					 * hold, so one extra entry invalidates the comparison. Cardinality
-					 * itself is covered in specs/utils.test.js, which is the only end
-					 * that can see more than one attachment hook at a time.
+					 * ever receive a snapshot that has been validated, and a hook that
+					 * ran after the cleanup below fails here rather than appending a
+					 * zero-sample result object. compare-results.js rejects a run whose
+					 * scenarios disagree about how many samples they hold, so one extra
+					 * entry would invalidate the comparison. How many attachment hooks
+					 * this spec has is enforced in specs/utils.test.js, which is the
+					 * only end that can see more than one at a time.
 					 */
 					for ( const [ metric, samples ] of sampleCounts ) {
 						expect(
@@ -206,10 +184,10 @@ test.describe( 'Admin', () => {
 					metrics,
 				} ) => {
 					/*
-					 * Every figure this spec reports is an uncached, cold-compile
-					 * measurement, so the reset that makes it one is required rather than
-					 * requested: clearServerCaches() fails the iteration unless the helper
-					 * answered 202.
+					 * Every figure this spec reports is measured after a cache reset, so
+					 * the reset is required rather than requested: clearServerCaches()
+					 * fails the iteration unless the authorized reset handler answered
+					 * 202.
 					 */
 					await clearServerCaches( page );
 
@@ -269,16 +247,13 @@ test.describe( 'Admin', () => {
 					results.timeToFirstByte.push( ttfb );
 
 					/*
-					 * Measured from the end of the response, so it excludes server time -
-					 * the same definition metrics.getLoadingDurations() uses, read straight
-					 * from the Navigation Timing API rather than through that helper. The
-					 * helper also dereferences the 'first-paint' and 'first-contentful-paint'
-					 * entries unconditionally, and an admin screen that has not painted by
-					 * the time the load event fires records neither, so it throws
-					 * "Cannot read properties of undefined (reading 'startTime')" and costs
-					 * this spec a domContentLoaded sample over two paint metrics it does not
-					 * report. Reading the navigation entry alone cannot fail that way: it is
-					 * always present once navigation has completed.
+					 * The interval from the navigation entry's responseEnd to its
+					 * domContentLoadedEventEnd, so it excludes server time - the same
+					 * definition metrics.getLoadingDurations() uses, read straight from
+					 * the Navigation Timing API rather than through that helper. Reading
+					 * the navigation entry directly keeps this sample independent of the
+					 * paint entries that helper also dereferences, which an admin screen
+					 * need not have recorded by the time the load event fires.
 					 */
 					const domContentLoaded = await page.evaluate( () => {
 						const [ navigation ] =

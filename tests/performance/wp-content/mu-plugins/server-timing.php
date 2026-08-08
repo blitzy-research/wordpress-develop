@@ -3,39 +3,24 @@
 /**
  * Resolves the secret that authorizes a cache reset, or reports that there is none.
  *
- * The reset is an expensive, unauthenticated-by-nature side effect: it discards the
- * opcode cache, the object cache and the expired transient rows for the whole
- * installation. Presence of a query argument is therefore not authorization, and this
- * function is what the control plane below has instead. It reports the empty string
- * whenever no usable secret has been provisioned, and the caller treats that as the
- * endpoint not existing at all.
+ * Provisioning a secret is what enables the reset; the empty string returned when none is
+ * usable is what makes the control plane below answer as though the endpoint did not
+ * exist. The performance harness provisions a token before its first measured iteration
+ * (`tests/performance/utils.js`) and its global teardown is meant to delete it again
+ * (`tests/performance/config/global-teardown.js`).
  *
- * Provisioning the secret is the explicit enable step, and it is the only one: the
- * performance harness writes a fresh random token before its first measured iteration
- * (`tests/performance/utils.js`) and its global teardown deletes the file again
- * (`tests/performance/config/global-teardown.js`), so the control plane exists for
- * exactly the duration of one measured run and nowhere else. An installation that
- * merely has this mu-plugin present has no reset endpoint.
- *
- * Three sources are consulted, in this order, so that a deployment can choose whichever
- * it can reach:
+ * Three sources are consulted, in this order:
  *
  * 1. The `WP_PERF_CACHE_RESET_TOKEN` constant, for a `wp-config.php` deployment.
  * 2. The `WP_PERF_CACHE_RESET_TOKEN` environment variable, for a container deployment.
- * 3. A token file, which is what the harness itself uses. Its path comes from the
+ * 3. A token file, which is what the harness uses. Its path comes from the
  *    `WP_PERF_CACHE_RESET_TOKEN_FILE` constant or environment variable, and otherwise
- *    defaults to `.cache/performance-cache-reset-token` beside the installation
- *    directory rather than inside it, so the secret is never itself web readable.
+ *    defaults to `.cache/performance-cache-reset-token` beside the installation directory.
  *
- * Every candidate must be at least 32 alphanumeric characters. That is a grammar check
- * rather than a strength check, but it is enough to make the failure closed instead of
- * open: a truncated file, an empty variable, a placeholder or a short hand-written
- * value all resolve to no token, which disables the reset rather than protecting it
- * with something guessable.
- *
- * Deliberately implemented with language functions only, so that the whole decision can
- * be reached, and checked, in a process where WordPress has never been loaded and no part
- * of it can influence the answer.
+ * A candidate is accepted only as 32 to 128 alphanumeric characters, so a truncated file,
+ * an empty variable or a short hand-written value disables the reset rather than
+ * protecting it with something guessable. Only language functions are used, so the
+ * decision can be reached in a process where WordPress has not been loaded.
  *
  * @ignore
  * @since 7.0.0
@@ -71,9 +56,10 @@ function wp_perf_cache_reset_token() {
 			$file = $configured;
 		} elseif ( defined( 'ABSPATH' ) ) {
 			/*
-			 * Beside the installation directory, never inside it. ABSPATH is the document
-			 * root the web server serves, so a token kept under it would be fetchable over
-			 * HTTP by the very requests this token exists to keep out.
+			 * Beside the installation directory rather than inside it. In the performance
+			 * harness layout ABSPATH is the served document root, so a token kept under it
+			 * would be fetchable over HTTP. A deployment that serves the parent directory
+			 * as well has to configure a path of its own outside the served root.
 			 */
 			$file = dirname( rtrim( ABSPATH, '/\\' ) ) . '/.cache/performance-cache-reset-token';
 		}
@@ -100,25 +86,22 @@ function wp_perf_cache_reset_token() {
 /**
  * Decides what the cache reset control plane answers one reset request with.
  *
- * Separated from the request so that the decision is a pure function of the two things
- * that may authorize a reset, which is what lets every branch be reached directly rather
- * than inferred from a live response, over the whole request matrix rather than one shape
- * at a time. It never resets anything itself.
+ * Separated from the request so the status can be selected from the request method, the
+ * presented secret and the provisioned token state alone, which is what lets every branch
+ * be reached directly rather than inferred from a live response. It has no side effects
+ * and resets nothing itself. Each step answers with the status that describes only that
+ * step, and the ladder fails closed:
  *
- * The ladder fails closed at each step, and each step answers with the status that
- * describes only that step:
- *
- * - 404 when no token has been provisioned. The endpoint does not exist, and nothing
- *   about the installation is disclosed, including which cache layers it runs.
- * - 405 for any method other than POST. A reset changes server state, so it may not be
- *   reachable by navigation, prefetch, image load or link preview.
+ * - 404 when no token has been provisioned, disclosing nothing about the installation.
+ * - 405 for any method other than POST, so a reset is not reachable by navigation,
+ *   prefetch, image load or link preview.
  * - 403 when the presented secret is absent or does not match, compared with
  *   `hash_equals()` so the comparison is not a timing oracle.
  * - 202 only when a POST presented the provisioned token.
  *
- * The token is read from a request header by the caller below, never from the URL, so
- * it cannot be sent by a cross-origin form, an `img` tag or a navigation, and it does
- * not reach the access log, the referrer or the browser history.
+ * The caller below reads the token from a request header rather than from the URL, which
+ * keeps it out of the address, the referrer and the browser history, and out of the request
+ * logs the harness is configured with.
  *
  * @ignore
  * @since 7.0.0
@@ -149,28 +132,16 @@ function wp_perf_cache_reset_status( $method, $presented ) {
 /**
  * Discards every cache the next measured request would otherwise be served from.
  *
- * The measurement contract for this harness is that each sample is taken in the
- * cold, uncached regime: the opcode cache, the object cache and the expired
- * transient rows must all be gone before the request under measurement starts.
- * `tests/performance/wp-content/mu-plugins/clear-cache.php` is what has always
- * implemented that, but the CI job that provisions the harness copies only
- * `server-timing.php` into the installed tree, so under the shipped workflow
- * `/?clear_cache` was answered by WordPress as an ordinary front-page request and
- * nothing was reset. A 200 satisfied the step, and warm samples were published
- * under an uncached label.
- *
- * Answering the same request here puts the reset in the one file the workflow
- * installs, so the regime is a property of the harness rather than of how the
- * harness happened to be provisioned.
+ * Each sample is measured in the cold, uncached regime, so the opcode cache, the
+ * object cache and the expired transient rows are discarded before the request under
+ * measurement starts. The reset lives in this file because it is the one mu-plugin the
+ * performance workflows copy into the installed tree.
  *
  * Reached only from the control plane below, and only for a POST that presented the
- * provisioned token. That is a deliberate divergence from `clear-cache.php`, which runs
- * the same operations for any request carrying the query argument: the two files no
- * longer behave identically, and only this one may be provisioned. Must-use plugins
- * load in filename order, so an installation holding both would let `clear-cache.php`
- * answer first and exit, reinstating an unauthenticated reset that this file refuses;
- * the harness therefore installs this file alone, exactly as both performance workflows
- * already do.
+ * provisioned token. `clear-cache.php` in this directory runs the same operations for
+ * any request carrying the query argument, and must-use plugins load in filename
+ * order, so an installation holding both would let that file answer first with an
+ * unauthenticated reset. This mu-plugin has to be provisioned without it.
  *
  * @ignore
  * @since 7.0.0
@@ -213,11 +184,10 @@ function wp_perf_reset_caches() {
 
 	/*
 	 * 202 rather than 200, because nothing was rendered and the only thing the
-	 * caller may conclude is that the reset was accepted. No status WordPress
-	 * itself sends for this URL collides with it, and neither does any status the
-	 * control plane refuses with, so a spec that requires 202 fails whenever the
-	 * reset helper is absent or its token was never provisioned instead of going on
-	 * to measure a warm request.
+	 * caller may conclude is that the reset was accepted. It is this control plane's
+	 * explicit success signal, and it is none of the statuses the ladder above
+	 * refuses with, so a spec that requires it fails rather than going on to measure
+	 * a warm request.
 	 */
 	status_header( 202 );
 
@@ -227,20 +197,17 @@ function wp_perf_reset_caches() {
 /*
  * The cache reset control plane.
  *
- * Registered at 'plugins_loaded' priority 1, early enough that nothing the request
- * would otherwise be served from has been read yet, and matching the priority the
- * pre-existing clear-cache.php uses so that the load order of the two files is
- * unchanged.
+ * Registered at 'plugins_loaded' priority 1, so the reset runs and the request ends
+ * before the request the harness goes on to measure, and at the priority the
+ * pre-existing clear-cache.php uses so the load order of the two files is unchanged.
  *
- * The `clear_cache` query argument selects the endpoint and authorizes nothing. It is
- * not a secret and is deliberately left where it has always been, so the URL the
- * workflows and the specs use does not change. Authorization is the token in the
+ * The `clear_cache` query argument selects the endpoint and authorizes nothing, so the
+ * URL the workflows and the specs use is unchanged. Authorization is the token in the
  * X-WP-Perf-Cache-Reset-Token request header, which arrives as
  * $_SERVER['HTTP_X_WP_PERF_CACHE_RESET_TOKEN']: a header cannot be set by a
- * cross-origin form, a navigation or an embedded resource, so no reset can be provoked
- * by tricking a browser, and the secret never reaches a URL, an access log, a referrer
- * or the browser history. Neither superglobal is trusted beyond an isset() test before
- * it has been unslashed and sanitized.
+ * cross-origin form, a navigation or an embedded resource, and it keeps the secret out
+ * of the address, the referrer and the browser history. Neither superglobal is trusted
+ * beyond an isset() test before it has been unslashed and sanitized.
  */
 add_action(
 	'plugins_loaded',
@@ -261,7 +228,6 @@ add_action(
 		$status = wp_perf_cache_reset_status( $method, $presented );
 
 		if ( 202 === $status ) {
-			// Sends the 202 and the reset vocabulary header itself, then ends the request.
 			wp_perf_reset_caches();
 		}
 
@@ -280,18 +246,16 @@ add_action(
 /**
  * Stores or retrieves the duration of the WordPress bootstrap sequence, in seconds.
  *
- * The metric has exactly one boundary: the interval from $timestart to 'wp_loaded'.
- * That boundary is the same for the front-end and the admin scenario, so the two are
- * comparable, and there is deliberately no second boundary to fall back to. A request
- * that never reaches 'wp_loaded' therefore has no bootstrap duration at all rather
- * than one measured to a different end point, and this function reports that as null.
+ * The metric has exactly one boundary: the interval from $timestart to 'wp_loaded',
+ * which is the same boundary in the front-end and the admin scenario, so the two are
+ * comparable. A request that never reaches 'wp_loaded' has no bootstrap duration at
+ * all rather than one measured to a different end point, and that is reported as null.
  *
- * Distinguishing "never recorded" from a recorded 0.0 is what keeps this function
- * honest about what it knows. Both collectors below read it from a 'shutdown'
- * callback, and a request only reaches 'shutdown' after 'wp_loaded' has fired, so
- * neither of them can observe the null in practice; they guard it anyway and emit
- * 0.0, a value no measured bootstrap can be confused with, rather than letting a
- * null reach the header conversion.
+ * Both collectors below register their 'shutdown' callback from a hook that runs after
+ * 'wp_loaded' - the template filter on the front end and admin_init in the admin - so
+ * a collector that runs at all runs with the duration already recorded. The null is
+ * guarded rather than assumed and emitted as 0.0, a value no measured bootstrap can be
+ * confused with, rather than reaching the header conversion.
  *
  * @ignore
  * @since 7.0.0
@@ -324,10 +288,10 @@ function wp_perf_bootstrap_duration( $duration = null ) {
  * and leak internal error detail whenever display errors are on.
  *
  * get_object_vars() is called from outside the class, so the snapshot it returns holds
- * only genuinely public properties and no magic accessor is ever consulted. Anything
- * that is not a numeric scalar with an integer representation is reported as 0, which is
- * the same value an entirely absent counter reports, so the metric degrades without ever
- * being omitted.
+ * only genuinely public properties and no magic accessor is ever consulted. A public
+ * counter that is a finite numeric value within the integer range is cast to an integer,
+ * so a fractional value is truncated; anything else - absent, non-numeric, non-finite or
+ * out of range - is reported as 0, so the metric degrades without ever being omitted.
  *
  * @ignore
  * @since 7.0.0
@@ -374,10 +338,10 @@ function wp_perf_object_cache_counters() {
 		}
 
 		/*
-		 * A numeric string or a float is still usable, but only when it has an integer
-		 * representation: casting a non-finite or out-of-range float emits
-		 * "The float ... is not representable as an int" as of PHP 8.5, which is exactly
-		 * the kind of notice this function exists to keep out of the measured response.
+		 * A numeric string or a float is still usable, but only once it is known to be
+		 * finite and within the integer range: casting a non-finite or out-of-range
+		 * float can emit a conversion diagnostic, which is exactly the kind of notice
+		 * this function exists to keep out of the measured response.
 		 */
 		$counter_number = (float) $counter_value;
 
@@ -442,25 +406,20 @@ add_filter(
 		ob_start();
 
 		/*
-		 * Everything below is measured at the start of shutdown, and that is the
-		 * boundary every metric it reports describes.
+		 * Every metric below is sampled in the first 'shutdown' callback, and that is
+		 * the boundary each of them describes.
 		 *
-		 * PHP_INT_MIN makes this the first 'shutdown' callback, which it has to be: the
-		 * Server-Timing header can only be sent while nothing has flushed the buffer
-		 * opened above, so the callback takes the body with ob_get_clean(), sets the
-		 * header, and echoes the body back out. Everything WordPress runs afterwards is
-		 * therefore outside the measurement - wp_ob_end_flush_all() at priority 1, then
-		 * _wp_cron(), _wp_delete_all_temp_backups() and any plugin callback at the
-		 * default priority, and finally wp_cache_close() plus PHP's own shutdown work,
-		 * all of which happen inside or after shutdown_action_hook().
+		 * PHP_INT_MIN makes this callback first, which it has to be: the Server-Timing
+		 * header can only be sent while nothing has flushed the buffer opened above, so
+		 * the callback takes the body with ob_get_clean(), sets the header, and echoes
+		 * the body back out. The remaining shutdown callbacks and PHP's own shutdown
+		 * work run afterwards and are outside the measurement.
 		 *
 		 * So 'files-loaded', 'memory-peak', 'db-queries', 'cache-hits', 'cache-misses',
-		 * 'total' and 'template' describe the request up to this point rather than
-		 * whole-process totals: a file included by a later shutdown callback is not
-		 * counted, and neither is the memory it allocates. That is the figure worth
-		 * reporting, because it covers everything that happens before the response
-		 * reaches the client, and because both arms of a comparison stop at the same
-		 * boundary the difference between them still belongs to the code under test.
+		 * 'total' and 'template' are values as at that point rather than whole-process
+		 * totals: a file included by a later shutdown callback is not counted, and
+		 * neither is the memory it allocates. A before/after comparison of these
+		 * figures therefore covers that common pre-boundary interval only.
 		 */
 		add_action(
 			'shutdown',
@@ -488,13 +447,13 @@ add_filter(
 				$cache_counters = wp_perf_object_cache_counters();
 
 				/*
-				 * This callback runs from 'shutdown', which a request only reaches after
-				 * 'wp_loaded' has fired, so the duration is always recorded here. The null
-				 * the function reserves for a request that never reached that boundary is
-				 * therefore unreachable from this collector, and it is still guarded rather
-				 * than assumed: a null would be emitted as a duration of 0.0, which no
-				 * sample can be confused with, instead of raising a conversion notice from
-				 * inside a callback that has already taken the response body.
+				 * This callback is registered from the template filter, which runs after
+				 * 'wp_loaded' has fired, so the duration is recorded by the time it runs.
+				 * The null the function reserves for a request that never reached that
+				 * boundary is still guarded rather than assumed: it is emitted as a
+				 * duration of 0.0, which no sample can be confused with, instead of
+				 * raising a conversion notice from inside a callback that has already
+				 * taken the response body.
 				 */
 				$bootstrap = wp_perf_bootstrap_duration();
 
@@ -565,9 +524,10 @@ add_action(
 				$cache_counters = wp_perf_object_cache_counters();
 
 				/*
-				 * Always recorded by the time this runs, for the same reason as in the
-				 * front-end collector above: 'shutdown' is only reached after 'wp_loaded'
-				 * fired. The null is still guarded rather than assumed.
+				 * Recorded by the time this runs, for the same reason as in the front-end
+				 * collector above: this callback is registered from 'admin_init', which
+				 * runs after 'wp_loaded' fired. The null is still guarded rather than
+				 * assumed.
 				 */
 				$bootstrap = wp_perf_bootstrap_duration();
 

@@ -4,9 +4,9 @@
  * Ensures the autoloader under test is loaded, whatever the load order is.
  *
  * wp-includes/autoload.php registers itself with spl_autoload_register() when it
- * is required, `require_once` is a no-op once the file has already been
- * required, and a repeat registration of the same named function is ignored, so
- * requiring it here is safe whether or not the bootstrap has loaded it already.
+ * is required, and `require_once` is a no-op once the file has been required, so
+ * this safely ensures the registration regardless of whether the bootstrap has
+ * already loaded it.
  */
 require_once ABSPATH . WPINC . '/autoload.php';
 
@@ -105,7 +105,8 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 			/*
 			 * The generated class map is committed, so an unreadable or empty map
 			 * is a real failure. Returning one case that cannot pass reports it,
-			 * where an empty provider would only mark the test risky.
+			 * where an empty provider would leave the entry assertions below
+			 * running against nothing.
 			 */
 			$cases['the generated class map is missing or empty'] = array( '', '' );
 		}
@@ -211,12 +212,13 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 	}
 
 	/**
-	 * Tests that loading a mapped name declares that name and nothing unrelated.
+	 * Tests that loading a mapped name declares that name and no unrelated symbol.
 	 *
-	 * A mapped file is allowed to bring in its parent class, the interfaces it
-	 * implements and the traits it uses, because those are resolved while the
-	 * file is being compiled. Anything else means the file declares more than
-	 * the single symbol it is mapped for.
+	 * The load has to resolve the name it was asked for, and it may additionally
+	 * declare the mapped file's parent class, the interfaces it implements and
+	 * the traits it uses, because those are resolved while the file is being
+	 * compiled. Any other newly declared symbol that is not itself in the class
+	 * map fails the test.
 	 *
 	 * The same property is then asserted for every spelling PHP can hand the
 	 * handler: PHP passes the name exactly as the reference site wrote it, minus
@@ -405,14 +407,12 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 	 * covered in one pass rather than only the ones a request happens to reach.
 	 *
 	 * The file-scope check belongs with it, because it is the same promise seen
-	 * from the other side: a file that runs anything of its own is not safe to
-	 * load from an autoloader. A file that requires its own subclasses at file
-	 * scope recurses through the autoloader while its parent is still being
-	 * declared, which exhausts the stack rather than raising an error; a file that
-	 * reports a deprecation emits output in the middle of an unrelated request; and
-	 * a file that calls a function assumes a bootstrap state the autoloader cannot
-	 * promise, because it runs at the first reference rather than at a fixed point
-	 * in the load order.
+	 * from the other side: an autoloaded file runs at the first reference to its
+	 * symbol rather than at a fixed point in the load order, so anything it does
+	 * beyond declaring that symbol happens at a moment the bootstrap has not
+	 * agreed to. The scan is a conservative eligibility check - it recognises the
+	 * top-level constructs a mapped file may hold and rejects anything else,
+	 * which can reject a file that would in fact have been harmless.
 	 */
 	public function test_class_map_entries_declare_the_mapped_symbol() {
 		$class_map = self::get_class_map();
@@ -498,8 +498,8 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 	 *
 	 * Stated here rather than read out of the autoloader, so that a change to the
 	 * pattern the autoloader applies has to be made deliberately in both places.
-	 * test_generator_and_autoloader_require_the_same_path_form() is what holds the
-	 * three copies together.
+	 * test_class_map_entry_points_to_a_readable_file() applies this copy to every
+	 * committed entry.
 	 *
 	 * @return string Pattern for preg_match().
 	 */
@@ -560,7 +560,6 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 						$collected[] = trim( $token[1], '"\'' );
 					}
 
-					// T_ARRAY and anything else in the expression is skipped.
 					continue;
 				}
 
@@ -636,7 +635,7 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 	}
 
 	/**
-	 * Returns a name that no core file can declare and no prefix can match.
+	 * Returns a probe name that lies outside the core prefixes.
 	 *
 	 * @return string A name outside the core prefixes.
 	 */
@@ -898,12 +897,15 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 	 * Returns a description of the first statement a file runs at its own file scope.
 	 *
 	 * The file is tokenized rather than loaded, so inspecting it cannot trigger
-	 * the very side effect being looked for. Only a declaration, a namespace, an
-	 * import, a `declare` and an attribute are inert at the top level; anything
-	 * else, from a `require` through an `if` to a bare function call, executes.
+	 * the very side effect being looked for. The classification is deliberately
+	 * conservative: a class, interface or trait declaration, a namespace, an
+	 * import, a `declare` and an attribute are recognised and skipped, and any
+	 * other top-level construct is reported as executing. A construct that is in
+	 * fact harmless - a function or constant declaration, for instance - is
+	 * therefore reported too, which is a false positive this check accepts.
 	 *
-	 * Written independently of the generator on purpose: two implementations that
-	 * agree is a stronger guarantee than one implementation checking itself.
+	 * Written without reference to how the class map generator classifies a file,
+	 * so this side of the contract does not inherit that side's mistakes.
 	 *
 	 * @param string $file Absolute path of the file to inspect.
 	 * @return string|null A description of the first executing statement, or null when there is none.
@@ -1026,7 +1028,9 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 	 *
 	 * @param array $tokens Token list from token_get_all().
 	 * @param int   $index  Index of the declaring keyword.
-	 * @return int|null Index of the first token after the body, or null when the declaration is anonymous.
+	 * @return int|null Index of the first token after the body, or null when the
+	 *                  declaration is anonymous or carries no named declaration
+	 *                  the scan recognises.
 	 */
 	private static function skip_declaration( $tokens, $index ) {
 		$total     = count( $tokens );

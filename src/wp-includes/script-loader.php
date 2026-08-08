@@ -2763,9 +2763,11 @@ function wp_should_load_block_assets_on_demand() {
  * admin screen. Another screen can opt in through the
  * {@see 'should_load_command_palette_assets'} filter.
  *
- * This screens the automatic 'admin_enqueue_scripts' delivery. Admin pages that call
- * {@see wp_enqueue_command_palette_assets()} directly are asking for the Command Palette
- * by name and receive it whatever this function returns.
+ * This screens the automatic 'admin_enqueue_scripts' delivery. An admin page that calls
+ * {@see wp_enqueue_command_palette_assets()} directly, outside that action, is asking for
+ * the Command Palette by name and receives it whatever this function returns. A direct
+ * call made while 'admin_enqueue_scripts' is running is still screened, because that
+ * callback cannot tell the two apart.
  *
  * @since 7.0.0
  * @see wp_should_load_block_editor_scripts_and_styles()
@@ -2791,9 +2793,9 @@ function wp_should_load_command_palette_assets() {
 	 * their dependencies. Returning false skips them, and the Command Palette is not
 	 * available on the screen.
 	 *
-	 * This filter is not applied outside the admin, where the assets are never enqueued,
-	 * and it does not affect admin pages that call {@see wp_enqueue_command_palette_assets()}
-	 * directly rather than relying on 'admin_enqueue_scripts'.
+	 * The filter governs deliveries made while 'admin_enqueue_scripts' is running. It is
+	 * not applied outside the admin, where the assets are never enqueued, and a call to
+	 * {@see wp_enqueue_command_palette_assets()} made outside that action bypasses it.
 	 *
 	 * @since 7.0.0
 	 *
@@ -3556,12 +3558,6 @@ function wp_enqueue_command_palette_assets() {
 		return;
 	}
 
-	/*
-	 * Only the 'admin_enqueue_scripts' delivery is screened. Admin pages that render their
-	 * own document never fire that hook and call this function directly instead, which is an
-	 * explicit request for the Command Palette on a screen that is not a block editor screen.
-	 * Screening those calls would take the Command Palette away from them.
-	 */
 	if ( doing_action( 'admin_enqueue_scripts' ) && ! wp_should_load_command_palette_assets() ) {
 		return;
 	}

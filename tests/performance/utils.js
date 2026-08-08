@@ -33,14 +33,14 @@ const countMetrics = new Set( [
 ] );
 
 /**
- * Status the cache-reset helper answers an authorized reset with, and nothing else does.
+ * Status the cache-reset helper requires of an authorized reset.
  *
  * `tests/performance/wp-content/mu-plugins/server-timing.php` answers an authorized
  * `POST /?clear_cache` with 202 after discarding the opcode cache, the object cache and
- * the expired transients. WordPress itself never sends 202 for that URL, and neither
- * does any status the reset refuses with, so requiring it is what distinguishes a
- * request that was actually reset from one that was refused, or from a front page that
- * merely returned 200 because no reset helper was installed.
+ * the expired transients, and refuses every other shape with 404, 405 or 403. Requiring
+ * 202 is therefore what distinguishes a request the reset handler accepted from one it
+ * refused, or from a front page that merely returned 200 because no reset helper was
+ * installed.
  */
 const CACHE_RESET_STATUS = 202;
 
@@ -49,11 +49,10 @@ const CACHE_RESET_STATUS = 202;
  *
  * A header rather than a query argument, because a reset changes server state for the
  * whole installation: a secret in the URL would be sent by any navigation, prefetch or
- * embedded resource that copied the address, and would be recorded in the access log,
- * the referrer and the browser history. A custom header cannot be set by a cross-origin
- * form or an `img` tag at all, which is what makes the endpoint unreachable by tricking
- * a browser. PHP exposes this name as `$_SERVER['HTTP_X_WP_PERF_CACHE_RESET_TOKEN']`,
- * which is where the mu-plugin reads it.
+ * embedded resource that copied the address, and would appear in the referrer and the
+ * browser history. A cross-origin form submission or an `img` tag cannot set a custom
+ * header either. PHP exposes this name as
+ * `$_SERVER['HTTP_X_WP_PERF_CACHE_RESET_TOKEN']`, which is where the mu-plugin reads it.
  */
 const CACHE_RESET_TOKEN_HEADER = 'X-WP-Perf-Cache-Reset-Token';
 
@@ -90,19 +89,19 @@ function cacheResetTokenPath() {
  * Provisions the secret that authorizes this run's cache resets.
  *
  * The mu-plugin has no reset endpoint until this file exists, so writing it is the
- * explicit, deliberate enable step for the control plane, and `globalTeardown` deletes
- * it again once the workers are done. Nothing is provisioned for an installation that
+ * explicit enable step for the control plane, and `globalTeardown` is what removes it
+ * again once the workers are done. Nothing is provisioned for an installation that
  * merely has the mu-plugin present.
  *
  * Created exclusively, so that two processes reaching this at the same time cannot end
  * up disagreeing about the secret: whoever loses the race reads the winner's file
- * instead of overwriting it. The mode is deliberately world readable, because PHP-FPM
- * runs as a different user than the test runner and has to read it; the file is outside
- * the document root, so the value is reachable by a local process and by nothing over
- * the network.
+ * instead of overwriting it. The mode requested is world readable, because PHP-FPM runs
+ * as a different user than the test runner and has to read it, and the path is outside
+ * the document root the harness serves so that the value is not itself fetchable over
+ * HTTP.
  *
- * The value itself is never returned to a caller that logs, never interpolated into a
- * URL and never attached to a test result.
+ * No caller in this file interpolates the value into a URL, a diagnostic or a test
+ * result.
  *
  * @return {string} The secret for this run.
  */
@@ -134,7 +133,6 @@ function cacheResetToken() {
 	mkdirSync( dirname( path ), { recursive: true } );
 
 	try {
-		// 32 random bytes, hex encoded, so the value satisfies the grammar above.
 		const token = randomBytes( 32 ).toString( 'hex' );
 
 		writeFileSync( path, token, {
@@ -157,11 +155,12 @@ function cacheResetToken() {
 }
 
 /**
- * Withdraws the secret, and with it the reset endpoint.
+ * Withdraws the file-based provisioning of the secret, and this process's cached copy.
  *
- * Called from the global teardown so the control plane exists for exactly the duration
- * of one measured run. The next run provisions a fresh secret, so no value outlives the
- * run that created it.
+ * Called from the global teardown, so the token this run wrote does not outlive it and
+ * the next run provisions a fresh one. A `WP_PERF_CACHE_RESET_TOKEN` constant or
+ * environment variable takes precedence over the file in the mu-plugin, so where one of
+ * those is configured the endpoint stays enabled after this returns.
  *
  * Only the file is removed. Its directory holds other build caches, so removing the
  * directory could take something else with it.
@@ -177,10 +176,11 @@ function revokeCacheResetToken() {
 /**
  * Discards the caches the next measured navigation would otherwise be served from.
  *
- * Every measured sample in this suite is reported as an uncached, cold-compile
- * measurement, and that label is only true if the reset actually happened. Ignoring
- * the response let a missing mu-plugin publish warm samples under an uncached label,
- * so the status is asserted here, once, for every spec.
+ * Every measured sample in this suite is reported as an uncached measurement, so the
+ * status is asserted here, once, for every spec: a 202 is the authorized reset handler
+ * reporting that it ran, and anything else means the caches this navigation is served
+ * from were not discarded. Which layers it discarded is reported separately, in the
+ * `X-WP-Perf-Cache-Reset` response header.
  *
  * A POST through the request API rather than a navigation, because the reset is a
  * state-changing operation that has to be unreachable from anything a browser will do
@@ -192,7 +192,6 @@ function revokeCacheResetToken() {
  * @return {Promise<void>} Resolves once the caches have been discarded.
  */
 async function clearServerCaches( page ) {
-	// Not actually loading a page: the response body is empty by design.
 	const response = await page.request.post( '/?clear_cache', {
 		headers: { [ CACHE_RESET_TOKEN_HEADER ]: cacheResetToken() },
 	} );
@@ -204,11 +203,10 @@ async function clearServerCaches( page ) {
 	}
 
 	/*
-	 * Each refusal has one cause, and the mu-plugin answers each with a status of its
-	 * own, so the reason is reported rather than guessed. The secret is never included
-	 * in any of these messages: the failures are all explained by which file exists and
-	 * which method was used, and a message that quoted the value would put it into the
-	 * run's log and its uploaded artifacts.
+	 * The mu-plugin answers each category of refusal with a status of its own, so the
+	 * message below names that category and the causes it is likely to have rather than
+	 * leaving the caller to guess. None of them quotes the secret: a message that did
+	 * would put the value into the run's log and its uploaded artifacts.
 	 */
 	const reasons = {
 		404: `no cache reset endpoint answered. Either tests/performance/wp-content/mu-plugins/server-timing.php is not installed in the WordPress tree under test, or it could not read the token at ${ cacheResetTokenPath() } — check that the path is beside the installation directory and readable by the web server user.`,
@@ -388,11 +386,12 @@ function parseFile( fileName ) {
 }
 
 /**
- * Computes the median number from an array numbers.
+ * Computes the median number from an array of numbers.
  *
- * An unusable series is rejected rather than medianed. An empty array produced NaN,
- * and a null or undefined sample sorted as though it were zero, so either reached the
- * results table looking like a measurement.
+ * The series has to hold at least one sample and every sample has to be a finite
+ * number: an empty array medians to NaN and a null sorts as zero, so either would
+ * reach the results table looking like a measurement. An unusable series is rejected
+ * rather than medianed.
  *
  * @param {number[]} array
  *
@@ -551,8 +550,8 @@ async function getJavaScriptResponseByteSizes( responses ) {
 /**
  * Returns a Markdown link to a Git commit on the current GitHub repository.
  *
- * For example, turns `a5c3785ed8d6a35868bc169f07e40e889087fd2e`
- * into (https://github.com/wordpress/wordpress-develop/commit/36fe58a8c64dcc83fc21bddd5fcf054aef4efb27)[36fe58a].
+ * For example, turns `a5c3785ed8d6a35868bc169f07e40e889087fd2e` into
+ * [a5c3785](https://github.com/wordpress/wordpress-develop/commit/a5c3785ed8d6a35868bc169f07e40e889087fd2e).
  *
  * @param {string} sha Commit SHA.
  * @return {string} Link.
@@ -592,11 +591,11 @@ function medianAbsoluteDeviation( array = [] ) {
 /**
  * Merges the per-repetition series of one scenario into one series per metric.
  *
- * Accumulating silently was how a metric that stopped being emitted in one repetition
- * kept a shorter series than its siblings, and how a series holding a null reached the
- * median. Both are rejected here as well as in validateResults(), because this function
- * is also reachable from a caller that assembled its results in memory rather than
- * reading them from an artifact.
+ * Every repetition has to expose the same set of metrics, and every series has to be
+ * finite and non-empty, before anything is merged. The same requirements are enforced
+ * in validateResults(), and they are enforced here too because this function is also
+ * reachable from a caller that assembled its results in memory rather than reading them
+ * from an artifact.
  *
  * @param {Array<Record<string, number[]>>} results
  * @return {Record<string, number[]>} Accumulated metric values.

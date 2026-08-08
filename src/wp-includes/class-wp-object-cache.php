@@ -62,20 +62,18 @@ class WP_Object_Cache {
 	/**
 	 * Whether to count hits and misses per group as well as in total.
 	 *
-	 * Off by default, because get() is one of the most frequently called methods in
-	 * a request - a front-end page view reaches it several hundred times - and the
-	 * totals in $cache_hits and $cache_misses answer every question core itself
-	 * asks. Collecting a second, per-group tally on every one of those calls is
-	 * diagnostic work, so it is paid for only when something asks for it.
+	 * Off by default: the per-group tally is diagnostic work on every get(), so it
+	 * is paid for only when something asks for it.
 	 *
-	 * Enable it to find which groups a request actually misses in, for example from
-	 * a debugging plugin or a profiling harness:
+	 * Enable it on the cache object itself, for example from a debugging plugin or
+	 * a profiling harness:
 	 *
-	 *     wp_cache_get_object()->track_group_stats = true;
+	 *     if ( isset( $GLOBALS['wp_object_cache'] ) && $GLOBALS['wp_object_cache'] instanceof WP_Object_Cache ) {
+	 *         $GLOBALS['wp_object_cache']->track_group_stats = true;
+	 *     }
 	 *
 	 * Turning it on part way through a request is supported: the counts then
-	 * describe the calls made from that point on rather than the whole request,
-	 * which is why anything reading them should enable it as early as it can.
+	 * describe the calls made from that point on rather than the whole request.
 	 *
 	 * @since 7.0.0
 	 * @var bool
@@ -98,7 +96,11 @@ class WP_Object_Cache {
 	public $max_tracked_groups = 250;
 
 	/**
-	 * Number of distinct groups left out of $cache_group_stats because of the cap.
+	 * Number of distinct groups counted as left out of $cache_group_stats.
+	 *
+	 * Counting relies on $untracked_groups to recognise a group it has already
+	 * counted, and that register is capped too, so once the register is full this
+	 * stops rising and is a lower bound on the omitted groups rather than a total.
 	 *
 	 * @since 7.0.0
 	 * @var int
@@ -473,8 +475,10 @@ class WP_Object_Cache {
 	 * below is never paid by a request that has not asked for the breakdown.
 	 *
 	 * A group that arrives after $max_tracked_groups groups are already counted is
-	 * not given counters. It is recorded in $untracked_group_count instead, so the
-	 * breakdown reports itself as partial rather than silently omitting the group.
+	 * not given counters. It is added to $untracked_group_count while the register
+	 * of omitted names has room, so the breakdown reports itself as partial rather
+	 * than silently omitting the group; groups arriving after that register is full
+	 * are neither counted nor named.
 	 *
 	 * @since 7.0.0
 	 *
@@ -758,8 +762,9 @@ class WP_Object_Cache {
 	 * $track_group_stats was enabled, since that is what collects them; when it was
 	 * not, the breakdown is reported as unavailable rather than as a row of zeros
 	 * that would read like a group nothing ever asked for. Any group that has
-	 * counters but no current entries, and any group left out by
-	 * $max_tracked_groups, is reported after the list.
+	 * counters but no current entries is listed after the groups, followed by an
+	 * aggregate count of the groups left out by $max_tracked_groups - reported as a
+	 * lower bound when the register of omitted names is full.
 	 *
 	 * @since 2.0.0
 	 * @since 7.0.0 Added the opt-in per-group hit and miss counts.
