@@ -548,11 +548,30 @@ if ( ! is_multisite() && wp_is_fatal_error_handler_enabled() ) {
 	wp_recovery_mode()->initialize();
 }
 
-// To make get_plugin_data() available in a way that's compatible with plugins also loading this file, see #62244.
-require_once ABSPATH . 'wp-admin/includes/plugin.php';
+$_wp_active_plugins = wp_get_active_and_valid_plugins();
+
+/*
+ * To make get_plugin_data() available in a way that's compatible with plugins also
+ * loading this file, see #62244.
+ *
+ * Loaded only where something reaches it. The one caller here is the loop below, which
+ * does not run when no plugin is active, and the admin loads this file again through
+ * wp-admin/includes/admin.php on every screen. On a front-end request of a site with no
+ * active plugin, requiring it here parsed 2,665 lines that nothing then called.
+ *
+ * Deferring it does not make the functions it declares unavailable to a front-end
+ * caller: every one in wp-includes that reaches them - the plugins, block directory and
+ * templates REST controllers, WP_Plugin_Dependencies, WP_Recovery_Mode_Email_Service,
+ * wp_update_plugins() and _wp_connectors_get_connector_script_module_data() - requires
+ * this same file itself before calling, as each did before #62244 added the require
+ * here.
+ */
+if ( $_wp_active_plugins || is_admin() ) {
+	require_once ABSPATH . 'wp-admin/includes/plugin.php';
+}
 
 // Load active plugins.
-foreach ( wp_get_active_and_valid_plugins() as $plugin ) {
+foreach ( $_wp_active_plugins as $plugin ) {
 	wp_register_plugin_realpath( $plugin );
 
 	$plugin_data = get_plugin_data( $plugin, false, false );
@@ -579,7 +598,7 @@ foreach ( wp_get_active_and_valid_plugins() as $plugin ) {
 	 */
 	do_action( 'plugin_loaded', $plugin );
 }
-unset( $plugin, $_wp_plugin_file, $plugin_data, $textdomain );
+unset( $plugin, $_wp_plugin_file, $plugin_data, $textdomain, $_wp_active_plugins );
 
 // Load pluggable functions.
 require ABSPATH . WPINC . '/pluggable.php';
@@ -729,11 +748,28 @@ unset( $theme, $wp_theme );
  */
 do_action( 'after_setup_theme' );
 
-// Create an instance of WP_Site_Health so that Cron events may fire.
-if ( ! class_exists( 'WP_Site_Health' ) ) {
-	require_once ABSPATH . 'wp-admin/includes/class-wp-site-health.php';
+/*
+ * Create an instance of WP_Site_Health so that Cron events may fire.
+ *
+ * Instantiated where something it registers can be reached, rather than on every
+ * request. The constructor schedules the wp_site_health_scheduled_check event and adds
+ * four callbacks, and all four are admin or Cron: admin_body_class,
+ * admin_enqueue_scripts, site_health_tab_content and wp_site_health_scheduled_check.
+ * A front-end request fires none of them, so constructing the instance there parsed
+ * 3,868 lines to register work that request could not do.
+ *
+ * The class stays reachable everywhere it was: it is in the generated class map, so
+ * class_exists( 'WP_Site_Health' ) and WP_Site_Health::get_instance() both resolve on
+ * any request, whichever bootstrap ran. That is what the Site Health REST controller
+ * relies on - create_initial_rest_routes() calls get_instance() itself - and what makes
+ * the require below a fallback for a tree that carries no usable generated map.
+ */
+if ( is_admin() || wp_doing_cron() || ( defined( 'WP_CLI' ) && WP_CLI ) ) {
+	if ( ! class_exists( 'WP_Site_Health' ) ) {
+		require_once ABSPATH . 'wp-admin/includes/class-wp-site-health.php';
+	}
+	WP_Site_Health::get_instance();
 }
-WP_Site_Health::get_instance();
 
 // Set up current user.
 $GLOBALS['wp']->init();

@@ -198,6 +198,23 @@ test.describe( 'Admin', () => {
 
 						if ( url.pathname.endsWith( '.js' ) ) {
 							javaScriptResponses.push( response );
+							return;
+						}
+
+						/*
+						 * The extension is not the only way an admin screen is served
+						 * JavaScript: with CONCATENATE_SCRIPTS in effect the admin
+						 * payload arrives from wp-admin/load-scripts.php, whose pathname
+						 * ends in .php. Matching the declared type as well is what keeps
+						 * this metric from silently under-reporting on such an install.
+						 * The early return above is what keeps a response that satisfies
+						 * both from being counted twice.
+						 */
+						const contentType =
+							response.headers()[ 'content-type' ] ?? '';
+
+						if ( /\b(?:java|ecma)script\b/i.test( contentType ) ) {
+							javaScriptResponses.push( response );
 						}
 					};
 
@@ -254,6 +271,13 @@ test.describe( 'Admin', () => {
 					 * the navigation entry directly keeps this sample independent of the
 					 * paint entries that helper also dereferences, which an admin screen
 					 * need not have recorded by the time the load event fires.
+					 *
+					 * This is a client-side interval, not the page level figure measured
+					 * from navigationStart. The page level figure is not recorded as a
+					 * second metric because it is already the sum of two metrics this
+					 * spec records for the same navigation - timeToFirstByte plus this
+					 * one - so adding it would publish a derived value as if it were an
+					 * independent measurement.
 					 */
 					const domContentLoaded = await page.evaluate( () => {
 						const [ navigation ] =

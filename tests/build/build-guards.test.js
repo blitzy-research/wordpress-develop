@@ -36,7 +36,13 @@ const os = require( 'node:os' );
 const path = require( 'node:path' );
 
 const REPO_DIR = path.resolve( __dirname, '..', '..' );
-const GRUNT_BIN = path.join( REPO_DIR, 'node_modules', 'grunt', 'bin', 'grunt' );
+const GRUNT_BIN = path.join(
+	REPO_DIR,
+	'node_modules',
+	'grunt',
+	'bin',
+	'grunt'
+);
 const GRUNTFILE = path.join( REPO_DIR, 'Gruntfile.js' );
 const GENERATOR = path.join(
 	REPO_DIR,
@@ -45,7 +51,11 @@ const GENERATOR = path.join(
 	'generate-autoload-classmap.php'
 );
 
-const CLASSMAP_PATH = path.join( 'src', 'wp-includes', 'autoload-classmap.php' );
+const CLASSMAP_PATH = path.join(
+	'src',
+	'wp-includes',
+	'autoload-classmap.php'
+);
 const EMOJI_PATH = path.join( 'src', 'wp-includes', 'emoji-arrays.php' );
 const EMOJI_START = '// START: emoji arrays';
 const EMOJI_END = '// END: emoji arrays';
@@ -99,17 +109,18 @@ const SANDBOX_MANIFEST = {
  * @type {Object<string, string>}
  */
 const SOURCE_TREE = {
-	'src/wp-settings.php': "<?php\nrequire ABSPATH . WPINC . '/autoload.php';\n",
+	'src/wp-settings.php':
+		"<?php\nrequire ABSPATH . WPINC . '/autoload.php';\n",
 	'src/wp-includes/autoload.php':
 		"<?php\n$core_prefixes = array( 'wp' );\nfunction wp_autoload_class( $name ) {\n\treturn;\n}\nspl_autoload_register( 'wp_autoload_class' );\n",
-	'src/wp-includes/class-wp-alpha.php': "<?php\nclass WP_Alpha {}\n",
-	'src/wp-includes/class-wp-beta.php': "<?php\nclass WP_Beta {}\n",
+	'src/wp-includes/class-wp-alpha.php': '<?php\nclass WP_Alpha {}\n',
+	'src/wp-includes/class-wp-beta.php': '<?php\nclass WP_Beta {}\n',
 	'src/wp-includes/blocks/class-wp-excluded.php':
-		"<?php\nclass WP_Excluded {}\n",
+		'<?php\nclass WP_Excluded {}\n',
 	'src/wp-admin/includes/class-wp-site-health.php':
-		"<?php\nclass WP_Site_Health {}\n",
+		'<?php\nclass WP_Site_Health {}\n',
 	'src/wp-admin/includes/class-wp-site-health-auto-updates.php':
-		"<?php\nclass WP_Site_Health_Auto_Updates {}\n",
+		'<?php\nclass WP_Site_Health_Auto_Updates {}\n',
 };
 
 /**
@@ -276,7 +287,10 @@ exit( (int) $scenario['exit'] );
 function digestLine( entries, contents ) {
 	return `AUTOLOAD_CLASSMAP_DIGEST entries=${ entries } bytes=${ Buffer.byteLength(
 		contents
-	) } sha256=${ crypto.createHash( 'sha256' ).update( contents ).digest( 'hex' ) }`;
+	) } sha256=${ crypto
+		.createHash( 'sha256' )
+		.update( contents )
+		.digest( 'hex' ) }`;
 }
 
 /**
@@ -308,7 +322,8 @@ function emojiDataFile( regions ) {
 	}
 
 	if ( 0 === regions ) {
-		body += "\t$entities = array( '&#x1f600;' );\n\t$partials = array( '&#x1f600;' );\n";
+		body +=
+			"\t$entities = array( '&#x1f600;' );\n\t$partials = array( '&#x1f600;' );\n";
 	}
 
 	return `${ body }\nreturn array(\n\t'entities' => $entities,\n\t'partials' => $partials,\n);\n`;
@@ -424,7 +439,10 @@ test( 'the class map task accepts the map the generator published', ( t ) => {
 		`The task must report the number of entries it verified. It reported:\n${ result.output }`
 	);
 
-	const published = fs.readFileSync( path.join( root, CLASSMAP_PATH ), 'utf8' );
+	const published = fs.readFileSync(
+		path.join( root, CLASSMAP_PATH ),
+		'utf8'
+	);
 
 	assert.match(
 		published,
@@ -622,7 +640,8 @@ test( 'the class map generator rewrites nothing on a second run', ( t ) => {
 test( 'the class map generator refuses a name two files declare', ( t ) => {
 	const root = createSandbox( {
 		...SOURCE_TREE,
-		'src/wp-includes/class-wp-alpha-again.php': "<?php\nclass WP_Alpha {}\n",
+		'src/wp-includes/class-wp-alpha-again.php':
+			'<?php\nclass WP_Alpha {}\n',
 	} );
 	t.after( () => fs.rmSync( root, { recursive: true, force: true } ) );
 
@@ -689,7 +708,10 @@ test( 'the marker gate refuses a missing data file', ( t ) => {
 } );
 
 test( 'the shipped emoji data file carries exactly one generated region', () => {
-	const shipped = fs.readFileSync( path.join( REPO_DIR, EMOJI_PATH ), 'utf8' );
+	const shipped = fs.readFileSync(
+		path.join( REPO_DIR, EMOJI_PATH ),
+		'utf8'
+	);
 	const regions = shipped.match(
 		new RegExp( `${ EMOJI_START }[\\S\\s]*?${ EMOJI_END }`, 'g' )
 	);

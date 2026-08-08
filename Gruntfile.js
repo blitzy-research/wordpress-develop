@@ -2224,7 +2224,8 @@ module.exports = function(grunt) {
 				'precommit:css',
 				'precommit:image',
 				'precommit:emoji',
-				'precommit:php'
+				'precommit:php',
+				'verify:build-guards'
 			]);
 
 			done();
@@ -2467,6 +2468,12 @@ module.exports = function(grunt) {
 		 * therefore sequenced ahead of build:files, which copies that result into
 		 * BUILD_DIR.
 		 *
+		 * This is the one part of the build that needs a `php` on PATH - here and for
+		 * the `php -l` check below - which the rest of the build does not. A host
+		 * without one is reported as that rather than as an opaque spawn failure,
+		 * because the message is the only thing telling a reader which dependency is
+		 * missing.
+		 *
 		 * Its output is captured rather than inherited, because the last line it
 		 * prints is a digest of the map it rendered. That digest is what lets this
 		 * task accept the file on disk only when the file *is* that map: a nonzero
@@ -2486,6 +2493,12 @@ module.exports = function(grunt) {
 
 			if ( result && result.stderr ) {
 				grunt.log.error( result.stderr );
+			}
+
+			if ( error && 'ENOENT' === error.code ) {
+				grunt.log.error( 'No `php` executable was found on PATH. Generating the autoload class map needs one, because the generator uses PHP\'s own tokenizer to inspect the source tree.' );
+				done( false );
+				return;
 			}
 
 			if ( error ) {
@@ -2547,6 +2560,12 @@ module.exports = function(grunt) {
 
 			// A map the PHP parser rejects would turn the first autoload attempt into a fatal error.
 			lint = spawn( 'php', [ '-l', file ], { encoding: 'utf8' } );
+
+			if ( lint.error && 'ENOENT' === lint.error.code ) {
+				grunt.log.error( 'No `php` executable was found on PATH, so the generated autoload class map cannot be linted; refusing to accept it unchecked.' );
+				done( false );
+				return;
+			}
 
 			if ( 0 !== lint.status ) {
 				grunt.log.error( `${ lint.stdout || '' }${ lint.stderr || '' }` );
@@ -2640,7 +2659,6 @@ module.exports = function(grunt) {
 	grunt.registerTask( 'verify:build', [
 		'verify:old-files',
 		'verify:source-maps',
-		'verify:build-guards',
 	] );
 
 	/**
@@ -2655,6 +2673,11 @@ module.exports = function(grunt) {
 	 * build that happens to go wrong.
 	 *
 	 * Run with Node's own test runner, so this adds no dependency and no configuration.
+	 *
+	 * Reached from `precommit` rather than from `verify:build`: the cases spawn real Grunt
+	 * subprocesses against sandbox trees, which is a check on the tasks themselves rather
+	 * than on the build output, and putting it in `build` would add that failure surface to
+	 * every production build and to every workflow that runs one.
 	 *
 	 * @since 7.0.0
 	 */
@@ -2821,7 +2844,9 @@ module.exports = function(grunt) {
 		'precommit:php',
 		'precommit:js',
 		'precommit:css',
-		'precommit:image'
+		'precommit:image',
+		// Reached whenever this file changes, which is when a build task guard can break.
+		'verify:build-guards'
 	] );
 
 	// Testing tasks.

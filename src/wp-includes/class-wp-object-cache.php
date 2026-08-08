@@ -760,8 +760,9 @@ class WP_Object_Cache {
 	 *
 	 * Per-group hit and miss counts are printed alongside each group only when
 	 * $track_group_stats was enabled, since that is what collects them; when it was
-	 * not, the breakdown is reported as unavailable rather than as a row of zeros
-	 * that would read like a group nothing ever asked for. Any group that has
+	 * not, nothing about them is printed - the output is what it has always been,
+	 * rather than a row of zeros that would read like a group nothing ever asked for
+	 * or a notice on a default path that never carried one. Any group that has
 	 * counters but no current entries is listed after the groups, followed by an
 	 * aggregate count of the groups left out by $max_tracked_groups - reported as a
 	 * lower bound when the register of omitted names is full.
@@ -789,8 +790,12 @@ class WP_Object_Cache {
 		}
 		echo '</ul>';
 
+		/*
+		 * Nothing further is printed when the breakdown was not collected, so the
+		 * default output of this public method is exactly what it was before the
+		 * per-group counters existed.
+		 */
 		if ( ! $this->track_group_stats ) {
-			echo '<p>Per-group hit and miss counts were not collected. Set <code>$track_group_stats</code> on the cache object to collect them.</p>';
 			return;
 		}
 

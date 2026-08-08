@@ -376,6 +376,8 @@ function wp_autoload_classmap_normalize_tokens( $tokens ) {
  *
  * @param string $message Reason the class map cannot be generated.
  *
+ * @return never
+ *
  * @throws RuntimeException Always.
  */
 function wp_autoload_classmap_fail( $message ) {

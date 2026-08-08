@@ -100,6 +100,15 @@ function cacheResetTokenPath() {
  * the document root the harness serves so that the value is not itself fetchable over
  * HTTP.
  *
+ * World readable is what that trade buys, and it is the reason the secret is scoped the
+ * way it is: any local user of the host can read this file for as long as it exists, and
+ * what it authorizes is flushing the caches of a throwaway test installation. It exists
+ * only while the suite runs - `globalTeardown` deletes it - and it is regenerated per
+ * run, so it is not a credential to anything that outlives the run. A deployment where a
+ * local user reading it would matter should point
+ * `WP_PERF_CACHE_RESET_TOKEN_FILE` at a path readable only by the runner and the PHP
+ * user, which both this file and the mu-plugin honour.
+ *
  * No caller in this file interpolates the value into a URL, a diagnostic or a test
  * result.
  *

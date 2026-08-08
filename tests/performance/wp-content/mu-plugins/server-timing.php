@@ -93,6 +93,11 @@ function wp_perf_cache_reset_token() {
  * step, and the ladder fails closed:
  *
  * - 404 when no token has been provisioned, disclosing nothing about the installation.
+ * - 404 when the unauthenticated `clear-cache.php` is provisioned alongside this file,
+ *   for the reason given in wp_perf_reset_caches(): that file answers first, so serving
+ *   the authorized plane in the same installation would report an authorization this
+ *   installation does not actually have. Refusing makes the harness fail on the missing
+ *   reset rather than measure in an installation that exposes an unauthenticated one.
  * - 405 for any method other than POST, so a reset is not reachable by navigation,
  *   prefetch, image load or link preview.
  * - 403 when the presented secret is absent or does not match, compared with
@@ -115,6 +120,14 @@ function wp_perf_cache_reset_status( $method, $presented ) {
 	$token = wp_perf_cache_reset_token();
 
 	if ( '' === $token ) {
+		return 404;
+	}
+
+	/*
+	 * Answered as unprovisioned, not as refused: the two files cannot both own this
+	 * endpoint, and the one that loads first is the unauthenticated one.
+	 */
+	if ( is_readable( __DIR__ . '/clear-cache.php' ) ) {
 		return 404;
 	}
 

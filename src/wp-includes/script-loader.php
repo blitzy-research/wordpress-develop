@@ -2769,9 +2769,24 @@ function wp_should_load_block_assets_on_demand() {
  * call made while 'admin_enqueue_scripts' is running is still screened, because that
  * callback cannot tell the two apart.
  *
+ * Two consequences follow on a screen this function declines, and both are intended:
+ *
+ * - `wp.commands` and `wp.coreCommands` are not defined there, because the scripts that
+ *   define them are the scripts that were not enqueued.
+ * - The admin bar's Ctrl+K button is not rendered there. Both callbacks that add it -
+ *   {@see wp_admin_bar_command_palette_menu()} and the Gutenberg plugin's equivalent -
+ *   return early unless `wp-core-commands` is enqueued, so the button never appears
+ *   without the code behind it.
+ *
+ * Reverting to the previous behaviour, where every admin screen received the bundles,
+ * takes one line and no core change:
+ *
+ *     add_filter( 'should_load_command_palette_assets', '__return_true' );
+ *
  * @since 7.0.0
  * @see wp_should_load_block_editor_scripts_and_styles()
  * @see wp_enqueue_command_palette_assets()
+ * @see wp_admin_bar_command_palette_menu()
  *
  * @global WP_Screen $current_screen WordPress current screen object.
  *
@@ -2796,6 +2811,9 @@ function wp_should_load_command_palette_assets() {
 	 * The filter governs deliveries made while 'admin_enqueue_scripts' is running. It is
 	 * not applied outside the admin, where the assets are never enqueued, and a call to
 	 * {@see wp_enqueue_command_palette_assets()} made outside that action bypasses it.
+	 *
+	 * Returning true unconditionally restores the delivery every admin screen had before
+	 * this function existed, including `wp.commands` and the admin bar's Ctrl+K button.
 	 *
 	 * @since 7.0.0
 	 *

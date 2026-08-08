@@ -5900,18 +5900,27 @@ function wp_enqueue_emoji_styles() {
  * render the emoji that WordPress recognises and, when it is not, loads the emoji
  * replacement script so that those characters are swapped for images.
  *
- * The script is skipped by default and can be printed again, either globally or for a
- * single request, through the {@see 'should_load_emoji_detection_script'} filter.
+ * It is skipped by default on the front end, where it was measured: the settings object
+ * and the inlined loader are the largest fixed block in the document head of a page that
+ * may contain no emoji at all. It is printed by default everywhere else it is hooked -
+ * the admin and oEmbed templates - because the cost was not measured there and turning it
+ * off would change those screens without a measurement behind it. Any context can be
+ * decided differently, globally or for a single request, through the
+ * {@see 'should_load_emoji_detection_script'} filter, which receives the context.
  *
- * Server-side emoji handling is not affected. Feeds and email are still processed by
- * wp_staticize_emoji() and wp_staticize_emoji_for_email(), and the emoji styles are still
- * enqueued by wp_enqueue_emoji_styles().
+ * Server-side emoji handling is not affected in any context. Feeds and email are still
+ * processed by wp_staticize_emoji() and wp_staticize_emoji_for_email(), and the emoji
+ * styles are still enqueued by wp_enqueue_emoji_styles().
  *
  * @since 7.0.0
  *
+ * @param string $context Optional. Where the script would be printed. Accepts 'front',
+ *                        'admin' or 'embed'. Default 'front'.
  * @return bool Whether the emoji detection script should be printed.
  */
-function wp_should_load_emoji_detection_script() {
+function wp_should_load_emoji_detection_script( $context = 'front' ) {
+	$should_load = ( 'front' !== $context );
+
 	/**
 	 * Filters whether the inline emoji detection script is printed.
 	 *
@@ -5921,9 +5930,12 @@ function wp_should_load_emoji_detection_script() {
 	 *
 	 * @since 7.0.0
 	 *
-	 * @param bool $should_load Current value of the flag. Default false.
+	 * @param bool   $should_load Current value of the flag. Default false in the 'front'
+	 *                            context, true in every other context.
+	 * @param string $context     Where the script would be printed. One of 'front',
+	 *                            'admin' or 'embed'.
 	 */
-	return apply_filters( 'should_load_emoji_detection_script', false );
+	return (bool) apply_filters( 'should_load_emoji_detection_script', $should_load, $context );
 }
 
 /**
@@ -5933,13 +5945,32 @@ function wp_should_load_emoji_detection_script() {
  * @since 7.0.0 The script is only printed when wp_should_load_emoji_detection_script() returns true.
  */
 function print_emoji_detection_script() {
-	if ( ! wp_should_load_emoji_detection_script() ) {
-		return;
-	}
-
 	static $printed = false;
 
 	if ( $printed ) {
+		return;
+	}
+
+	/*
+	 * Derived here rather than taken as an argument, because this function is a hook
+	 * callback on wp_head, embed_head and admin_print_scripts, none of which passes one.
+	 * embed_head is checked before is_admin(), so an oEmbed template is reported as
+	 * 'embed' wherever it is rendered.
+	 */
+	if ( doing_action( 'embed_head' ) ) {
+		$context = 'embed';
+	} elseif ( is_admin() ) {
+		$context = 'admin';
+	} else {
+		$context = 'front';
+	}
+
+	/*
+	 * Checked after the guard above and before $printed is set, so a request that
+	 * declines the script does not consume the one-shot: a filter that turns it on later
+	 * in the same request still gets it printed once.
+	 */
+	if ( ! wp_should_load_emoji_detection_script( $context ) ) {
 		return;
 	}
 

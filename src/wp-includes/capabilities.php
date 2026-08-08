@@ -43,6 +43,86 @@
  * @return string[] Primitive capabilities required of the user.
  */
 function map_meta_cap( $cap, $user_id, ...$args ) {
+	/*
+	 * Results of the post edit and delete arms, keyed on every input those arms read.
+	 *
+	 * Those arms are re-entered with identical arguments many times in one request: a list
+	 * table asks for edit_post and delete_post per row and again for each row action, and
+	 * every get_edit_post_link() in a loop asks again. Each entry costs a post lookup, a
+	 * post type object lookup and a walk through the arm, and the answer cannot differ
+	 * between two calls whose inputs are the same.
+	 *
+	 * The key is what makes this a memo rather than a cache, so there is nothing to
+	 * invalidate: it carries the capability, the user, the post's id, type, status, author
+	 * and parent, the capability map of the registered post type, and the privacy policy
+	 * page setting. A request in which any of those changes computes a new entry rather
+	 * than reading the old one.
+	 *
+	 * Only the value the switch produces is memoized. The 'map_meta_cap' filter is applied
+	 * to every call, on this path as much as on the computed one, so a callback added part
+	 * way through a request still sees every check, and a callback that answers differently
+	 * for identical arguments still decides every call itself.
+	 */
+	static $memo = array();
+
+	/*
+	 * The arms this memo covers. read_post and read_page are deliberately absent: they
+	 * resolve the status through get_post_status(), which inherits from the parent post and
+	 * is itself filterable, so their result depends on inputs a key of the post's own
+	 * fields does not describe.
+	 */
+	static $memoized_caps = array(
+		'delete_page' => true,
+		'delete_post' => true,
+		'edit_page'   => true,
+		'edit_post'   => true,
+	);
+
+	$memo_key = null;
+
+	if ( isset( $args[0] ) && 1 === count( $args ) && isset( $memoized_caps[ $cap ] ) ) {
+		$memo_post      = get_post( $args[0] );
+		$memo_post_type = $memo_post instanceof WP_Post ? get_post_type_object( $memo_post->post_type ) : null;
+
+		/*
+		 * Every case the arms answer from something the key does not hold is excluded, so
+		 * that the memo is never the reason two identical checks disagree:
+		 *
+		 * - A post that does not resolve, or whose type is not registered, is answered
+		 *   through _doing_it_wrong(), and a notice has to be raised each time it happens.
+		 * - A revision is answered from its parent post.
+		 * - A trashed post is answered from its _wp_trash_meta_status meta value.
+		 * - The privacy policy page merges in the result of a second map_meta_cap() call,
+		 *   which is filtered in its own right.
+		 */
+		if ( $memo_post instanceof WP_Post
+			&& $memo_post_type instanceof WP_Post_Type
+			&& 'revision' !== $memo_post->post_type
+			&& 'trash' !== $memo_post->post_status
+			&& (int) get_option( 'wp_page_for_privacy_policy' ) !== (int) $memo_post->ID
+		) {
+			$memo_key = implode(
+				'|',
+				array(
+					$cap,
+					(string) $user_id,
+					(string) $memo_post->ID,
+					$memo_post->post_type,
+					$memo_post->post_status,
+					(string) $memo_post->post_author,
+					(string) $memo_post->post_parent,
+					$memo_post_type->map_meta_cap ? '1' : '0',
+					implode( ',', (array) $memo_post_type->cap ),
+				)
+			);
+
+			if ( isset( $memo[ $memo_key ] ) ) {
+				/** This filter is documented at the end of this function. */
+				return apply_filters( 'map_meta_cap', $memo[ $memo_key ][0], $memo[ $memo_key ][1], $user_id, $args );
+			}
+		}
+	}
+
 	$caps = array();
 
 	switch ( $cap ) {
@@ -876,6 +956,11 @@ function map_meta_cap( $cap, $user_id, ...$args ) {
 	 * @param array    $args    Adds context to the capability check, typically
 	 *                          starting with an object ID.
 	 */
+	if ( null !== $memo_key ) {
+		// $cap as well as $caps: the arms above reassign it for a post type that maps its own.
+		$memo[ $memo_key ] = array( $caps, $cap );
+	}
+
 	return apply_filters( 'map_meta_cap', $caps, $cap, $user_id, $args );
 }
 
