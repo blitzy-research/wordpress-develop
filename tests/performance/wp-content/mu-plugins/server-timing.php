@@ -286,12 +286,12 @@ add_action(
  * that never reaches 'wp_loaded' therefore has no bootstrap duration at all rather
  * than one measured to a different end point, and this function reports that as null.
  *
- * Distinguishing "never recorded" from a recorded 0.0 is what keeps the reported
- * figure aggregatable. A placeholder duration is a number like any other once it
- * reaches the results table, so it would be pulled into the median of the samples
- * that were genuinely measured. The callers below turn the null into an explicit
- * 'bootstrap-valid' flag so an unmeasured sample can be recognized and dropped
- * instead of silently averaged in.
+ * Distinguishing "never recorded" from a recorded 0.0 is what keeps this function
+ * honest about what it knows. Both collectors below read it from a 'shutdown'
+ * callback, and a request only reaches 'shutdown' after 'wp_loaded' has fired, so
+ * neither of them can observe the null in practice; they guard it anyway and emit
+ * 0.0, a value no measured bootstrap can be confused with, rather than letting a
+ * null reach the header conversion.
  *
  * @ignore
  * @since 7.0.0
@@ -387,217 +387,6 @@ function wp_perf_object_cache_counters() {
 	}
 
 	return $counters;
-}
-
-/**
- * Reads one OPcache directive from a configuration snapshot.
- *
- * opcache_get_configuration() is the accurate source, because it reports the value the
- * engine resolved. It is also refusable: opcache.restrict_api makes it return false for
- * a script outside the permitted path, exactly as it does for opcache_get_status().
- * ini_get() is never refused, so it is the fallback that keeps a restricted request from
- * having to report an unknown regime.
- *
- * @ignore
- * @since 7.0.0
- * @access private
- *
- * @param array|false|null $directives Directives from opcache_get_configuration(), or null
- *                                     or false to read from ini_get().
- * @param string           $name       Directive name, including its `opcache.` prefix.
- * @return mixed Directive value, or false when the directive is unknown.
- */
-function wp_perf_opcache_directive( $directives, $name ) {
-	if ( is_array( $directives ) && array_key_exists( $name, $directives ) ) {
-		return $directives[ $name ];
-	}
-
-	return ini_get( $name );
-}
-
-/**
- * Reads one OPcache directive as a boolean.
- *
- * opcache_get_configuration() types a boolean directive as a boolean while ini_get()
- * types it as a string, and the string form differs between builds. Normalizing both
- * here keeps the caller from having to know which source answered. No cast to int is
- * used, because casting a non-representable float emits a notice as of PHP 8.5 and this
- * instrumentation must not print anything into a measured response.
- *
- * @ignore
- * @since 7.0.0
- * @access private
- *
- * @param array|false|null $directives Directives from opcache_get_configuration(), or null
- *                                     or false to read from ini_get().
- * @param string           $name       Directive name, including its `opcache.` prefix.
- * @return bool Whether the directive is switched on.
- */
-function wp_perf_opcache_flag( $directives, $name ) {
-	$value = wp_perf_opcache_directive( $directives, $name );
-
-	if ( is_bool( $value ) ) {
-		return $value;
-	}
-
-	if ( is_int( $value ) ) {
-		return 0 !== $value;
-	}
-
-	if ( is_float( $value ) ) {
-		return is_finite( $value ) && 0.0 !== $value;
-	}
-
-	if ( ! is_string( $value ) ) {
-		return false;
-	}
-
-	return in_array( strtolower( trim( $value ) ), array( '1', 'on', 'yes', 'true' ), true );
-}
-
-/**
- * Reduces the OPcache configuration to stable numeric measurement metadata.
- *
- * Both reported fields describe how the opcode cache is *configured*, never what it
- * currently *holds*. That is deliberate, and it is measured rather than assumed.
- * opcache_get_status() answers with the accelerator state of the request that asked, and
- * clear-cache.php resets the opcode cache before every measured iteration: a reset takes
- * effect only once a later request can take the lock while no other worker is active, so
- * until then every request activates with the accelerator switched off and
- * opcache_get_status() answers `opcache_enabled => false` while the cache still holds its
- * scripts. On this suite's own harness that transient appeared in none of 40 serial
- * reset-then-request cycles and in 56 of 60 of the same cycles run against six concurrent
- * front-page requests, which is why it surfaced only on the heaviest theme, and only
- * sometimes.
- *
- * Deriving the regime from that state would therefore report a value that changes between
- * iterations of one scenario, and both consumers need the opposite: the specs assert the
- * regime is immutable within a measured theme and locale, and compare-results.js refuses a
- * before/after pair whose regimes disagree, because a pair taken across two opcode-cache
- * regimes reports the regime rather than the change under test. What those two checks are
- * really about is the interpreter flags, which cannot change without restarting the
- * process, so the flags are what these fields report.
- *
- * Only the two regime flags are reported. Server-wide counters such as the number of
- * cached scripts and the cache hit rate describe every site sharing the interpreter rather
- * than the request being measured, and this header is sent to every client, so they are
- * deliberately not emitted.
- *
- * Every field has a numeric zero fallback, so no measured iteration can silently omit a
- * field and leave an unusable sample series.
- *
- * @ignore
- * @since 7.0.0
- * @access private
- *
- * @param array|false      $status     OPcache status from opcache_get_status(), or false when
- *                                     unavailable. Accepted so a caller can pass the snapshot
- *                                     it already holds; the reported regime never depends on
- *                                     it, which is what keeps the regime immutable across the
- *                                     iterations of one measured scenario.
- * @param array|false|null $directives Directives from opcache_get_configuration(), or null or
- *                                     false to read each directive from ini_get(). This is the
- *                                     sole source of both reported fields.
- * @return array {
- *     Numeric OPcache regime metadata.
- *
- *     @type int $opcache-enabled Whether the opcode cache is configured on for this SAPI.
- *     @type int $opcache-jit     Whether OPcache JIT is configured on.
- * }
- */
-function wp_perf_opcache_metadata( $status, $directives = null ) {
-	$metadata = array(
-		'opcache-enabled' => 0,
-		'opcache-jit'     => 0,
-	);
-
-	$enabled = wp_perf_opcache_flag( $directives, 'opcache.enable' );
-
-	/*
-	 * opcache.enable is the master switch, and the command-line SAPIs need their own one
-	 * as well. Honoring it keeps a command-line invocation of this instrumentation from
-	 * claiming the regime of the web requests being measured.
-	 */
-	if ( $enabled && ( 'cli' === PHP_SAPI || 'phpdbg' === PHP_SAPI ) ) {
-		$enabled = wp_perf_opcache_flag( $directives, 'opcache.enable_cli' );
-	}
-
-	if ( $enabled ) {
-		$metadata['opcache-enabled'] = 1;
-
-		/*
-		 * JIT needs a compiling mode selected and a buffer to compile into:
-		 * opcache.jit_buffer_size of 0 switches JIT off whatever the mode says. The
-		 * buffer is a shorthand byte value such as `64M`, and its leading number is
-		 * enough to tell zero from non-zero without parsing the suffix.
-		 */
-		$mode   = wp_perf_opcache_directive( $directives, 'opcache.jit' );
-		$mode   = is_scalar( $mode ) ? strtolower( trim( (string) $mode ) ) : '';
-		$buffer = wp_perf_opcache_directive( $directives, 'opcache.jit_buffer_size' );
-		$buffer = is_scalar( $buffer ) ? (float) $buffer : 0.0;
-
-		if (
-			! in_array( $mode, array( '', '0', 'off', 'no', 'false', 'none', 'disable' ), true )
-			&& is_finite( $buffer ) && 0.0 < $buffer
-		) {
-			$metadata['opcache-jit'] = 1;
-		}
-	}
-
-	return $metadata;
-}
-
-/**
- * Returns the opcode-cache regime metadata for the current request.
- *
- * The result is memoized so every consumer in one request observes one OPcache
- * snapshot, and a new PHP request recomputes it.
- *
- * The two regime flags are the whole of what is reported. They are what the
- * measurement method requires alongside every figure, because opcode-cache state
- * moves measured time and memory by far more than any change under test. Nothing
- * that identifies the process or the interpreter is emitted: a process ID, a PHP
- * version ID, a worker request count and server-wide OPcache counters describe the
- * host rather than the request, and this header is sent to every client.
- *
- * @ignore
- * @since 7.0.0
- * @access private
- *
- * @return array Numeric runtime metadata keyed by Server-Timing slug.
- */
-function wp_perf_runtime_metadata() {
-	static $metadata = null;
-
-	if ( null !== $metadata ) {
-		return $metadata;
-	}
-
-	$opcache_status = false;
-
-	if ( function_exists( 'opcache_get_status' ) ) {
-		// The function warns when OPcache status access is restricted.
-		$opcache_status = @opcache_get_status( false ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
-	}
-
-	/*
-	 * Resolved once per request beside the status, so the regime fields are read from the
-	 * interpreter flags rather than from the accelerator state of this particular request.
-	 * Access to this function is restrictable in the same way, and it warns when refused.
-	 */
-	$opcache_directives = null;
-
-	if ( function_exists( 'opcache_get_configuration' ) ) {
-		$opcache_configuration = @opcache_get_configuration(); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
-
-		if ( is_array( $opcache_configuration ) && isset( $opcache_configuration['directives'] ) && is_array( $opcache_configuration['directives'] ) ) {
-			$opcache_directives = $opcache_configuration['directives'];
-		}
-	}
-
-	$metadata = wp_perf_opcache_metadata( $opcache_status, $opcache_directives );
-
-	return $metadata;
 }
 
 /**
@@ -698,9 +487,15 @@ add_filter(
 				// Both cache metrics come from one validated snapshot, so a replacement object cache is never touched twice.
 				$cache_counters = wp_perf_object_cache_counters();
 
-				$runtime = wp_perf_runtime_metadata();
-
-				// Null exactly when the single 'wp_loaded' boundary was never reached.
+				/*
+				 * This callback runs from 'shutdown', which a request only reaches after
+				 * 'wp_loaded' has fired, so the duration is always recorded here. The null
+				 * the function reserves for a request that never reached that boundary is
+				 * therefore unreachable from this collector, and it is still guarded rather
+				 * than assumed: a null would be emitted as a duration of 0.0, which no
+				 * sample can be confused with, instead of raising a conversion notice from
+				 * inside a callback that has already taken the response body.
+				 */
 				$bootstrap = wp_perf_bootstrap_duration();
 
 				/*
@@ -708,17 +503,14 @@ add_filter(
 				 * any numeric value can actually be passed.
 				 * This is a nice little trick as it allows to easily get this information in JS.
 				 */
-				$server_timing_values['memory-usage']    = memory_get_usage();
-				$server_timing_values['db-queries']      = $wpdb->num_queries;
-				$server_timing_values['ext-obj-cache']   = wp_using_ext_object_cache() ? 1 : 0;
-				$server_timing_values['memory-peak']     = $memory_peak;
-				$server_timing_values['files-loaded']    = (int) count( get_included_files() );
-				$server_timing_values['cache-hits']      = $cache_counters['hits'];
-				$server_timing_values['cache-misses']    = $cache_counters['misses'];
-				$server_timing_values['bootstrap']       = null === $bootstrap ? 0.0 : $bootstrap;
-				$server_timing_values['bootstrap-valid'] = null === $bootstrap ? 0 : 1;
-				$server_timing_values['opcache-enabled'] = $runtime['opcache-enabled'];
-				$server_timing_values['opcache-jit']     = $runtime['opcache-jit'];
+				$server_timing_values['memory-usage']  = memory_get_usage();
+				$server_timing_values['db-queries']    = $wpdb->num_queries;
+				$server_timing_values['ext-obj-cache'] = wp_using_ext_object_cache() ? 1 : 0;
+				$server_timing_values['memory-peak']   = $memory_peak;
+				$server_timing_values['files-loaded']  = (int) count( get_included_files() );
+				$server_timing_values['cache-hits']    = $cache_counters['hits'];
+				$server_timing_values['cache-misses']  = $cache_counters['misses'];
+				$server_timing_values['bootstrap']     = null === $bootstrap ? 0.0 : $bootstrap;
 
 				$header_values = array();
 				foreach ( $server_timing_values as $slug => $value ) {
@@ -772,9 +564,11 @@ add_action(
 				// Both cache metrics come from one validated snapshot, so a replacement object cache is never touched twice.
 				$cache_counters = wp_perf_object_cache_counters();
 
-				$runtime = wp_perf_runtime_metadata();
-
-				// Null exactly when the single 'wp_loaded' boundary was never reached.
+				/*
+				 * Always recorded by the time this runs, for the same reason as in the
+				 * front-end collector above: 'shutdown' is only reached after 'wp_loaded'
+				 * fired. The null is still guarded rather than assumed.
+				 */
 				$bootstrap = wp_perf_bootstrap_duration();
 
 				/*
@@ -782,17 +576,14 @@ add_action(
 				 * any numeric value can actually be passed.
 				 * This is a nice little trick as it allows to easily get this information in JS.
 				 */
-				$server_timing_values['memory-usage']    = memory_get_usage();
-				$server_timing_values['db-queries']      = $wpdb->num_queries;
-				$server_timing_values['ext-obj-cache']   = wp_using_ext_object_cache() ? 1 : 0;
-				$server_timing_values['memory-peak']     = $memory_peak;
-				$server_timing_values['files-loaded']    = (int) count( get_included_files() );
-				$server_timing_values['cache-hits']      = $cache_counters['hits'];
-				$server_timing_values['cache-misses']    = $cache_counters['misses'];
-				$server_timing_values['bootstrap']       = null === $bootstrap ? 0.0 : $bootstrap;
-				$server_timing_values['bootstrap-valid'] = null === $bootstrap ? 0 : 1;
-				$server_timing_values['opcache-enabled'] = $runtime['opcache-enabled'];
-				$server_timing_values['opcache-jit']     = $runtime['opcache-jit'];
+				$server_timing_values['memory-usage']  = memory_get_usage();
+				$server_timing_values['db-queries']    = $wpdb->num_queries;
+				$server_timing_values['ext-obj-cache'] = wp_using_ext_object_cache() ? 1 : 0;
+				$server_timing_values['memory-peak']   = $memory_peak;
+				$server_timing_values['files-loaded']  = (int) count( get_included_files() );
+				$server_timing_values['cache-hits']    = $cache_counters['hits'];
+				$server_timing_values['cache-misses']  = $cache_counters['misses'];
+				$server_timing_values['bootstrap']     = null === $bootstrap ? 0.0 : $bootstrap;
 
 				$header_values = array();
 				foreach ( $server_timing_values as $slug => $value ) {

@@ -35,8 +35,7 @@
  *              and `update_https` capabilities.
  * @since 6.7.0 Added the `edit_block_binding` capability.
  *
- * @global array $post_type_meta_caps   Used to get post type meta capabilities.
- * @global array $_wp_map_meta_cap_memo Request-scoped memo of resolved capability mappings.
+ * @global array $post_type_meta_caps Used to get post type meta capabilities.
  *
  * @param string $cap     Capability being checked.
  * @param int    $user_id User ID.
@@ -844,49 +843,6 @@ function map_meta_cap( $cap, $user_id, ...$args ) {
 				return map_meta_cap( $post_type_meta_caps[ $cap ], $user_id, ...$args );
 			}
 
-			/*
-			 * Capabilities that no case above claims map to themselves, or to their post
-			 * equivalent, and that result is decided by the capability name alone.
-			 * Resolving it again on every check is repeated work: a default dashboard
-			 * request enters this function 160 times for 32 distinct capabilities, 103 of
-			 * those calls reach this branch, and 88 of those 103 repeat a mapping the same
-			 * request has already resolved. The result is therefore memoized below and
-			 * read back here.
-			 *
-			 * The memo is only used while nothing can make the mapping vary:
-			 *
-			 * - Checks carrying arguments are excluded, because their mapping reads the
-			 *   object they are checked against.
-			 * - Post type meta capabilities are excluded by the test above, which runs on
-			 *   every call, so a post type registered part way through a request is
-			 *   honored at once and no invalidation step is needed.
-			 * - Nothing is read or written while a callback is attached to the
-			 *   `map_meta_cap` filter or to `all`, the two conditions under which the
-			 *   apply_filters() call at the end of this function has any observable
-			 *   effect. A filter attached after a mapping was memoized therefore still
-			 *   runs, and a filter mapping identical arguments to different results is
-			 *   never short-circuited.
-			 * - Only integer user IDs and string capabilities are memoized, so that reads
-			 *   and writes always agree on the array key, and so that the argument types
-			 *   this function has always tolerated cannot become invalid array keys.
-			 *
-			 * Capabilities claimed by a case above are never memoized, because those
-			 * branches read constants, options, filters and super admin status, any of
-			 * which a request can change. Those checks never reach this branch, so they
-			 * carry none of the cost of this one.
-			 */
-			$memoizable_cap = null;
-			if ( ! $args && is_int( $user_id ) && is_string( $cap )
-				&& ! isset( $GLOBALS['wp_filter']['map_meta_cap'] )
-				&& ! isset( $GLOBALS['wp_filter']['all'] )
-			) {
-				if ( isset( $GLOBALS['_wp_map_meta_cap_memo'][ $user_id ][ $cap ] ) ) {
-					return $GLOBALS['_wp_map_meta_cap_memo'][ $user_id ][ $cap ];
-				}
-
-				$memoizable_cap = $cap;
-			}
-
 			// Block capabilities map to their post equivalent.
 			$block_caps = array(
 				'edit_blocks',
@@ -906,21 +862,6 @@ function map_meta_cap( $cap, $user_id, ...$args ) {
 
 			// If no meta caps match, return the original cap.
 			$caps[] = $cap;
-
-			if ( null !== $memoizable_cap ) {
-				/*
-				 * Empty the memo once it holds this many mappings for a single user, so
-				 * that a request checking a large number of distinct capability names
-				 * cannot grow it without limit.
-				 */
-				if ( isset( $GLOBALS['_wp_map_meta_cap_memo'][ $user_id ] )
-					&& count( $GLOBALS['_wp_map_meta_cap_memo'][ $user_id ] ) >= 512
-				) {
-					$GLOBALS['_wp_map_meta_cap_memo'] = array();
-				}
-
-				$GLOBALS['_wp_map_meta_cap_memo'][ $user_id ][ $memoizable_cap ] = $caps;
-			}
 	}
 
 	/**

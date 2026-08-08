@@ -23,35 +23,14 @@ const themes = [
 	'twentytwentyfive',
 ];
 
-const booleanMetrics = new Set( [
-	'wpExtObjCache',
-	'wpOpcacheEnabled',
-	'wpOpcacheJit',
-] );
+const booleanMetrics = new Set( [ 'wpExtObjCache' ] );
 
 const countMetrics = new Set( [
 	'wpDbQueries',
 	'wpFilesLoaded',
 	'wpCacheHits',
 	'wpCacheMisses',
-	/*
-	 * 1 when wpBootstrap was measured to its own 'wp_loaded' boundary, 0 when it was
-	 * never reached. Passed through as a number so the comparison table shows the
-	 * count of valid samples rather than rendering the flag as a duration.
-	 */
-	'wpBootstrapValid',
 ] );
-
-/**
- * Metrics whose value states whether another metric was measured at all.
- *
- * A validity flag is a count of usable samples rather than a quantity, so it is
- * formatted as a raw number but must not be differenced: subtracting one run's
- * validity from another's produces a number that reads like a regression and means
- * nothing. Membership here leaves the difference, STD and MAD cells empty while the
- * value itself is still reported, which is what makes an invalid run visible.
- */
-const validityMetrics = new Set( [ 'wpBootstrapValid' ] );
 
 /**
  * Status the cache-reset helper answers an authorized reset with, and nothing else does.
@@ -158,7 +137,11 @@ function cacheResetToken() {
 		// 32 random bytes, hex encoded, so the value satisfies the grammar above.
 		const token = randomBytes( 32 ).toString( 'hex' );
 
-		writeFileSync( path, token, { encoding: 'utf8', flag: 'wx', mode: 0o644 } );
+		writeFileSync( path, token, {
+			encoding: 'utf8',
+			flag: 'wx',
+			mode: 0o644,
+		} );
 
 		cacheResetToken.token = token;
 	} catch ( error ) {
@@ -235,7 +218,8 @@ async function clearServerCaches( page ) {
 
 	throw new Error(
 		`Requesting a cache reset answered ${ status } where ${ CACHE_RESET_STATUS } was required: ${
-			reasons[ status ] ?? 'the request was not answered by the cache reset endpoint.'
+			reasons[ status ] ??
+			'the request was not answered by the cache reset endpoint.'
 		} The opcode cache, object cache and transients were therefore not discarded, and every sample taken after this point would be warm.`
 	);
 }
@@ -395,7 +379,9 @@ function parseFile( fileName ) {
 	try {
 		parsed = JSON.parse( readFileSync( file, 'utf8' ) );
 	} catch ( error ) {
-		throw new Error( `${ fileName }: is not valid JSON: ${ error.message }` );
+		throw new Error(
+			`${ fileName }: is not valid JSON: ${ error.message }`
+		);
 	}
 
 	return validateResults( parsed, fileName );
@@ -416,7 +402,9 @@ function median( array ) {
 	const reason = invalidSeriesReason( array );
 
 	if ( null !== reason ) {
-		throw new Error( `Cannot take the median of a series that ${ reason }` );
+		throw new Error(
+			`Cannot take the median of a series that ${ reason }`
+		);
 	}
 
 	const mid = Math.floor( array.length / 2 );
@@ -521,22 +509,16 @@ function formatValue( metric, value ) {
  * Determines whether the difference between two values of a metric is meaningful.
  *
  * Flags belong in the comparison because they qualify every other number in their row —
- * an object cache that appeared, an OPcache that was switched off — but they are not
+ * an object cache that appeared where the previous run had none — but they are not
  * quantities. Subtracting, averaging or deviating them is arithmetic on labels, which
  * renders as '-1' rather than as information, so their difference columns are left empty
- * instead.
- *
- * A validity flag is excluded for the same reason. 'wpBootstrapValid' says whether the
- * bootstrap duration beside it was measured at all, so a difference of -1 between two
- * runs reads as a one-unit regression in a metric that has no units. Its value is still
- * reported, because a run in which it is not 1 is a run whose bootstrap figures must be
- * discarded.
+ * while the value itself is still reported.
  *
  * @param {string} metric Metric.
  * @return {boolean} Whether a numeric difference between two values of the metric is meaningful.
  */
 function isComparableMetric( metric ) {
-	return ! booleanMetrics.has( metric ) && ! validityMetrics.has( metric );
+	return ! booleanMetrics.has( metric );
 }
 
 /**

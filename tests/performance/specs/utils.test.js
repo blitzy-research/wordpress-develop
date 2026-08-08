@@ -49,7 +49,10 @@ const producerSource = readFileSync(
  * either would surface as a warm sample published under an uncached label rather than as
  * a failure, so both are read off the source itself.
  */
-const callerSource = readFileSync( join( __dirname, '..', 'utils.js' ), 'utf8' );
+const callerSource = readFileSync(
+	join( __dirname, '..', 'utils.js' ),
+	'utf8'
+);
 
 /**
  * Sources of the specs that attach measured results to the run.
@@ -102,9 +105,6 @@ const reportedAs = {
 	wpCacheHits: 'count',
 	wpCacheMisses: 'count',
 	wpBootstrap: 'ms',
-	wpBootstrapValid: 'count',
-	wpOpcacheEnabled: 'flag',
-	wpOpcacheJit: 'flag',
 };
 
 /**
@@ -185,9 +185,6 @@ test.describe( 'Performance report utilities', () => {
 				[ 'wp-cache-hits', 'wpCacheHits' ],
 				[ 'wp-cache-misses', 'wpCacheMisses' ],
 				[ 'wp-bootstrap', 'wpBootstrap' ],
-				[ 'wp-opcache-enabled', 'wpOpcacheEnabled' ],
-				[ 'wp-opcache-jit', 'wpOpcacheJit' ],
-				[ 'wp-bootstrap-valid', 'wpBootstrapValid' ],
 			];
 
 			for ( const [ headerName, reportKey ] of headerNames ) {
@@ -219,14 +216,8 @@ test.describe( 'Performance report utilities', () => {
 				[ 'wpCacheHits', 2035, 2035 ],
 				[ 'wpCacheMisses', 185, 185 ],
 				[ 'wpBootstrap', 23.897, '23.90 ms' ],
-				[ 'wpOpcacheEnabled', 1, 'yes' ],
-				[ 'wpOpcacheEnabled', 0, 'no' ],
-				[ 'wpOpcacheJit', 1, 'yes' ],
-				[ 'wpOpcacheJit', 0, 'no' ],
 				[ 'adminJsRaw', 124500, '124.50 kB' ],
 				[ 'adminJsGzipped', 30250, '30.25 kB' ],
-				[ 'wpBootstrapValid', 1, 1 ],
-				[ 'wpBootstrapValid', 0, 0 ],
 				[ 'wpTotal', 39.75, '39.75 ms' ],
 				[ 'wpBeforeTemplate', 29.14, '29.14 ms' ],
 				[ 'wpTemplate', 32.876, '32.88 ms' ],
@@ -261,7 +252,6 @@ test.describe( 'Performance report utilities', () => {
 			expect( formatValue( 'wpFilesLoaded', null ) ).toBe( 'N/A' );
 			expect( formatValue( 'wpExtObjCache', null ) ).toBe( 'N/A' );
 			expect( formatValue( 'wpBootstrap', null ) ).toBe( 'N/A' );
-			expect( formatValue( 'wpOpcacheEnabled', null ) ).toBe( 'N/A' );
 			expect( formatValue( 'wpCacheHits', null ) ).toBe( 'N/A' );
 			expect( formatValue( 'adminJsGzipped', null ) ).toBe( 'N/A' );
 		} );
@@ -270,39 +260,20 @@ test.describe( 'Performance report utilities', () => {
 	test.describe( 'isComparableMetric()', () => {
 		test( 'refuses to compare flags', () => {
 			/*
-			 * Every one of these formats into a label. Differencing them produced the cells
+			 * 'wpExtObjCache' formats into a label. Differencing it produced the cells
 			 * the classification exists to prevent, such as 'no' for a flag that never
 			 * changed.
 			 */
-			for ( const metric of [
-				'wpExtObjCache',
-				'wpOpcacheEnabled',
-				'wpOpcacheJit',
-			] ) {
-				expect( isComparableMetric( metric ), metric ).toBe( false );
-			}
-		} );
-
-		test( 'refuses to compare a validity flag', () => {
-			/*
-			 * 'wpBootstrapValid' states whether the bootstrap duration beside it was
-			 * measured at all. It is formatted as a raw number, because a run in which it
-			 * is not 1 is a run whose bootstrap figures must be discarded, but a
-			 * difference of -1 between two runs reads as a one-unit regression in a
-			 * metric that has no units.
-			 */
-			expect( reportedUnit( 'wpBootstrapValid' ) ).toBe( 'count' );
-			expect( isComparableMetric( 'wpBootstrapValid' ) ).toBe( false );
+			expect( reportedUnit( 'wpExtObjCache' ) ).toBe( 'flag' );
+			expect( isComparableMetric( 'wpExtObjCache' ) ).toBe( false );
 		} );
 
 		test( 'compares every metric that carries a quantity', () => {
 			const labelUnits = [ 'flag' ];
-			const validityMetrics = [ 'wpBootstrapValid' ];
 
 			for ( const [ metric, unit ] of Object.entries( reportedAs ) ) {
 				expect( isComparableMetric( metric ), metric ).toBe(
-					! labelUnits.includes( unit ) &&
-						! validityMetrics.includes( metric )
+					! labelUnits.includes( unit )
 				);
 			}
 
@@ -572,14 +543,14 @@ test.describe( 'Performance report utilities', () => {
 
 		test( 'rejects a scenario the comparison could not match', () => {
 			expect( () =>
-				validateResults( [ scenario( { title: '' } ) ], 'artifact.json' )
+				validateResults(
+					[ scenario( { title: '' } ) ],
+					'artifact.json'
+				)
 			).toThrow( /has no title/ );
 
 			expect( () =>
-				validateResults(
-					[ scenario( { title: 7 } ) ],
-					'artifact.json'
-				)
+				validateResults( [ scenario( { title: 7 } ) ], 'artifact.json' )
 			).toThrow( /has no title/ );
 
 			expect( () =>
@@ -658,15 +629,16 @@ test.describe( 'Performance report utilities', () => {
 				[ [ 484, NaN ], /not a finite number/ ],
 				[ '484', /expected an array of samples/ ],
 			] ) {
-				expect( () =>
-					validateResults(
-						[
-							scenario( {
-								results: [ { wpFilesLoaded: samples } ],
-							} ),
-						],
-						'artifact.json'
-					),
+				expect(
+					() =>
+						validateResults(
+							[
+								scenario( {
+									results: [ { wpFilesLoaded: samples } ],
+								} ),
+							],
+							'artifact.json'
+						),
 					JSON.stringify( samples )
 				).toThrow( pattern );
 			}
@@ -710,7 +682,9 @@ test.describe( 'Performance report utilities', () => {
 				producerSource,
 				`the reset must answer ${ CACHE_RESET_STATUS }, which WordPress never sends for that URL`
 			).toMatch(
-				new RegExp( `status_header\\(\\s*${ CACHE_RESET_STATUS }\\s*\\)` )
+				new RegExp(
+					`status_header\\(\\s*${ CACHE_RESET_STATUS }\\s*\\)`
+				)
 			);
 
 			/*
@@ -804,17 +778,52 @@ test.describe( 'Performance report utilities', () => {
 			).not.toMatch( /\$\{\s*cacheResetToken\(\)\s*\}/ );
 		} );
 
-		test( 'the regime each sample was taken in is reported with it', () => {
+		test( 'the specs require exactly the metric vocabulary the producer emits', () => {
+			/*
+			 * The producer and the specs are the two ends of one contract, and the
+			 * vocabulary is pinned: five metrics were added to the four the front end and
+			 * the admin already shared, and nothing beyond them. A slug that appears at
+			 * one end only is a metric that is either measured and never checked, or
+			 * required and never sent, so both ends are read here rather than restated.
+			 */
+			const added = [
+				'memory-peak',
+				'files-loaded',
+				'cache-hits',
+				'cache-misses',
+				'bootstrap',
+			];
+
+			for ( const context of [ 'front-end', 'admin' ] ) {
+				const slugs = producerSlugs( context );
+
+				expect(
+					slugs.filter( ( slug ) => added.includes( slug ) ).sort(),
+					`the ${ context } collector should emit exactly the added metrics`
+				).toEqual( [ ...added ].sort() );
+
+				expect(
+					slugs.length,
+					`the ${ context } collector should emit only the pinned metrics`
+				).toBe( 'admin' === context ? 9 : 11 );
+			}
+
 			for ( const [ name, source ] of attachingSpecs ) {
-				for ( const metric of [
-					'wp-opcache-enabled',
-					'wp-opcache-jit',
-				] ) {
-					expect(
-						source,
-						`${ name } should report ${ metric } alongside every measurement`
-					).toContain( metric );
-				}
+				const required = [
+					...source
+						.slice(
+							source.indexOf( 'requiredServerTimingMetrics = [' )
+						)
+						.matchAll( /'wp-([a-z-]+)'/g ),
+				].map( ( [ , slug ] ) => slug );
+
+				const context =
+					'admin.test.js' === name ? 'admin' : 'front-end';
+
+				expect(
+					required,
+					`${ name } should require exactly what the ${ context } collector emits`
+				).toEqual( producerSlugs( context ) );
 			}
 		} );
 	} );
@@ -837,8 +846,7 @@ test.describe( 'Performance comparison contract', () => {
 			results: [
 				{
 					wpFilesLoaded: series( 500 ),
-					wpOpcacheEnabled: series( 1 ),
-					wpOpcacheJit: series( 0 ),
+					wpMemoryPeak: series( 9_723_064 ),
 					...overrides,
 				},
 			],
@@ -987,16 +995,6 @@ test.describe( 'Performance comparison contract', () => {
 		expect( run.stderr ).toContain(
 			'the medians would be taken over different iteration counts'
 		);
-	} );
-
-	test( 'refuses to compare two different environments', () => {
-		const run = compare(
-			[ scenario() ],
-			[ scenario( { wpOpcacheEnabled: [ 0, 0 ] } ) ]
-		);
-
-		expect( run.status ).toBe( 1 );
-		expect( run.stderr ).toContain( 'did not run in the same environment' );
 	} );
 } );
 

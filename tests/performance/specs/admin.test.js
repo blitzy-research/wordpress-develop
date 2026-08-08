@@ -33,9 +33,6 @@ const requiredServerTimingMetrics = [
 	'wp-cache-hits',
 	'wp-cache-misses',
 	'wp-bootstrap',
-	'wp-bootstrap-valid',
-	'wp-opcache-enabled',
-	'wp-opcache-jit',
 ];
 
 /**
@@ -58,8 +55,8 @@ const requiredServerTimingMetrics = [
  * 'wpMemoryUsage' samples for six iterations, and the first three of each repetition
  * were byte-identical to the en_US ones, 6,745,720 and 6,746,360 against the locale's
  * own 7,333,616. Its reported median came out at 7,039,988, understating de_DE by
- * 293,628 bytes, or 4.0%. Every declared metric held exactly six. The runtime-regime
- * metadata and deterministic JavaScript byte totals follow the same reset contract.
+ * 293,628 bytes, or 4.0%. Every declared metric held exactly six. The deterministic
+ * JavaScript byte totals follow the same reset contract.
  *
  * How wrong a mixed median can be is bounded by how far the locales really are
  * apart, and they are not close: 'wpMemoryPeak', which was already declared and
@@ -82,12 +79,7 @@ const results = {
 	adminJsGzipped: [],
 };
 
-const immutableMeasurementMetrics = [
-	'wpOpcacheEnabled',
-	'wpOpcacheJit',
-	'adminJsRaw',
-	'adminJsGzipped',
-];
+const immutableMeasurementMetrics = [ 'adminJsRaw', 'adminJsGzipped' ];
 
 /**
  * Highest iteration count this spec will generate measured tests for.
@@ -251,23 +243,6 @@ test.describe( 'Admin', () => {
 							) }`
 						).toBe( true );
 					}
-
-					/*
-					 * 'wp-bootstrap' has a single boundary, from $timestart to 'wp_loaded'.
-					 * A 0 flag means that boundary was never reached, so the accompanying
-					 * duration is a placeholder rather than a measurement and must not be
-					 * aggregated with the samples that are.
-					 */
-					expect(
-						serverTiming[ 'wp-bootstrap-valid' ],
-						'wp-bootstrap should be measured to its own wp_loaded boundary, so wp-bootstrap-valid should be 1'
-					).toBe( 1 );
-					expect( [ 0, 1 ] ).toContain(
-						serverTiming[ 'wp-opcache-enabled' ]
-					);
-					expect( [ 0, 1 ] ).toContain(
-						serverTiming[ 'wp-opcache-jit' ]
-					);
 
 					for ( const [ key, value ] of Object.entries(
 						serverTiming

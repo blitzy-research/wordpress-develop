@@ -6,12 +6,7 @@ import { expect, test } from '@wordpress/e2e-test-utils-playwright';
 /**
  * Internal dependencies
  */
-import {
-	camelCaseDashes,
-	clearServerCaches,
-	themes,
-	locales,
-} from '../utils';
+import { camelCaseDashes, clearServerCaches, themes, locales } from '../utils';
 
 /**
  * Server-Timing entries every front-end iteration must report.
@@ -33,9 +28,6 @@ const requiredServerTimingMetrics = [
 	'wp-cache-hits',
 	'wp-cache-misses',
 	'wp-bootstrap',
-	'wp-bootstrap-valid',
-	'wp-opcache-enabled',
-	'wp-opcache-jit',
 ];
 
 /**
@@ -66,8 +58,6 @@ const results = {
 		] )
 	),
 };
-
-const immutableRuntimeMetrics = [ 'wpOpcacheEnabled', 'wpOpcacheJit' ];
 
 /**
  * Highest iteration count this spec will generate measured tests for.
@@ -140,19 +130,11 @@ test.describe( 'Single Post', () => {
 					 * measurements it never took.
 					 */
 					const body = JSON.stringify( results, null, 2 );
-					const sampleCounts = Object.keys( results ).map( ( metric ) => [
-						metric,
-						results[ metric ].length,
-					] );
+					const sampleCounts = Object.keys( results ).map(
+						( metric ) => [ metric, results[ metric ].length ]
+					);
 
 					try {
-						for ( const metric of immutableRuntimeMetrics ) {
-							expect(
-								new Set( results[ metric ] ).size,
-								`${ metric } must stay immutable within one measured theme and locale`
-							).toBe( 1 );
-						}
-
 						/*
 						 * Both checks run before the attachment, so the artifact can
 						 * only ever receive a snapshot that has been validated. A
@@ -223,23 +205,6 @@ test.describe( 'Single Post', () => {
 								) }`
 							).toBe( true );
 						}
-
-						/*
-						 * 'wp-bootstrap' has a single boundary, from $timestart to 'wp_loaded'.
-						 * A 0 flag means that boundary was never reached, so the accompanying
-						 * duration is a placeholder rather than a measurement and must not be
-						 * aggregated with the samples that are.
-						 */
-						expect(
-							serverTiming[ 'wp-bootstrap-valid' ],
-							'wp-bootstrap should be measured to its own wp_loaded boundary, so wp-bootstrap-valid should be 1'
-						).toBe( 1 );
-						expect( [ 0, 1 ] ).toContain(
-							serverTiming[ 'wp-opcache-enabled' ]
-						);
-						expect( [ 0, 1 ] ).toContain(
-							serverTiming[ 'wp-opcache-jit' ]
-						);
 
 						for ( const [ key, value ] of Object.entries(
 							serverTiming

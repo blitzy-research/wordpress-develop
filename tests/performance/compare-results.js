@@ -27,17 +27,6 @@ const args = process.argv.slice( 2 );
 const summaryFile = args[ 0 ];
 
 /**
- * Metrics whose value describes the environment a measurement was taken in.
- *
- * A comparison is only evidence when both arms ran under the same opcode-cache regime:
- * opcode-cache state alone moves measured memory and wall time by far more than any
- * change under test, so a pair taken across two regimes reports the regime rather than
- * the change. Both metrics are emitted by the mu-plugin for exactly that reason, and
- * they are compared before any figure is printed.
- */
-const environmentMetrics = [ 'wpOpcacheEnabled', 'wpOpcacheJit' ];
-
-/**
  * Aborts the comparison.
  *
  * Every condition that makes a printed difference misleading ends here rather than in a
@@ -97,14 +86,20 @@ function parseFile( fileName ) {
  * @return {{repetitions: number, iterations: number, metrics: string[], samples: Record<string, number>}} Shape of the scenario.
  */
 function describeShape( stat, fileName ) {
-	if ( ! stat || 'string' !== typeof stat.title || ! Array.isArray( stat.results ) ) {
+	if (
+		! stat ||
+		'string' !== typeof stat.title ||
+		! Array.isArray( stat.results )
+	) {
 		return fail(
 			`${ fileName } holds an entry that is not a measured scenario.`
 		);
 	}
 
 	if ( 0 === stat.results.length ) {
-		return fail( `${ fileName } holds no repetitions for ${ stat.title }.` );
+		return fail(
+			`${ fileName } holds no repetitions for ${ stat.title }.`
+		);
 	}
 
 	const metrics = Object.keys( stat.results[ 0 ] ).sort();
@@ -157,7 +152,9 @@ function describeShape( stat, fileName ) {
 		return fail(
 			`${ fileName } holds an inconsistent number of samples per iteration for ${
 				stat.title
-			}: ${ [ ...iterationCounts ].sort( ( a, b ) => a - b ).join( ', ' ) }.`
+			}: ${ [ ...iterationCounts ]
+				.sort( ( a, b ) => a - b )
+				.join( ', ' ) }.`
 		);
 	}
 
@@ -167,31 +164,6 @@ function describeShape( stat, fileName ) {
 		metrics,
 		samples,
 	};
-}
-
-/**
- * Reports the single value an environment metric holds across a whole run.
- *
- * @param {Record<string, number[]>} values   Accumulated metric values.
- * @param {string}                   metric   Environment metric to read.
- * @param {string}                   title    Scenario the values belong to.
- * @param {string}                   fileName Artifact the scenario came from.
- * @return {?number} The value, or null when the metric was not measured.
- */
-function environmentValue( values, metric, title, fileName ) {
-	if ( ! values[ metric ] ) {
-		return null;
-	}
-
-	const distinct = new Set( values[ metric ] );
-
-	if ( 1 !== distinct.size ) {
-		return fail(
-			`${ fileName } reports more than one ${ metric } for ${ title }, so its samples were not all taken in one environment.`
-		);
-	}
-
-	return [ ...distinct ][ 0 ];
 }
 
 /**
@@ -235,17 +207,21 @@ if ( null === beforeStats ) {
 
 if ( process.env.TARGET_SHA ) {
 	if ( null !== beforeStats ) {
-		if (process.env.GITHUB_SHA) {
-			summaryMarkdown += `This compares the results from this commit (${linkToSha(
+		if ( process.env.GITHUB_SHA ) {
+			summaryMarkdown += `This compares the results from this commit (${ linkToSha(
 				process.env.GITHUB_SHA
-			)}) with the ones from ${linkToSha(process.env.TARGET_SHA)}.\n\n`;
-		} else {
-			summaryMarkdown += `This compares the results from this commit with the ones from ${linkToSha(
+			) }) with the ones from ${ linkToSha(
 				process.env.TARGET_SHA
-			)}.\n\n`;
+			) }.\n\n`;
+		} else {
+			summaryMarkdown += `This compares the results from this commit with the ones from ${ linkToSha(
+				process.env.TARGET_SHA
+			) }.\n\n`;
 		}
 	} else {
-		summaryMarkdown += `Note: no build was found for the target commit ${linkToSha(process.env.TARGET_SHA)}. No comparison is possible.\n\n`;
+		summaryMarkdown += `Note: no build was found for the target commit ${ linkToSha(
+			process.env.TARGET_SHA
+		) }. No comparison is possible.\n\n`;
 	}
 }
 
@@ -267,7 +243,9 @@ if ( null !== beforeStats ) {
 	const missing = [ ...afterShapes.keys() ].filter(
 		( title ) => ! beforeTitles.includes( title )
 	);
-	const extra = beforeTitles.filter( ( title ) => ! afterShapes.has( title ) );
+	const extra = beforeTitles.filter(
+		( title ) => ! afterShapes.has( title )
+	);
 
 	if ( 0 < missing.length || 0 < extra.length ) {
 		fail(
@@ -351,15 +329,23 @@ for ( const { title, results } of afterStats ) {
 		 * different measurements, and the difference between them is not a change in the
 		 * code.
 		 */
-		if ( afterShape.metrics.join( ',' ) !== beforeShape.metrics.join( ',' ) ) {
+		if (
+			afterShape.metrics.join( ',' ) !== beforeShape.metrics.join( ',' )
+		) {
 			fail(
 				`the two runs measured different metrics for ${ title }. Only after: ${
 					afterShape.metrics
-						.filter( ( metric ) => ! beforeShape.metrics.includes( metric ) )
+						.filter(
+							( metric ) =>
+								! beforeShape.metrics.includes( metric )
+						)
 						.join( ', ' ) || 'none'
 				}. Only before: ${
 					beforeShape.metrics
-						.filter( ( metric ) => ! afterShape.metrics.includes( metric ) )
+						.filter(
+							( metric ) =>
+								! afterShape.metrics.includes( metric )
+						)
 						.join( ', ' ) || 'none'
 				}.`
 			);
@@ -372,32 +358,11 @@ for ( const { title, results } of afterStats ) {
 		}
 
 		for ( const metric of afterShape.metrics ) {
-			if ( afterShape.samples[ metric ] !== beforeShape.samples[ metric ] ) {
+			if (
+				afterShape.samples[ metric ] !== beforeShape.samples[ metric ]
+			) {
 				fail(
 					`${ metric } holds ${ afterShape.samples[ metric ] } samples after and ${ beforeShape.samples[ metric ] } before for ${ title }.`
-				);
-			}
-		}
-
-		const prevAccumulated = accumulateValues( prevStat.results );
-
-		for ( const metric of environmentMetrics ) {
-			const afterEnvironment = environmentValue(
-				newResults,
-				metric,
-				title,
-				'performance-results.json'
-			);
-			const beforeEnvironment = environmentValue(
-				prevAccumulated,
-				metric,
-				title,
-				'before-performance-results.json'
-			);
-
-			if ( afterEnvironment !== beforeEnvironment ) {
-				fail(
-					`${ title } was measured with ${ metric } ${ beforeEnvironment } before and ${ afterEnvironment } after, so the two arms did not run in the same environment.`
 				);
 			}
 		}

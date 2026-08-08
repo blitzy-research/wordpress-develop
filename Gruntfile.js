@@ -2285,8 +2285,25 @@ module.exports = function(grunt) {
 							}
 						} );
 
-						if ( [ 'twemoji.js' ].some( testPath ) ) {
-							grunt.log.writeln( 'twemoji.js has updated. Running `precommit:emoji.' );
+						/*
+						 * The emoji arrays are generated from the published Twemoji file
+						 * list, which `replace:emoji-regex` reads over the network from the
+						 * pinned tree, and they are written to `emoji-arrays.php`. That file
+						 * is therefore the trigger: a change to it either came from the
+						 * generator, in which case regenerating confirms it is what the
+						 * pinned list produces, or it was made by hand, which is exactly what
+						 * `verify:emoji-markers` and the regeneration exist to catch. The
+						 * pinned Twemoji version lives in this file, and a change here already
+						 * routes to `prerelease` above. `js/twemoji.js` is no longer read by
+						 * the generator - it is a source asset for the emoji script bundle -
+						 * so it is covered by `precommit:js` like any other script.
+						 *
+						 * Matched by its full path, because testPath() anchors on the space
+						 * that precedes the path in the status output: a bare file name only
+						 * matches a file at the root of the checkout.
+						 */
+						if ( [ EMOJI_ARRAYS_FILE ].some( testPath ) ) {
+							grunt.log.writeln( EMOJI_ARRAYS_FILE + ' has changed. Running `precommit:emoji`.' );
 							taskList.push( 'precommit:emoji' );
 						}
 
