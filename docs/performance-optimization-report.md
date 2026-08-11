@@ -1602,7 +1602,13 @@ output it is for: the three files named in §_Evidence manifest_ plus Playwright
 `test-results/.last-run.json`, all of which a later run replaces — the directory is empty as this is written,
 which is why the manifest carries sizes and digests rather than pointing at a path. Second, an authenticated admin
 session is a credential. `tests/performance/playwright.config.js:29-43` moves this suite's storage state out
-of the uploaded tree to `.cache/performance-storage-states/admin.json`; `tests/e2e/playwright.config.js:13`
+of the uploaded tree to `.cache/performance-storage-states/admin.json`, and `global-teardown.js:109-115`
+withdraws it when the run ends. Relocating it is only half of that: the withdrawal has to come *after* the
+theme restore, because the restore authenticates and an authentication writes a session to whatever path it is
+handed, so a removal placed before it is a removal the step after it undoes — which is why the restore is
+handed no path at all and why the removal sits in a `finally`, where a restore that cannot reach the site
+still cannot leave a session behind. `tests/performance/specs/utils.test.js:1585` and `:1674` assert both
+halves, each against the failure it is there to catch. `tests/e2e/playwright.config.js:13`
 still defaults its own into `artifacts/storage-states/admin.json`. The stale file left there by an earlier run
 has been removed, but the E2E default is unchanged because that file is outside the plan's scope — the same
 relocation is item 18 of §_Prioritized opportunities discovered but not implemented_.
@@ -1621,7 +1627,7 @@ rather than discovered:
     (`node ./tools/local-env/scripts/docker.js run --rm php ./vendor/bin/phpunit`), and that is what the
     commands below use.
 -   **The cache-reset token has to be provisioned first.** `globalTeardown` revokes it after every suite run
-    (`tests/performance/config/global-teardown.js:33`), so the default state is no token file — in which state
+    (`tests/performance/config/global-teardown.js:105`), so the default state is no token file — in which state
     the endpoint answers 404 to every verb, by design. The provisioning line below writes the same 32 random
     bytes, with the same exclusive flag and the same mode, that `tests/performance/utils.js:145-151` writes.
 -   **The `server-timing` header needs the mu-plugin in the served docroot**, `$LOCAL_DIR/wp-content/mu-plugins`,

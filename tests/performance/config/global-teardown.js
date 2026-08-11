@@ -27,6 +27,12 @@ import { previousThemePath, revokeCacheResetToken } from '../utils';
  * A failure here is reported rather than raised: the measurements are already taken, and
  * failing the run over the cleanup would discard them.
  *
+ * It authenticates for itself and is deliberately handed no storage state path.
+ * `setupRest()` writes the session it establishes to any path it is given, and nothing
+ * here reads one - the path is only read by `RequestUtils.setup()`, and this
+ * reauthenticates regardless - so handing it the run's path would have this step write a
+ * working admin session back to disk on its way out of the run that was finished with it.
+ *
  * @param {import('@playwright/test').FullConfig} config Resolved Playwright configuration.
  * @return {Promise<void>}
  */
@@ -51,14 +57,11 @@ async function restorePreviousTheme( config ) {
 		return;
 	}
 
-	const { storageState, baseURL } = config.projects[ 0 ].use;
+	const { baseURL } = config.projects[ 0 ].use;
 
 	try {
 		const requestContext = await request.newContext( { baseURL } );
-		const requestUtils = new RequestUtils( requestContext, {
-			storageStatePath:
-				'string' === typeof storageState ? storageState : undefined,
-		} );
+		const requestUtils = new RequestUtils( requestContext );
 
 		await requestUtils.setupRest();
 		await requestUtils.activateTheme( slug );
@@ -81,16 +84,19 @@ async function restorePreviousTheme( config ) {
  *
  * The cache reset token is what enables the mu-plugin's reset endpoint at all, so
  * withdrawing it here is what makes that endpoint exist for exactly the duration of one
- * measured run. It is revoked first and unconditionally, because it is the one of the
- * two that grants a state-changing operation, and because the storage state path is
- * configurable and may return early.
+ * measured run. It is revoked first, ahead of everything here that can fail, because it
+ * is the one of the two that grants a state-changing operation.
  *
  * Only files are removed. Both paths are configurable, so removing a directory could
  * take something else with it.
  *
- * The theme the run found active is put back last, because it is the one step that needs
- * the site to answer and the two secrets above have to be withdrawn whether or not it
- * does.
+ * The theme the run found active is put back in between, and the session is removed after
+ * it rather than before it. That order is the point: putting the theme back is the one
+ * step that needs the site to answer, answering it means authenticating, and an
+ * authentication is what writes a session to disk - so a removal that ran first is a
+ * removal the step after it can undo. Removing it last, in a `finally`, keeps the
+ * withdrawal as unconditional as the revocation above: a site that cannot answer the
+ * restore leaves its theme as this run left it, never a session behind.
  *
  * @param {import('@playwright/test').FullConfig} config Resolved Playwright configuration.
  * @return {Promise<void>}
@@ -100,11 +106,13 @@ async function globalTeardown( config ) {
 
 	const { storageState } = config.projects[ 0 ].use;
 
-	if ( 'string' === typeof storageState ) {
-		rmSync( storageState, { force: true } );
+	try {
+		await restorePreviousTheme( config );
+	} finally {
+		if ( 'string' === typeof storageState ) {
+			rmSync( storageState, { force: true } );
+		}
 	}
-
-	await restorePreviousTheme( config );
 }
 
 export default globalTeardown;

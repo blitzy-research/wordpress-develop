@@ -2,10 +2,21 @@
  * External dependencies
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { expect, test } from '@playwright/test';
+import { expect, request, test } from '@playwright/test';
+
+/**
+ * WordPress dependencies
+ */
+import { RequestUtils } from '@wordpress/e2e-test-utils-playwright';
 
 /**
  * Internal dependencies
@@ -1556,6 +1567,147 @@ test.describe( 'Performance evidence hygiene', () => {
 			await expect(
 				globalTeardown( { projects: [ { use: { storageState } } ] } )
 			).resolves.toBeUndefined();
+		} finally {
+			if ( undefined === configured ) {
+				delete process.env.WP_PERF_CACHE_RESET_TOKEN_FILE;
+			} else {
+				process.env.WP_PERF_CACHE_RESET_TOKEN_FILE = configured;
+			}
+
+			if ( undefined === configuredTheme ) {
+				delete process.env.WP_PERF_PREVIOUS_THEME_FILE;
+			} else {
+				process.env.WP_PERF_PREVIOUS_THEME_FILE = configuredTheme;
+			}
+		}
+	} );
+
+	test( 'withdraws the session even when the theme restore reauthenticates', async () => {
+		const directory = mkdtempSync(
+			join( tmpdir(), 'wp-performance-theme-restore-' )
+		);
+		const storageState = join( directory, 'admin.json' );
+		const themeRecord = join( directory, 'performance-previous-theme' );
+		const { baseURL } = performanceConfig.use;
+
+		/*
+		 * Redirected into the sandbox for the same reasons the test above redirects them:
+		 * this suite runs in the same worker as the measuring specs, so consuming the
+		 * run's own token or theme record here would disable the reset endpoint those
+		 * specs are still using and leave the run's teardown with nothing to restore.
+		 */
+		const configured = process.env.WP_PERF_CACHE_RESET_TOKEN_FILE;
+		const configuredTheme = process.env.WP_PERF_PREVIOUS_THEME_FILE;
+		process.env.WP_PERF_CACHE_RESET_TOKEN_FILE = join(
+			directory,
+			'performance-cache-reset-token'
+		);
+		process.env.WP_PERF_PREVIOUS_THEME_FILE = themeRecord;
+
+		/*
+		 * A record is what makes the teardown restore a theme at all, and the slug is one
+		 * no installation has: the restore authenticates, reads the themes page, finds no
+		 * activation link for it and reports that it could not reactivate it. That is the
+		 * whole restore path exercised - including the authentication, which is the step
+		 * that matters here - without changing the theme the measuring specs run under.
+		 */
+		writeFileSync( themeRecord, 'wp-performance-teardown-fixture', 'utf8' );
+
+		try {
+			/*
+			 * The session is established the way the run establishes it, through the call
+			 * the global setup makes. It is also what keeps the assertion below from
+			 * being vacuous: it proves that this installation answers an authentication
+			 * and that setupRest() writes the session to whatever path it is handed -
+			 * together, the two properties by which a restore that authenticates on the
+			 * way out can put back a session the teardown has already removed.
+			 */
+			const requestContext = await request.newContext( { baseURL } );
+			const requestUtils = new RequestUtils( requestContext, {
+				storageStatePath: storageState,
+			} );
+
+			await requestUtils.setupRest();
+			await requestContext.dispose();
+
+			expect(
+				existsSync( storageState ),
+				'the session this asserts the removal of has to exist first'
+			).toBe( true );
+
+			await globalTeardown( {
+				projects: [ { use: { storageState, baseURL } } ],
+			} );
+
+			/*
+			 * Consumed whether or not the activation succeeded, so a slug this run could
+			 * not apply cannot be applied by a later one.
+			 */
+			expect(
+				existsSync( themeRecord ),
+				'the theme record has to be consumed by the restore'
+			).toBe( false );
+
+			/*
+			 * The point of the test: a teardown that reauthenticates on its way out must
+			 * still leave no working admin session behind it.
+			 */
+			expect(
+				existsSync( storageState ),
+				'the restore must not leave the session on disk'
+			).toBe( false );
+		} finally {
+			if ( undefined === configured ) {
+				delete process.env.WP_PERF_CACHE_RESET_TOKEN_FILE;
+			} else {
+				process.env.WP_PERF_CACHE_RESET_TOKEN_FILE = configured;
+			}
+
+			if ( undefined === configuredTheme ) {
+				delete process.env.WP_PERF_PREVIOUS_THEME_FILE;
+			} else {
+				process.env.WP_PERF_PREVIOUS_THEME_FILE = configuredTheme;
+			}
+		}
+	} );
+
+	test( 'withdraws the session even when the restore cannot run', async () => {
+		const directory = mkdtempSync(
+			join( tmpdir(), 'wp-performance-restore-failure-' )
+		);
+		const storageState = join( directory, 'admin.json' );
+		const themeRecord = join( directory, 'performance-previous-theme' );
+
+		writeFileSync(
+			storageState,
+			JSON.stringify( { cookies: [], origins: [] } )
+		);
+
+		const configured = process.env.WP_PERF_CACHE_RESET_TOKEN_FILE;
+		const configuredTheme = process.env.WP_PERF_PREVIOUS_THEME_FILE;
+		process.env.WP_PERF_CACHE_RESET_TOKEN_FILE = join(
+			directory,
+			'performance-cache-reset-token'
+		);
+		process.env.WP_PERF_PREVIOUS_THEME_FILE = themeRecord;
+
+		/*
+		 * A directory where the theme record belongs, which is a record the restore can
+		 * neither read nor consume: it raises rather than returning. That is the case the
+		 * removal has to survive, because a run whose cleanup half failed is exactly the
+		 * run that must not be the one to leave a working admin session behind.
+		 */
+		mkdirSync( themeRecord );
+
+		try {
+			await expect(
+				globalTeardown( { projects: [ { use: { storageState } } ] } )
+			).rejects.toThrow();
+
+			expect(
+				existsSync( storageState ),
+				'a restore that failed must still leave the session withdrawn'
+			).toBe( false );
 		} finally {
 			if ( undefined === configured ) {
 				delete process.env.WP_PERF_CACHE_RESET_TOKEN_FILE;
