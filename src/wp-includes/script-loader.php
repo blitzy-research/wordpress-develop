@@ -2758,10 +2758,17 @@ function wp_should_load_block_assets_on_demand() {
  * Checks whether the Command Palette assets should be enqueued on the current screen.
  *
  * The Command Palette is delivered by the `wp-commands` and `wp-core-commands` script
- * bundles. By default they are enqueued on block editor screens, detected the same way as
- * in {@see wp_should_load_block_editor_scripts_and_styles()}, and skipped on every other
- * admin screen. Another screen can opt in through the
- * {@see 'should_load_command_palette_assets'} filter.
+ * bundles, and those bundles are by far the largest part of the default admin JavaScript
+ * payload. This function is the one place that decides whether a screen receives them,
+ * so a site that does not use the palette can stop paying for it without unhooking a
+ * callback or filtering a script queue.
+ *
+ * The default is to deliver them on every admin screen, which is the palette every admin
+ * screen has: the admin bar advertises Ctrl+K wherever `wp-core-commands` is enqueued
+ * (see {@see wp_admin_bar_command_palette_menu()}), so the palette is a global admin
+ * capability rather than an editor one, and withholding it by default would remove a
+ * working feature. Outside the admin the answer is always false, and it is returned
+ * before the filter runs, so no filter can widen delivery to an unauthenticated visitor.
  *
  * This screens the automatic 'admin_enqueue_scripts' delivery. An admin page that calls
  * {@see wp_enqueue_command_palette_assets()} directly, outside that action, is asking for
@@ -2769,58 +2776,70 @@ function wp_should_load_block_assets_on_demand() {
  * call made while 'admin_enqueue_scripts' is running is still screened, because that
  * callback cannot tell the two apart.
  *
- * Two consequences follow on a screen this function declines, and both are intended:
+ * Declining a screen has consequences beyond the palette itself, which is why it is opt
+ * in rather than the default. On a declined screen:
  *
- * - `wp.commands` and `wp.coreCommands` are not defined there, because the scripts that
- *   define them are the scripts that were not enqueued.
- * - The admin bar's Ctrl+K button is not rendered there. Both callbacks that add it -
+ * - `wp.commands` and `wp.coreCommands` are not defined, because the scripts that define
+ *   them are the scripts that were not enqueued. Neither is the rest of the dependency
+ *   chain those bundles drag in, which is most of the `wp.*` package surface along with
+ *   `window.React`, `window.ReactDOM` and the script module import map. An admin script
+ *   that uses one of those without declaring it as a dependency stops working there;
+ *   one that declares its dependencies is unaffected, because `WP_Scripts` resolves them.
+ * - The admin bar's Ctrl+K button is not rendered. Both callbacks that add it -
  *   {@see wp_admin_bar_command_palette_menu()} and the Gutenberg plugin's equivalent -
  *   return early unless `wp-core-commands` is enqueued, so the button never appears
  *   without the code behind it.
  *
- * Reverting to the previous behaviour, where every admin screen received the bundles,
- * takes one line and no core change:
+ * Withholding the bundles from the screens that do not need them takes one line and no
+ * core change. Every screen:
  *
- *     add_filter( 'should_load_command_palette_assets', '__return_true' );
+ *     add_filter( 'should_load_command_palette_assets', '__return_false' );
+ *
+ * or everything except the block editor, which is where the palette is used most:
+ *
+ *     add_filter(
+ *         'should_load_command_palette_assets',
+ *         function () {
+ *             $screen = get_current_screen();
+ *
+ *             return ( $screen instanceof WP_Screen ) && $screen->is_block_editor();
+ *         }
+ *     );
  *
  * @since 7.0.0
  * @see wp_should_load_block_editor_scripts_and_styles()
  * @see wp_enqueue_command_palette_assets()
  * @see wp_admin_bar_command_palette_menu()
  *
- * @global WP_Screen $current_screen WordPress current screen object.
- *
  * @return bool Whether the Command Palette assets should be enqueued.
  */
 function wp_should_load_command_palette_assets() {
-	global $current_screen;
-
 	if ( ! is_admin() ) {
 		return false;
 	}
-
-	$should_load = ( $current_screen instanceof WP_Screen ) && $current_screen->is_block_editor();
 
 	/**
 	 * Filters whether the Command Palette assets are enqueued on the current screen.
 	 *
 	 * Returning true enqueues the `wp-commands` and `wp-core-commands` bundles along with
 	 * their dependencies. Returning false skips them, and the Command Palette is not
-	 * available on the screen.
+	 * available on the screen: `wp.commands` is undefined there, the admin bar's Ctrl+K
+	 * button is not rendered, and the rest of the dependency chain those bundles carry -
+	 * most of the `wp.*` packages, `window.React`, `window.ReactDOM` and the script
+	 * module import map - is not delivered either.
+	 *
+	 * A callback can decide per screen by reading {@see get_current_screen()}.
 	 *
 	 * The filter governs deliveries made while 'admin_enqueue_scripts' is running. It is
 	 * not applied outside the admin, where the assets are never enqueued, and a call to
 	 * {@see wp_enqueue_command_palette_assets()} made outside that action bypasses it.
 	 *
-	 * Returning true unconditionally restores the delivery every admin screen had before
-	 * this function existed, including `wp.commands` and the admin bar's Ctrl+K button.
-	 *
 	 * @since 7.0.0
 	 *
-	 * @param bool $should_load Current value of the flag. Default true on block editor
-	 *                          screens, false on every other admin screen.
+	 * @param bool $should_load Current value of the flag. Default true on every admin
+	 *                          screen.
 	 */
-	return apply_filters( 'should_load_command_palette_assets', $should_load );
+	return apply_filters( 'should_load_command_palette_assets', true );
 }
 
 /**
@@ -3554,14 +3573,16 @@ function wp_enqueue_classic_theme_styles() {
 /**
  * Enqueues the assets required for the Command Palette.
  *
- * As the default 'admin_enqueue_scripts' callback, this function only enqueues the assets on
- * the screens allowed by {@see wp_should_load_command_palette_assets()}. Calling it directly
- * always enqueues them, because an admin page that does not fire 'admin_enqueue_scripts' has
- * no other way to ask for the Command Palette. The assets are never enqueued outside the admin.
+ * As the default 'admin_enqueue_scripts' callback, this function enqueues the assets on the
+ * screens allowed by {@see wp_should_load_command_palette_assets()}, which is every admin
+ * screen unless a site opts out. Calling it directly always enqueues them, because an admin
+ * page that does not fire 'admin_enqueue_scripts' has no other way to ask for the Command
+ * Palette. The assets are never enqueued outside the admin.
  *
  * @since 6.9.0
- * @since 7.0.0 Deliveries through 'admin_enqueue_scripts' are limited to the screens allowed
- *              by wp_should_load_command_palette_assets(). Direct calls are unaffected.
+ * @since 7.0.0 Deliveries through 'admin_enqueue_scripts' consult
+ *              wp_should_load_command_palette_assets(), so a site can withhold the assets
+ *              from screens that do not use the palette. Direct calls are unaffected.
  *
  * @see wp_should_load_command_palette_assets()
  *

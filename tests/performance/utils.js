@@ -23,6 +23,18 @@ const themes = [
 	'twentytwentyfive',
 ];
 
+/**
+ * Metrics that report a configuration flag rather than a quantity.
+ *
+ * `wpExtObjCache` says whether the site under test had a persistent object cache behind
+ * it. That is a property of the environment, not of the code, and it changes what every
+ * other metric in the row means: a run with a drop-in issues fewer queries and holds a
+ * different heap than the same code without one. So a flag is reported as a value, never
+ * subtracted (see {@see isComparableMetric()}), and a pair of runs that disagree about one
+ * is refused outright by compare-results.js rather than compared.
+ *
+ * @type {Set<string>}
+ */
 const booleanMetrics = new Set( [ 'wpExtObjCache' ] );
 
 const countMetrics = new Set( [
@@ -82,6 +94,59 @@ function cacheResetTokenPath() {
 	return (
 		process.env.WP_PERF_CACHE_RESET_TOKEN_FILE ||
 		join( __dirname, '..', '..', '.cache', 'performance-cache-reset-token' )
+	);
+}
+
+/**
+ * Reads the active theme's stylesheet slug out of the admin themes page.
+ *
+ * Taken from the page rather than from `/wp/v2/themes`, which is the obvious source and
+ * the wrong one here: that controller reports update availability, so serving it can wait
+ * on an outbound request to the .org API, and an installation without egress - which a
+ * measurement sandbox usually is - answers it minutes later or not at all. The themes page
+ * is what `RequestUtils.activateTheme()` already reads to find its activation nonce, so
+ * recording the slug and putting it back afterwards use one page and one mechanism.
+ *
+ * The marker is core's own template: the active theme's card carries `class="theme active"`
+ * and its heading carries `id="{$stylesheet}-name"`. The stylesheet is what is wanted
+ * rather than the template, so that a child theme is restored as the child theme.
+ *
+ * @param {string} html Body of wp-admin/themes.php.
+ * @return {string} Stylesheet slug, or '' when the page does not identify one.
+ */
+function activeThemeFromThemesPage( html ) {
+	if ( 'string' !== typeof html ) {
+		return '';
+	}
+
+	const active = html.indexOf( 'class="theme active"' );
+
+	if ( 0 > active ) {
+		return '';
+	}
+
+	const name = html
+		.slice( active )
+		.match( /class="theme-name" id="([A-Za-z0-9_-]+)-name"/ );
+
+	return name ? name[ 1 ] : '';
+}
+
+/**
+ * Where the theme that was active before the run is recorded.
+ *
+ * Beside the cache reset token, and for the same reasons: git-ignored, outside the served
+ * document root, and resolved from this file's location so that it is the same path
+ * whichever directory the suite was started from. The global setup writes the slug here
+ * and the global teardown consumes it, which the two cannot do through a module variable
+ * because they are not guaranteed to share a process.
+ *
+ * @return {string} Absolute path of the record.
+ */
+function previousThemePath() {
+	return (
+		process.env.WP_PERF_PREVIOUS_THEME_FILE ||
+		join( __dirname, '..', '..', '.cache', 'performance-previous-theme' )
 	);
 }
 
@@ -660,6 +725,8 @@ module.exports = {
 	CACHE_RESET_TOKEN_PATTERN,
 	cacheResetTokenPath,
 	cacheResetToken,
+	activeThemeFromThemesPage,
+	previousThemePath,
 	revokeCacheResetToken,
 	clearServerCaches,
 	invalidSeriesReason,
@@ -670,6 +737,7 @@ module.exports = {
 	formatAsMarkdownTable,
 	formatValue,
 	isComparableMetric,
+	booleanMetrics,
 	getJavaScriptResponseByteSizes,
 	linkToSha,
 	standardDeviation,

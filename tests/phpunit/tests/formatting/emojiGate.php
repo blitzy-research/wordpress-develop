@@ -22,12 +22,40 @@ class Tests_Formatting_EmojiGate extends WP_UnitTestCase {
 	private $filter_calls = array();
 
 	/**
+	 * Context derived while 'embed_head' was running.
+	 *
+	 * @var string|null
+	 */
+	private $embedded_context = null;
+
+	/**
+	 * Screen in place before a test replaced it, so it can be put back.
+	 *
+	 * @var WP_Screen|null
+	 */
+	private $previous_screen = null;
+
+	/**
 	 * Resets the recorded filter calls before every test.
 	 */
 	public function set_up() {
 		parent::set_up();
 
-		$this->filter_calls = array();
+		$this->filter_calls    = array();
+		$this->previous_screen = get_current_screen();
+	}
+
+	/**
+	 * Puts the screen back, since the context under test is derived from it.
+	 */
+	public function tear_down() {
+		if ( $this->previous_screen instanceof WP_Screen ) {
+			$GLOBALS['current_screen'] = $this->previous_screen;
+		} else {
+			unset( $GLOBALS['current_screen'] );
+		}
+
+		parent::tear_down();
 	}
 
 	/**
@@ -41,6 +69,87 @@ class Tests_Formatting_EmojiGate extends WP_UnitTestCase {
 		$this->filter_calls[] = array( $should_load, $context );
 
 		return $should_load;
+	}
+
+	/**
+	 * Records one call to the filter and then declines the script.
+	 *
+	 * Declining is what makes this usable on print_emoji_detection_script(): that
+	 * function keeps a one-shot in a function static that no test can reset, and it sets
+	 * the static only once the gate has agreed. A recorder that let the default through
+	 * would consume the one-shot for the rest of the process and leave every later case
+	 * that needs the function's body dependent on running first.
+	 *
+	 * @param bool   $should_load Incoming value of the flag.
+	 * @param string $context     Incoming context.
+	 * @return false Always declines.
+	 */
+	public function record_call_and_decline( $should_load, $context = null ) {
+		$this->filter_calls[] = array( $should_load, $context );
+
+		return false;
+	}
+
+	/**
+	 * Returns the context print_emoji_detection_script() derived on this request.
+	 *
+	 * The derivation is not a return value and not an argument - the function is hooked
+	 * on 'wp_head', 'embed_head' and 'admin_print_scripts', none of which passes one - so
+	 * the context is read back through the filter the function consults, which is the
+	 * only place it is observable.
+	 *
+	 * @return string|null The context the function derived, or null when the gate was
+	 *                     never consulted.
+	 */
+	private function derived_context() {
+		$this->filter_calls = array();
+
+		add_filter( 'should_load_emoji_detection_script', array( $this, 'record_call_and_decline' ), 10, 2 );
+		print_emoji_detection_script();
+		remove_filter( 'should_load_emoji_detection_script', array( $this, 'record_call_and_decline' ), 10 );
+
+		if ( array() === $this->filter_calls ) {
+			return null;
+		}
+
+		return $this->filter_calls[0][1];
+	}
+
+	/**
+	 * Reads the derived context from inside the 'embed_head' action.
+	 *
+	 * doing_action( 'embed_head' ) is only true while that action is running, so the
+	 * reading has to happen from a callback on it rather than from the test body.
+	 */
+	public function derive_context_from_embed_head() {
+		$this->embedded_context = $this->derived_context();
+	}
+
+	/**
+	 * Asserts that an oEmbed template is reported as the embed context.
+	 *
+	 * @param string $screen Screen to render the template on.
+	 */
+	private function assert_embed_head_is_the_embed_context( $screen ) {
+		set_current_screen( $screen );
+
+		/*
+		 * Emptied of its other callbacks before it is fired, so nothing but the function
+		 * under test runs and no styles or scripts of a template this request is not
+		 * really rendering reach the global queues. WP_UnitTestCase clones $wp_filter in
+		 * set_up() and restores it in tear_down(), so the action is put back afterwards.
+		 */
+		remove_all_actions( 'embed_head' );
+		add_action( 'embed_head', array( $this, 'derive_context_from_embed_head' ) );
+
+		$this->embedded_context = null;
+		do_action( 'embed_head' );
+
+		$this->assertSame(
+			'embed',
+			$this->embedded_context,
+			"An oEmbed template should be reported as the embed context on the {$screen} screen."
+		);
 	}
 
 	/**
@@ -122,12 +231,12 @@ class Tests_Formatting_EmojiGate extends WP_UnitTestCase {
 		);
 		remove_filter( 'should_load_emoji_detection_script', '__return_false' );
 
-		add_filter( 'should_load_emoji_detection_script', array( $this, '__return_truthy_string' ) );
+		add_filter( 'should_load_emoji_detection_script', array( $this, 'return_truthy_string' ) );
 		$this->assertTrue(
 			wp_should_load_emoji_detection_script( 'front' ),
 			'A truthy non-boolean should be cast to true.'
 		);
-		remove_filter( 'should_load_emoji_detection_script', array( $this, '__return_truthy_string' ) );
+		remove_filter( 'should_load_emoji_detection_script', array( $this, 'return_truthy_string' ) );
 	}
 
 	/**
@@ -135,19 +244,58 @@ class Tests_Formatting_EmojiGate extends WP_UnitTestCase {
 	 *
 	 * @return string A non-empty string.
 	 */
-	public function __return_truthy_string() {
+	public function return_truthy_string() {
 		return 'yes';
 	}
 
 	/**
-	 * The public hooked function declines without consuming its one-shot, then prints once.
+	 * The public hooked function derives its context, declines without consuming its
+	 * one-shot, and then prints once.
 	 *
-	 * Both halves are asserted in one test because the one-shot lives in a function static
-	 * that no test can reset: splitting them would make the pair order dependent.
+	 * All of it is asserted in one test because the one-shot lives in a function static
+	 * that no test can reset, and only a declined call leaves it unused. Splitting these
+	 * assertions across methods would make every one of them dependent on running before
+	 * the one that prints: once that has happened, the function returns at its guard and
+	 * the context is never derived again for the rest of the process.
+	 *
+	 * The context is asserted first, and it matters because the three branches decide who
+	 * keeps the script. Only the front end is opted out by default, so a derivation that
+	 * answered 'front' everywhere would silently withdraw the script from the admin and
+	 * from every oEmbed template as well, and one that never answered 'front' would leave
+	 * the front-end payload in place. Neither is visible from
+	 * wp_should_load_emoji_detection_script(), which is passed the context rather than
+	 * deriving it, so this is the only place the derivation can be read. Each derivation
+	 * is made through a filter that declines, which is what keeps the one-shot intact for
+	 * the second half of this test.
 	 *
 	 * @covers ::print_emoji_detection_script
 	 */
-	public function test_declining_does_not_consume_the_one_shot() {
+	public function test_the_context_is_derived_and_declining_does_not_consume_the_one_shot() {
+		set_current_screen( 'dashboard' );
+
+		$this->assertTrue( is_admin(), 'The admin case must be an admin request.' );
+		$this->assertSame(
+			'admin',
+			$this->derived_context(),
+			'An admin request should be reported as the admin context, which keeps the script.'
+		);
+
+		/*
+		 * 'embed' is checked ahead of is_admin() in the function under test, so an oEmbed
+		 * template is reported as 'embed' wherever it is rendered. Both are asserted.
+		 */
+		$this->assert_embed_head_is_the_embed_context( 'dashboard' );
+		$this->assert_embed_head_is_the_embed_context( 'front' );
+
+		set_current_screen( 'front' );
+
+		$this->assertFalse( is_admin(), 'The front-end case must not be an admin request.' );
+		$this->assertSame(
+			'front',
+			$this->derived_context(),
+			'A front-end request should be reported as the front context.'
+		);
+
 		$this->assertFalse(
 			(bool) has_action( 'wp_print_footer_scripts', '_print_emoji_detection_script' ),
 			'Nothing should be scheduled before the hooked function runs.'

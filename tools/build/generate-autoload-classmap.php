@@ -522,10 +522,12 @@ function wp_autoload_classmap_inspect_file( $file ) {
 	 * A file that cannot be read cannot be judged. Treating the failure as "declares
 	 * nothing" would drop a mappable class from the map without saying so, and the
 	 * loss would only appear later as a name the autoloader cannot resolve, so the
-	 * read is checked and reported here instead. The suppression stays on the
-	 * tokenizer alone, which warns about a source file it cannot make sense of.
+	 * read is checked and reported here instead. It is suppressed for the same reason
+	 * the tokenizer below is: the failure is reported by the message under it, which
+	 * names the file and says what the run was doing with it, and PHP's own warning
+	 * ahead of that only repeats the path with none of the context.
 	 */
-	$source = file_get_contents( $file );
+	$source = @file_get_contents( $file ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
 
 	if ( false === $source ) {
 		wp_autoload_classmap_fail( sprintf( 'Unable to read %s while deciding whether it can be autoloaded.', $file ) );
@@ -1030,9 +1032,10 @@ function wp_autoload_classmap_required_paths( $file, $src_dir ) {
 	 * Reported rather than read as an empty file, for the same reason as in
 	 * wp_autoload_classmap_inspect_file(): a file whose requires cannot be read would
 	 * be taken to require nothing, which would shrink the set of names the bootstrap
-	 * is known to load and let a class be mapped whose parent is not resolvable.
+	 * is known to load and let a class be mapped whose parent is not resolvable. The
+	 * read is suppressed there too, so the only thing printed is the message below.
 	 */
-	$source = file_get_contents( $file );
+	$source = @file_get_contents( $file ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
 
 	if ( false === $source ) {
 		wp_autoload_classmap_fail( sprintf( 'Unable to read %s while resolving what the bootstrap loads.', $file ) );

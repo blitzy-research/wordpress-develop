@@ -10,7 +10,18 @@
  * counts are attributed correctly, bounded, and reported once it is on.
  *
  * Every case runs against its own WP_Object_Cache instance rather than the global one, so
- * the counters observed are only the ones the case made.
+ * the counters observed are only the ones the case made. That instance is of whatever class
+ * owns the name at run time, which is why the whole class is skipped while an
+ * `object-cache.php` drop-in is installed: the register is a member of core's
+ * WP_Object_Cache, and a drop-in that replaces the class replaces the register with it.
+ *
+ * The skip is decided by wp_using_ext_object_cache() rather than by an `instanceof`
+ * check, because a drop-in declares the class name itself - the memcached drop-in the
+ * workflows install, tests/phpunit/includes/object-cache.php, declares
+ * `class WP_Object_Cache` with none of these members - so every instance is an instance of
+ * `WP_Object_Cache` whichever file declared it, and an `instanceof` guard is always true.
+ * The same condition and the same message guard core's own WP_Object_Cache cases in
+ * tests/phpunit/tests/cache.php and tests/phpunit/tests/option/transient.php.
  *
  * @group cache
  * @group objectcache
@@ -29,19 +40,14 @@ class Tests_Cache_ObjectCacheGroupStats extends WP_UnitTestCase {
 	public function set_up() {
 		parent::set_up();
 
+		if ( wp_using_ext_object_cache() ) {
+			$this->markTestSkipped( 'This test requires that an external object cache is not in use.' );
+		}
+
 		global $wp_object_cache;
 
 		$cache_class = get_class( $wp_object_cache );
 		$this->cache = new $cache_class();
-	}
-
-	/**
-	 * Skips a case when a drop-in has replaced the class these properties belong to.
-	 *
-	 * @return bool Whether the register under test is present.
-	 */
-	private function register_is_available() {
-		return $this->cache instanceof WP_Object_Cache;
 	}
 
 	/**
@@ -67,11 +73,6 @@ class Tests_Cache_ObjectCacheGroupStats extends WP_UnitTestCase {
 	 * @covers ::get
 	 */
 	public function test_hits_and_misses_are_attributed_per_group() {
-		if ( ! $this->register_is_available() ) {
-			$this->assertTrue( true, 'A drop-in owns the cache class, so there is no register to attribute against.' );
-			return;
-		}
-
 		$this->cache->track_group_stats = true;
 
 		$this->cache->set( 'key', 'value', 'alpha' );
@@ -105,11 +106,6 @@ class Tests_Cache_ObjectCacheGroupStats extends WP_UnitTestCase {
 	 * @covers ::get_multiple
 	 */
 	public function test_per_group_totals_match_the_global_counters() {
-		if ( ! $this->register_is_available() ) {
-			$this->assertTrue( true, 'A drop-in owns the cache class, so there is no register to reconcile.' );
-			return;
-		}
-
 		$this->cache->track_group_stats = true;
 
 		$this->cache->set( 'one', 1, 'alpha' );
@@ -137,11 +133,6 @@ class Tests_Cache_ObjectCacheGroupStats extends WP_UnitTestCase {
 	 * @covers ::get
 	 */
 	public function test_enabling_part_way_through_counts_from_that_point() {
-		if ( ! $this->register_is_available() ) {
-			$this->assertTrue( true, 'A drop-in owns the cache class, so there is nothing to enable.' );
-			return;
-		}
-
 		$this->cache->set( 'key', 'value', 'alpha' );
 		$this->cache->get( 'key', 'alpha' );
 
@@ -168,11 +159,6 @@ class Tests_Cache_ObjectCacheGroupStats extends WP_UnitTestCase {
 	 * @covers ::get
 	 */
 	public function test_growth_is_bounded_by_the_cap() {
-		if ( ! $this->register_is_available() ) {
-			$this->assertTrue( true, 'A drop-in owns the cache class, so there is no cap to enforce.' );
-			return;
-		}
-
 		$this->cache->track_group_stats  = true;
 		$this->cache->max_tracked_groups = 3;
 
@@ -194,11 +180,6 @@ class Tests_Cache_ObjectCacheGroupStats extends WP_UnitTestCase {
 	 * @covers ::flush
 	 */
 	public function test_counters_survive_a_flush() {
-		if ( ! $this->register_is_available() ) {
-			$this->assertTrue( true, 'A drop-in owns the cache class, so there are no counters to preserve.' );
-			return;
-		}
-
 		$this->cache->track_group_stats = true;
 
 		$this->cache->set( 'key', 'value', 'alpha' );
@@ -219,11 +200,6 @@ class Tests_Cache_ObjectCacheGroupStats extends WP_UnitTestCase {
 	 * @covers ::stats
 	 */
 	public function test_stats_reports_the_breakdown_only_when_it_was_collected() {
-		if ( ! $this->register_is_available() ) {
-			$this->assertTrue( true, 'A drop-in owns the cache class, so stats() is not the one under test.' );
-			return;
-		}
-
 		$this->cache->set( 'key', 'value', 'alpha' );
 		$this->cache->get( 'key', 'alpha' );
 
@@ -252,11 +228,6 @@ class Tests_Cache_ObjectCacheGroupStats extends WP_UnitTestCase {
 	 * @covers ::stats
 	 */
 	public function test_stats_escapes_group_names() {
-		if ( ! $this->register_is_available() ) {
-			$this->assertTrue( true, 'A drop-in owns the cache class, so stats() is not the one under test.' );
-			return;
-		}
-
 		$this->cache->track_group_stats = true;
 
 		$this->cache->set( 'key', 'value', '<script>alert(1)</script>' );

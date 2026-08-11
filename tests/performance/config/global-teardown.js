@@ -1,12 +1,74 @@
 /**
  * External dependencies
  */
-import { rmSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { request } from '@playwright/test';
+
+/**
+ * WordPress dependencies
+ */
+import { RequestUtils } from '@wordpress/e2e-test-utils-playwright';
 
 /**
  * Internal dependencies
  */
-import { revokeCacheResetToken } from '../utils';
+import { previousThemePath, revokeCacheResetToken } from '../utils';
+
+/**
+ * Puts back the theme that was active before the run.
+ *
+ * The suite activates a theme of its own to measure a known scenario, and leaving it
+ * behind hands the next thing that looks at this installation - another suite, or someone
+ * measuring a named theme by hand - a site that is no longer the one they think they are
+ * measuring. The record is removed whether or not the activation succeeds, so a stale slug
+ * cannot be applied by a later run, and a run that never recorded one leaves the theme
+ * alone.
+ *
+ * A failure here is reported rather than raised: the measurements are already taken, and
+ * failing the run over the cleanup would discard them.
+ *
+ * @param {import('@playwright/test').FullConfig} config Resolved Playwright configuration.
+ * @return {Promise<void>}
+ */
+async function restorePreviousTheme( config ) {
+	const path = previousThemePath();
+
+	if ( ! existsSync( path ) ) {
+		return;
+	}
+
+	let slug = '';
+
+	try {
+		slug = readFileSync( path, 'utf8' ).trim();
+	} catch ( error ) {
+		console.warn( `Could not read ${ path }: ${ error.message }` );
+	}
+
+	rmSync( path, { force: true } );
+
+	if ( '' === slug ) {
+		return;
+	}
+
+	const { storageState, baseURL } = config.projects[ 0 ].use;
+
+	try {
+		const requestContext = await request.newContext( { baseURL } );
+		const requestUtils = new RequestUtils( requestContext, {
+			storageStatePath:
+				'string' === typeof storageState ? storageState : undefined,
+		} );
+
+		await requestUtils.setupRest();
+		await requestUtils.activateTheme( slug );
+		await requestContext.dispose();
+	} catch ( error ) {
+		console.warn(
+			`Could not reactivate the ${ slug } theme, so it is still the suite's theme that is active: ${ error.message }`
+		);
+	}
+}
 
 /**
  * Removes the two secrets this run put on disk.
@@ -26,19 +88,23 @@ import { revokeCacheResetToken } from '../utils';
  * Only files are removed. Both paths are configurable, so removing a directory could
  * take something else with it.
  *
+ * The theme the run found active is put back last, because it is the one step that needs
+ * the site to answer and the two secrets above have to be withdrawn whether or not it
+ * does.
+ *
  * @param {import('@playwright/test').FullConfig} config Resolved Playwright configuration.
- * @return {void}
+ * @return {Promise<void>}
  */
-function globalTeardown( config ) {
+async function globalTeardown( config ) {
 	revokeCacheResetToken();
 
 	const { storageState } = config.projects[ 0 ].use;
 
-	if ( 'string' !== typeof storageState ) {
-		return;
+	if ( 'string' === typeof storageState ) {
+		rmSync( storageState, { force: true } );
 	}
 
-	rmSync( storageState, { force: true } );
+	await restorePreviousTheme( config );
 }
 
 export default globalTeardown;

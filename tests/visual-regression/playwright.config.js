@@ -4,6 +4,19 @@
 import path from 'node:path';
 import { defineConfig } from '@playwright/test';
 
+const dotenv = require( 'dotenv' );
+const dotenvExpand = require( 'dotenv-expand' );
+
+/*
+ * The local environment's .env is what records which port this checkout serves on, and
+ * the shared configuration resolves baseURL from WP_BASE_URL while it is being required,
+ * falling back to http://localhost:8889. Expanded here, before that require, so the
+ * snapshots are taken of this checkout's own admin rather than of whatever answers on
+ * 8889. Nothing already set in the environment is overwritten, so an explicit
+ * WP_BASE_URL still wins.
+ */
+dotenvExpand.expand( dotenv.config() );
+
 /**
  * WordPress dependencies
  */

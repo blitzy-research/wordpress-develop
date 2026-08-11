@@ -5,7 +5,10 @@
  *
  * Provisioning a secret is what enables the reset; the empty string returned when none is
  * usable is what makes the control plane below answer as though the endpoint did not
- * exist. The performance harness provisions a token before its first measured iteration
+ * exist - it refuses the harness with 404, so a missing token fails the run loudly, and
+ * it leaves an ordinary visit carrying the query argument to WordPress untouched, so no
+ * page a visitor asked for is replaced by a bare status. The performance harness
+ * provisions a token before its first measured iteration
  * (`tests/performance/utils.js`) and its global teardown is meant to delete it again
  * (`tests/performance/config/global-teardown.js`).
  *
@@ -221,6 +224,18 @@ function wp_perf_reset_caches() {
  * cross-origin form, a navigation or an embedded resource, and it keeps the secret out
  * of the address, the referrer and the browser history. Neither superglobal is trusted
  * beyond an isset() test before it has been unslashed and sanitized.
+ *
+ * The query argument alone does not make a request one this endpoint answers. The
+ * harness always addresses it with a POST carrying the token header, so a request that
+ * is neither is not addressing the endpoint at all - it is an ordinary visit that
+ * happens to carry an unrecognized query argument, which is what following a crafted
+ * link produces - and ending it with a bare status would replace the page a visitor
+ * asked for with a blank one. Such a request is left to WordPress untouched, so the
+ * installation answers exactly as it would with no control plane present, which is what
+ * this file is documented to look like when it is not provisioned. Nothing is reset on
+ * that path, so this widens no authorization; and the harness's own diagnostics are
+ * unaffected, because a POST presenting the header still reaches the ladder below and
+ * still receives 404, 405 or 403 by cause.
  */
 add_action(
 	'plugins_loaded',
@@ -237,6 +252,10 @@ add_action(
 		$presented = isset( $_SERVER['HTTP_X_WP_PERF_CACHE_RESET_TOKEN'] )
 			? sanitize_text_field( wp_unslash( $_SERVER['HTTP_X_WP_PERF_CACHE_RESET_TOKEN'] ) )
 			: '';
+
+		if ( 'post' !== $method && '' === $presented ) {
+			return;
+		}
 
 		$status = wp_perf_cache_reset_status( $method, $presented );
 
@@ -290,7 +309,7 @@ function wp_perf_bootstrap_duration( $duration = null ) {
 }
 
 /**
- * Returns the object cache hit and miss counters as validated integers.
+ * Returns the object cache hit and miss counters, or null for a counter it cannot read.
  *
  * The object cache global can be replaced wholesale by an 'object-cache.php' drop-in,
  * which is free to omit these counters, declare them non-public, expose them through
@@ -302,25 +321,41 @@ function wp_perf_bootstrap_duration( $duration = null ) {
  *
  * get_object_vars() is called from outside the class, so the snapshot it returns holds
  * only genuinely public properties and no magic accessor is ever consulted. A public
- * counter that is a finite numeric value within the integer range is cast to an integer,
- * so a fractional value is truncated; anything else - absent, non-numeric, non-finite or
- * out of range - is reported as 0, so the metric degrades without ever being omitted.
+ * counter that is a finite numeric value within the non-negative integer range is cast
+ * to an integer, so a fractional value is truncated.
+ *
+ * Anything else - absent, non-numeric, non-finite, negative or out of range - is
+ * reported as null, and the caller omits that metric from the header rather than
+ * publishing a zero for it. This is the difference between "this cache made no cache
+ * lookups" and "this cache does not publish that number", and a zero cannot carry it:
+ * the memcached drop-in the workflows install, tests/phpunit/includes/object-cache.php,
+ * declares its own WP_Object_Cache with neither counter, so a zero published for it
+ * would report a busy persistent cache as having neither hit nor missed anything, on
+ * exactly the matrix arm that exists to measure a persistent cache. An absent metric
+ * says so, and it says so to every consumer at once - the specs, the comparator and the
+ * published report - because a metric that was never emitted has no series to median.
+ *
+ * A negative counter is refused for the same reason it cannot simply be clamped to 0:
+ * both metrics are monotonic counts, WP_Object_Cache initialises each to 0 and only ever
+ * increments it, so a negative value can only arrive from a replacement cache that is
+ * keeping something else in that property, and a negative Server-Timing duration is not
+ * a sample any consumer of this header can read.
  *
  * @ignore
  * @since 7.0.0
  * @access private
  *
- * @return int[] {
- *     Object cache counters, both 0 when the counter is unavailable or unusable.
+ * @return array {
+ *     Object cache counters, null for a counter this cache does not publish usably.
  *
- *     @type int $hits   Number of object cache hits.
- *     @type int $misses Number of object cache misses.
+ *     @type int|null $hits   Number of object cache hits, or null.
+ *     @type int|null $misses Number of object cache misses, or null.
  * }
  */
 function wp_perf_object_cache_counters() {
 	$counters = array(
-		'hits'   => 0,
-		'misses' => 0,
+		'hits'   => null,
+		'misses' => null,
 	);
 
 	if ( ! isset( $GLOBALS['wp_object_cache'] ) || ! is_object( $GLOBALS['wp_object_cache'] ) ) {
@@ -342,7 +377,9 @@ function wp_perf_object_cache_counters() {
 		$counter_value = $public_properties[ $property ];
 
 		if ( is_int( $counter_value ) ) {
-			$counters[ $counter ] = $counter_value;
+			if ( 0 <= $counter_value ) {
+				$counters[ $counter ] = $counter_value;
+			}
 			continue;
 		}
 
@@ -352,15 +389,32 @@ function wp_perf_object_cache_counters() {
 
 		/*
 		 * A numeric string or a float is still usable, but only once it is known to be
-		 * finite and within the integer range: casting a non-finite or out-of-range
-		 * float can emit a conversion diagnostic, which is exactly the kind of notice
-		 * this function exists to keep out of the measured response.
+		 * finite and within the non-negative integer range: casting a non-finite or
+		 * out-of-range float can emit a conversion diagnostic, which is exactly the kind
+		 * of notice this function exists to keep out of the measured response, and a
+		 * negative value is refused here for the same reason it is refused above.
 		 */
 		$counter_number = (float) $counter_value;
 
-		if ( is_finite( $counter_number ) && $counter_number >= (float) PHP_INT_MIN && $counter_number < (float) PHP_INT_MAX ) {
+		if ( is_finite( $counter_number ) && 0.0 <= $counter_number && $counter_number < (float) PHP_INT_MAX ) {
 			$counters[ $counter ] = (int) $counter_number;
 		}
+	}
+
+	/*
+	 * Reported as a pair or not at all. The two numbers are only readable together - a
+	 * hit count with no miss count cannot be read as a ratio, and the comparison in
+	 * tests/performance/compare-results.js pairs them row by row - so a cache that
+	 * publishes one of them usably and the other not is a cache whose counters cannot be
+	 * read, not a cache with one counter. Deciding that here is also what lets the specs
+	 * assert the far stronger property that the two metrics are either both present or
+	 * both absent, instead of accepting whichever subset arrived.
+	 */
+	if ( null === $counters['hits'] || null === $counters['misses'] ) {
+		return array(
+			'hits'   => null,
+			'misses' => null,
+		);
 	}
 
 	return $counters;
@@ -480,9 +534,22 @@ add_filter(
 				$server_timing_values['ext-obj-cache'] = wp_using_ext_object_cache() ? 1 : 0;
 				$server_timing_values['memory-peak']   = $memory_peak;
 				$server_timing_values['files-loaded']  = (int) count( get_included_files() );
-				$server_timing_values['cache-hits']    = $cache_counters['hits'];
-				$server_timing_values['cache-misses']  = $cache_counters['misses'];
 				$server_timing_values['bootstrap']     = null === $bootstrap ? 0.0 : $bootstrap;
+
+				/*
+				 * Published only by an object cache that keeps these counters, and left
+				 * out of the header entirely by one that does not, for the reason given
+				 * on wp_perf_object_cache_counters(): a zero here would be read as a
+				 * measured absence of cache traffic. They are last so that the metrics
+				 * every installation reports keep a fixed position in the header.
+				 */
+				if ( null !== $cache_counters['hits'] ) {
+					$server_timing_values['cache-hits'] = $cache_counters['hits'];
+				}
+
+				if ( null !== $cache_counters['misses'] ) {
+					$server_timing_values['cache-misses'] = $cache_counters['misses'];
+				}
 
 				$header_values = array();
 				foreach ( $server_timing_values as $slug => $value ) {
@@ -554,9 +621,20 @@ add_action(
 				$server_timing_values['ext-obj-cache'] = wp_using_ext_object_cache() ? 1 : 0;
 				$server_timing_values['memory-peak']   = $memory_peak;
 				$server_timing_values['files-loaded']  = (int) count( get_included_files() );
-				$server_timing_values['cache-hits']    = $cache_counters['hits'];
-				$server_timing_values['cache-misses']  = $cache_counters['misses'];
 				$server_timing_values['bootstrap']     = null === $bootstrap ? 0.0 : $bootstrap;
+
+				/*
+				 * Omitted rather than zeroed when this cache does not publish them, for
+				 * the reason given on wp_perf_object_cache_counters() and in the
+				 * front-end collector above, and last for the same reason.
+				 */
+				if ( null !== $cache_counters['hits'] ) {
+					$server_timing_values['cache-hits'] = $cache_counters['hits'];
+				}
+
+				if ( null !== $cache_counters['misses'] ) {
+					$server_timing_values['cache-misses'] = $cache_counters['misses'];
+				}
 
 				$header_values = array();
 				foreach ( $server_timing_values as $slug => $value ) {

@@ -462,6 +462,64 @@ class Tests_Load_wpAutoloadClass extends WP_UnitTestCase {
 	}
 
 	/**
+	 * Tests that the committed class map is the map the generator makes from the tree.
+	 *
+	 * The cases above check every entry the map holds. None of them can see an entry the
+	 * map has *lost*: a name dropped from the map still leaves a well-formed map, the
+	 * autoloader answers that name by doing nothing, and the failure surfaces much later
+	 * as an undeclared class - and only on a request that references it, which for most of
+	 * the mapped names is no request any test makes. Removing an entry for a class with no
+	 * direct coverage therefore passed everything.
+	 *
+	 * Comparing against the generator closes that, because the generator is the only
+	 * definition of what the map should hold: it walks the tree, applies the eligibility
+	 * rules, and excludes what `wp-settings.php` already requires. Requiring it only
+	 * defines its functions, so the map can be built here and compared without writing
+	 * anything. Asserting equality rather than inclusion also catches the opposite defect:
+	 * an entry the generator would not produce, such as one left behind for a file the
+	 * bootstrap has since gone back to requiring, which would fatally redeclare its
+	 * symbol.
+	 *
+	 * The generator is run against the source tree rather than against ABSPATH, because
+	 * the committed map is a property of the committed tree and that is what has to hold
+	 * whichever tree the suite happens to be installed from.
+	 */
+	public function test_class_map_is_the_map_the_generator_produces_from_the_tree() {
+		$source_dir = dirname( untrailingslashit( ABSPATH ) ) . '/src/';
+		$generator  = dirname( untrailingslashit( ABSPATH ) ) . '/tools/build/generate-autoload-classmap.php';
+		$class_map  = $source_dir . 'wp-includes/autoload-classmap.php';
+
+		if ( ! is_readable( $generator ) || ! is_readable( $class_map ) ) {
+			$this->markTestSkipped( 'This test requires the development tree the class map is generated from.' );
+		}
+
+		require_once $generator;
+
+		$this->assertTrue(
+			function_exists( 'wp_autoload_classmap_build' ),
+			'The class map generator must expose its build step without generating anything.'
+		);
+
+		$built     = wp_autoload_classmap_build( $source_dir );
+		$committed = require $class_map;
+
+		$this->assertIsArray( $committed, 'The committed class map must return an array.' );
+		$this->assertNotEmpty( $committed, 'The committed class map must not be empty.' );
+
+		$this->assertSame(
+			array_keys( $built['map'] ),
+			array_keys( $committed ),
+			'The committed class map must hold exactly the names the generator produces from the source tree, in the same order. Run `grunt build:autoload-classmap` after changing wp-settings.php or adding a class file.'
+		);
+
+		$this->assertSame(
+			$built['map'],
+			$committed,
+			'The committed class map must point every name at the file the generator resolves it to.'
+		);
+	}
+
+	/**
 	 * Returns the generated class map that wp_autoload_class() resolves against.
 	 *
 	 * Consumes the generated manifest the way core does elsewhere: a PHP file

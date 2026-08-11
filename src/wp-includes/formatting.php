@@ -5902,11 +5902,20 @@ function wp_enqueue_emoji_styles() {
  *
  * It is skipped by default on the front end, where it was measured: the settings object
  * and the inlined loader are the largest fixed block in the document head of a page that
- * may contain no emoji at all. It is printed by default everywhere else it is hooked -
- * the admin and oEmbed templates - because the cost was not measured there and turning it
- * off would change those screens without a measurement behind it. Any context can be
+ * may contain no emoji at all. Every other context it is hooked in - the admin and oEmbed
+ * templates - is left exactly as it was, because the cost was not measured there and
+ * turning it off would change those screens without a measurement behind it. Left as it
+ * was means the oEmbed template still prints it and an admin screen still does not: an
+ * admin request reaches print_emoji_detection_script() through 'admin_print_scripts',
+ * which defers the worker to 'wp_print_footer_scripts', and that action is fired only
+ * from wp_print_footer_scripts() on 'wp_footer', 'login_footer' and 'embed_footer'. That
+ * is long-standing behaviour this function does not change either way. Any context can be
  * decided differently, globally or for a single request, through the
  * {@see 'should_load_emoji_detection_script'} filter, which receives the context.
+ *
+ * A filter callback that ignores that argument decides all three contexts at once: the
+ * embed context is the oEmbed template this site serves to be rendered inside other
+ * sites, so declining it changes what those sites display, not only this one.
  *
  * Server-side emoji handling is not affected in any context. Feeds and email are still
  * processed by wp_staticize_emoji() and wp_staticize_emoji_for_email(), and the emoji
@@ -5927,6 +5936,23 @@ function wp_should_load_emoji_detection_script( $context = 'front' ) {
 	 * Returning true prints the emoji settings object and inlines the emoji loader on the
 	 * current request. Returning false skips both, leaving emoji to the font support of
 	 * the browser.
+	 *
+	 * This filter runs for every context, so a callback that answers without reading
+	 * `$context` answers for all three. In particular, attaching `__return_false` also
+	 * turns the script off in the 'embed' context - the oEmbed template WordPress serves
+	 * for this site to be rendered inside other sites - and in the admin, neither of
+	 * which is skipped by default. That is a supported choice, and it is worth making
+	 * deliberately rather than as a side effect: to change one context only, read the
+	 * second argument.
+	 *
+	 *     add_filter(
+	 *         'should_load_emoji_detection_script',
+	 *         function ( $should_load, $context ) {
+	 *             return 'embed' === $context ? $should_load : false;
+	 *         },
+	 *         10,
+	 *         2
+	 *     );
 	 *
 	 * @since 7.0.0
 	 *
@@ -6265,16 +6291,17 @@ function wp_staticize_emoji_for_email( $mail ) {
  *
  * @param string $type Optional. Which array type to return. Accepts 'partials' or 'entities', default 'entities'.
  * @return array An array to match all emoji that WordPress recognises. An empty array if the
- *               emoji data file is missing or does not contain the expected data.
+ *               emoji data file is missing, unreadable, or does not contain the expected data.
  */
 function _wp_emoji_list( $type = 'entities' ) {
 	static $emoji_list = null;
 
 	if ( null === $emoji_list ) {
 		/*
-		 * Seeded with empty arrays, so an absent data file, or one that returns something
-		 * other than the two expected arrays, degrades to an empty list. Callers iterate
-		 * over the return value directly, so this function returns an array either way.
+		 * Seeded with empty arrays, so a data file that is absent or unreadable, or one that
+		 * returns something other than the two expected arrays, degrades to an empty list.
+		 * Callers iterate over the return value directly, so this function returns an array
+		 * either way.
 		 */
 		$emoji_list = array(
 			'entities' => array(),
@@ -6283,7 +6310,16 @@ function _wp_emoji_list( $type = 'entities' ) {
 
 		$emoji_arrays_file = ABSPATH . WPINC . '/emoji-arrays.php';
 
-		if ( file_exists( $emoji_arrays_file ) ) {
+		/*
+		 * is_readable() rather than file_exists(): a data file that exists but cannot be
+		 * opened would pass a file_exists() check and then make the require below raise an
+		 * uncatchable E_COMPILE_ERROR, aborting the request and disclosing the absolute
+		 * path, which is the opposite of the documented behaviour of degrading to an empty
+		 * list. A file being rewritten in place, a partial deploy and a restrictive umask
+		 * all produce exactly that state, and wp_autoload_class() guards its own generated
+		 * file the same way for the same reason.
+		 */
+		if ( is_readable( $emoji_arrays_file ) ) {
 			$emoji_data = require $emoji_arrays_file;
 
 			if ( is_array( $emoji_data ) ) {

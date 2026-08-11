@@ -15,6 +15,7 @@ const {
 	formatAsMarkdownTable,
 	formatValue,
 	isComparableMetric,
+	booleanMetrics,
 	linkToSha,
 	standardDeviation,
 	medianAbsoluteDeviation,
@@ -363,6 +364,38 @@ for ( const { title, results } of afterStats ) {
 			) {
 				fail(
 					`${ metric } holds ${ afterShape.samples[ metric ] } samples after and ${ beforeShape.samples[ metric ] } before for ${ title }.`
+				);
+			}
+		}
+
+		/*
+		 * A flag metric describes the environment the code ran in, not the code. When the
+		 * two arms disagree about one, every difference in the row is a difference between
+		 * two environments as much as between two revisions, and none of them can be
+		 * attributed: a persistent object cache appearing in the after arm alone removes
+		 * queries and moves the heap on its own, which reads in the table as an
+		 * improvement the change set did not make. So the pair is refused here rather than
+		 * printed with a caveat, before any difference is computed.
+		 */
+		for ( const metric of afterShape.metrics ) {
+			if ( ! booleanMetrics.has( metric ) ) {
+				continue;
+			}
+
+			const afterFlag = median( newResults[ metric ] );
+			const beforeFlag = median(
+				accumulateValues( prevStat.results )[ metric ]
+			);
+
+			if ( afterFlag !== beforeFlag ) {
+				fail(
+					`${ title } was measured with ${ metric } ${ formatValue(
+						metric,
+						beforeFlag
+					) } before and ${ formatValue(
+						metric,
+						afterFlag
+					) } after, so the two runs describe different environments and no difference between them can be attributed to the code.`
 				);
 			}
 		}

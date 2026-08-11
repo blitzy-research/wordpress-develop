@@ -1,20 +1,26 @@
 <?php
 
 /**
- * Covers the request-scoped memo on the post edit and delete arms of map_meta_cap().
+ * Covers what the post edit and delete arms of map_meta_cap() answer from, check by check.
  *
- * The memo answers a repeated check from a key built out of every input those arms read,
- * so the property that matters is not that it is fast but that it can never be the reason
- * two checks disagree. Each case here changes one input between two otherwise identical
- * checks and asserts that the answer moves with it, or exercises a case the memo has to
- * decline outright.
+ * Every call resolves the post, its type and the surrounding settings again, so no two
+ * checks in one request can disagree because one of them was answered from something
+ * stale. Each case here changes one input between two otherwise identical checks and
+ * asserts that the answer moves with it, or exercises a case that has to be resolved
+ * from somewhere other than the post's own fields.
+ *
+ * These are the cases a caching layer in front of these arms would have to keep passing.
+ * A request-scoped memo was built here and withdrawn - it cost memory on every request
+ * that used it and could not demonstrate a time saving on a real request, which
+ * docs/performance-optimization-report.md records - so they stand as the guard against a
+ * future one being introduced without them.
  *
  * @group user
  * @group capabilities
  *
  * @covers ::map_meta_cap
  */
-class Tests_User_MapMetaCapMemoization extends WP_UnitTestCase {
+class Tests_User_MapMetaCapStateFidelity extends WP_UnitTestCase {
 
 	/**
 	 * An author who owns the fixtures.
@@ -65,7 +71,7 @@ class Tests_User_MapMetaCapMemoization extends WP_UnitTestCase {
 	/**
 	 * Changing the post status between two checks changes the answer.
 	 */
-	public function test_status_change_is_not_served_from_the_memo() {
+	public function test_status_change_changes_the_answer() {
 		$post_id = $this->published_post();
 
 		$published = map_meta_cap( 'edit_post', self::$author_id, $post_id );
@@ -87,7 +93,7 @@ class Tests_User_MapMetaCapMemoization extends WP_UnitTestCase {
 	/**
 	 * Changing the post author between two checks changes the answer.
 	 */
-	public function test_author_change_is_not_served_from_the_memo() {
+	public function test_author_change_changes_the_answer() {
 		$post_id = $this->published_post();
 
 		$own = map_meta_cap( 'edit_post', self::$author_id, $post_id );
@@ -144,7 +150,7 @@ class Tests_User_MapMetaCapMemoization extends WP_UnitTestCase {
 		$after = map_meta_cap( 'edit_post', self::$author_id, $post_id );
 		remove_filter( 'map_meta_cap', array( $this, 'deny_everything' ), 10 );
 
-		$this->assertSame( array( 'do_not_allow' ), $after, 'The filter must be applied even when the value came from the memo.' );
+		$this->assertSame( array( 'do_not_allow' ), $after, 'The filter must be applied to the value the arms resolved.' );
 	}
 
 	/**
@@ -159,7 +165,7 @@ class Tests_User_MapMetaCapMemoization extends WP_UnitTestCase {
 	/**
 	 * A filter that answers differently on each call is honoured on each call.
 	 */
-	public function test_a_filter_is_not_memoized() {
+	public function test_a_filter_decides_every_call() {
 		$post_id = $this->published_post();
 
 		$calls = 0;
@@ -175,7 +181,7 @@ class Tests_User_MapMetaCapMemoization extends WP_UnitTestCase {
 		remove_filter( 'map_meta_cap', $count );
 
 		$this->assertSame( array( 'counted_1' ), $first );
-		$this->assertSame( array( 'counted_2' ), $second, 'A filter must decide every call, memo or not.' );
+		$this->assertSame( array( 'counted_2' ), $second, 'A filter must decide every call.' );
 		$this->assertSame( 2, $calls, 'The filter must run once per call.' );
 	}
 
@@ -307,9 +313,9 @@ class Tests_User_MapMetaCapMemoization extends WP_UnitTestCase {
 	}
 
 	/**
-	 * A capability outside the memoized arms is unaffected.
+	 * A capability outside the post edit and delete arms is unaffected.
 	 */
-	public function test_a_capability_outside_the_memoized_arms_is_unaffected() {
+	public function test_a_capability_outside_the_post_arms_is_unaffected() {
 		$post_id = $this->published_post();
 
 		$this->assertSame(

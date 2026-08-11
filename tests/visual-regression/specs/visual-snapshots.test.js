@@ -163,4 +163,31 @@ test.describe( 'Admin Visual Snapshots', () => {
 			mask: elementsToHide.map( ( selector ) => page.locator( selector ) ),
 		});
 	} );
+
+	/*
+	 * The cases above mask `#wp-admin-bar-root-default`, which is the subtree the Command
+	 * Palette control lives in, so none of them can see that control appear or disappear.
+	 * This case screenshots the control itself, unmasked: it fails if the control stops
+	 * rendering, which is what happens when the `wp-core-commands` bundle behind it is not
+	 * enqueued on a screen.
+	 */
+	test( 'Admin Bar Command Palette control', async ({ admin, page }) => {
+		await admin.visitAdminPage( '/' );
+		await expect(
+			page.locator( '#wp-admin-bar-command-palette' )
+		).toHaveScreenshot( 'Admin Bar Command Palette control.png' );
+	} );
+
+	/*
+	 * No other case visits a block editor screen, so nothing above covers the editor's own
+	 * chrome. The header is the part of it that is the same on every install: the canvas
+	 * below it renders whatever the fixture holds, and its caret, block toolbar and
+	 * autosave indicator move between two screenshots of the same code.
+	 */
+	test( 'Post Editor header', async ({ admin, page }) => {
+		await admin.createNewPost();
+		await expect(
+			page.locator( '.editor-header' )
+		).toHaveScreenshot( 'Post Editor header.png' );
+	} );
 } );

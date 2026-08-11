@@ -18,6 +18,7 @@ import {
 	CACHE_RESET_TOKEN_HEADER,
 	CACHE_RESET_TOKEN_PATTERN,
 	accumulateValues,
+	activeThemeFromThemesPage,
 	camelCaseDashes,
 	formatValue,
 	getJavaScriptResponseByteSizes,
@@ -102,10 +103,24 @@ const reportedAs = {
 	wpExtObjCache: 'flag',
 	wpMemoryPeak: 'MB',
 	wpFilesLoaded: 'count',
+	wpBootstrap: 'ms',
 	wpCacheHits: 'count',
 	wpCacheMisses: 'count',
-	wpBootstrap: 'ms',
 };
+
+/**
+ * Reads one section of the producer, split at the boundary between its two collectors.
+ *
+ * @param {'front-end'|'admin'} context Request context to read.
+ * @return {string} Source of that collector.
+ */
+function producerSection( context ) {
+	const adminAt = producerSource.indexOf( "'admin_init'" );
+
+	return 'admin' === context
+		? producerSource.slice( adminAt )
+		: producerSource.slice( 0, adminAt );
+}
 
 /**
  * Reads the metric slugs the mu-plugin reports for one of its request contexts.
@@ -114,11 +129,7 @@ const reportedAs = {
  * @return {string[]} Slugs in the order the producer assigns them.
  */
 function producerSlugs( context ) {
-	const adminAt = producerSource.indexOf( "'admin_init'" );
-	const section =
-		'admin' === context
-			? producerSource.slice( adminAt )
-			: producerSource.slice( 0, adminAt );
+	const section = producerSection( context );
 
 	const slugs = [];
 	for ( const [ , slug ] of section.matchAll(
@@ -130,6 +141,61 @@ function producerSlugs( context ) {
 	}
 
 	return slugs;
+}
+
+/**
+ * Reads the metric slugs the mu-plugin publishes only when it has a value for them.
+ *
+ * A conditional metric is assigned inside a `null !==` guard over the counter snapshot,
+ * which is what distinguishes "this installation does not publish that number" from a
+ * number that happens to be 0. Reading the guards rather than a list is what keeps this
+ * classification derived from the producer instead of restated beside it.
+ *
+ * @param {'front-end'|'admin'} context Request context to read.
+ * @return {string[]} Slugs in the order the producer assigns them.
+ */
+function producerConditionalSlugs( context ) {
+	const section = producerSection( context );
+
+	const slugs = [];
+	for ( const [ , slug ] of section.matchAll(
+		/if \(\s*null !== \$cache_counters\[\s*'[a-z]+'\s*\]\s*\)\s*\{\s*\$server_timing_values\[\s*'([a-z-]+)'\s*\]\s*=/g
+	) ) {
+		if ( ! slugs.includes( slug ) ) {
+			slugs.push( slug );
+		}
+	}
+
+	return slugs;
+}
+
+/**
+ * Reads one declared list of metric slugs out of a spec.
+ *
+ * Bounded to the array literal rather than read from the declaration to the end of the
+ * file, because the specs classify their metrics in more than one list - required,
+ * conditional and structurally positive - and a slug named in two of them would
+ * otherwise be counted twice.
+ *
+ * @param {string} source Spec source.
+ * @param {string} name   Declared constant name.
+ * @return {?string[]} Slugs without the 'wp-' prefix, or null when the list is absent.
+ */
+function specSlugs( source, name ) {
+	const declaredAt = source.indexOf( `const ${ name } = [` );
+
+	if ( -1 === declaredAt ) {
+		return null;
+	}
+
+	const literal = source.slice(
+		declaredAt,
+		source.indexOf( '];', declaredAt )
+	);
+
+	return [ ...literal.matchAll( /'wp-([a-z-]+)'/g ) ].map(
+		( [ , slug ] ) => slug
+	);
 }
 
 /**
@@ -809,21 +875,141 @@ test.describe( 'Performance report utilities', () => {
 			}
 
 			for ( const [ name, source ] of attachingSpecs ) {
-				const required = [
-					...source
-						.slice(
-							source.indexOf( 'requiredServerTimingMetrics = [' )
-						)
-						.matchAll( /'wp-([a-z-]+)'/g ),
-				].map( ( [ , slug ] ) => slug );
-
 				const context =
 					'admin.test.js' === name ? 'admin' : 'front-end';
 
+				/*
+				 * Compared as one ordered sequence rather than as two lists, because the
+				 * producer assigns the conditional metrics last: the sequence is what
+				 * proves nothing was dropped on the way from one end to the other, and
+				 * the split between the two lists is what the next case asserts.
+				 */
 				expect(
-					required,
+					[
+						...specSlugs( source, 'requiredServerTimingMetrics' ),
+						...specSlugs(
+							source,
+							'conditionalServerTimingMetrics'
+						),
+					],
 					`${ name } should require exactly what the ${ context } collector emits`
 				).toEqual( producerSlugs( context ) );
+			}
+		} );
+
+		test( 'a counter the cache does not publish is omitted rather than reported as zero', () => {
+			/*
+			 * This is the difference between "this cache made no lookups" and "this cache
+			 * does not publish that number", and a zero cannot carry it. The memcached
+			 * drop-in the workflows install declares its own WP_Object_Cache with neither
+			 * counter, so publishing 0 for it reported a busy persistent cache as having
+			 * neither hit nor missed anything - on the one matrix arm that exists to
+			 * measure a persistent cache - and no assertion anywhere could tell that from
+			 * a measurement. Both ends of the distinction are read here: the producer has
+			 * to withhold the metric, and the specs have to classify it as one that may be
+			 * withheld.
+			 */
+			expect(
+				producerSource,
+				'an unreadable counter must be reported as null, not as 0'
+			).toMatch( /'hits'\s*=>\s*null,\s*\n\s*'misses'\s*=>\s*null,/ );
+
+			expect(
+				producerSource,
+				'the counter snapshot must not seed either counter with 0, which would be indistinguishable from a measured 0'
+			).not.toMatch( /'(?:hits|misses)'\s*=>\s*0\b/ );
+
+			for ( const context of [ 'front-end', 'admin' ] ) {
+				expect(
+					producerConditionalSlugs( context ),
+					`the ${ context } collector should publish both cache counters only when it has them`
+				).toEqual( [ 'cache-hits', 'cache-misses' ] );
+			}
+
+			for ( const [ name, source ] of attachingSpecs ) {
+				expect(
+					specSlugs( source, 'conditionalServerTimingMetrics' ),
+					`${ name } should treat both cache counters as metrics an installation may not publish`
+				).toEqual( [ 'cache-hits', 'cache-misses' ] );
+
+				expect(
+					specSlugs( source, 'requiredServerTimingMetrics' ),
+					`${ name } should not require a metric the installation may not publish`
+				).not.toContain( 'cache-hits' );
+
+				expect(
+					source,
+					`${ name } should assert that the counters arrive as a pair or not at all`
+				).toContain(
+					'should be reported as a pair or not at all, received'
+				);
+
+				expect(
+					source,
+					`${ name } should read absence as absence rather than as a value`
+				).toContain( 'undefined !== serverTiming[ metric ]' );
+			}
+		} );
+
+		test( 'a metric whose zero could not have been measured is rejected rather than accepted', () => {
+			/*
+			 * A request that reached the collector loaded files, allocated memory and took
+			 * time. Accepting any non-negative number for those metrics made a producer
+			 * that stopped measuring indistinguishable from an installation that got
+			 * faster: forcing one of them to a structural zero passed every check in the
+			 * suite while its median went into the published report as 0. The floor is
+			 * what turns that into a failing iteration.
+			 *
+			 * The query count and the object cache flag are excluded on purpose, and the
+			 * exclusion is asserted so that widening it later is a deliberate act: a
+			 * request served entirely from a cache can issue no query, and the flag is 0
+			 * on every installation without a drop-in.
+			 */
+			for ( const [ name, source ] of attachingSpecs ) {
+				const positive = specSlugs(
+					source,
+					'positiveServerTimingMetrics'
+				);
+
+				expect(
+					positive,
+					`${ name } should name the metrics whose zero could not have been measured`
+				).not.toBeNull();
+
+				for ( const slug of [
+					'total',
+					'memory-usage',
+					'memory-peak',
+					'files-loaded',
+					'bootstrap',
+				] ) {
+					expect(
+						positive,
+						`${ name } should refuse a zero for ${ slug }`
+					).toContain( slug );
+				}
+
+				for ( const slug of [ 'db-queries', 'ext-obj-cache' ] ) {
+					expect(
+						positive,
+						`${ name } should still accept a measured zero for ${ slug }`
+					).not.toContain( slug );
+				}
+
+				expect(
+					positive.every( ( slug ) =>
+						specSlugs(
+							source,
+							'requiredServerTimingMetrics'
+						).includes( slug )
+					),
+					`${ name } should only put a metric it requires under a floor`
+				).toBe( true );
+
+				expect(
+					source,
+					`${ name } should apply the floor to the value it measured`
+				).toContain( 'positive ? 0 < value : 0 <= value' );
 			}
 		} );
 	} );
@@ -975,6 +1161,49 @@ test.describe( 'Performance comparison contract', () => {
 
 		expect( run.status ).toBe( 1 );
 		expect( run.stderr ).toContain( 'samples after' );
+	} );
+
+	/*
+	 * The pair below is the one that looks most like proof and is worth least: real
+	 * measurements, real sample counts, matching scenarios, and a persistent object cache
+	 * behind only one of the two arms. Everything in the row then moves - queries fall,
+	 * the heap changes - for a reason that has nothing to do with the revision under test,
+	 * so the comparison has to be refused rather than annotated.
+	 */
+	test( 'refuses to pair runs measured under different object cache configurations', () => {
+		const run = compare(
+			[
+				scenario( {
+					wpExtObjCache: [ 0, 0 ],
+					wpDbQueries: [ 38, 37 ],
+				} ),
+			],
+			[ scenario( { wpExtObjCache: [ 1, 1 ], wpDbQueries: [ 31, 31 ] } ) ]
+		);
+
+		expect( run.status ).toBe( 1 );
+		expect( run.stderr ).toContain(
+			'wpExtObjCache no before and yes after'
+		);
+		expect( run.stderr ).toContain( 'different environments' );
+		// The fabricated improvement must not have been printed on the way out.
+		expect( run.stdout ).not.toContain( '-18.42 %' );
+	} );
+
+	test( 'compares runs measured under the same object cache configuration', () => {
+		const run = compare(
+			[
+				scenario( {
+					wpExtObjCache: [ 1, 1 ],
+					wpDbQueries: [ 31, 31 ],
+				} ),
+			],
+			[ scenario( { wpExtObjCache: [ 1, 1 ], wpDbQueries: [ 31, 31 ] } ) ]
+		);
+
+		expect( run.stderr ).toBe( '' );
+		expect( run.status ).toBe( 0 );
+		expect( run.stdout ).toContain( 'yes' );
 	} );
 
 	/*
@@ -1171,6 +1400,98 @@ test.describe( 'Performance reporter contract', () => {
 			restoreReporterEnvironment();
 		}
 	} );
+
+	test( 'discards the results of an earlier run when this one did not pass', () => {
+		const artifacts = mkdtempSync(
+			join( tmpdir(), 'wp-performance-reporter-' )
+		);
+		const results = join( artifacts, 'performance-results.json' );
+
+		try {
+			const reporter = reporterWithOneResult( artifacts );
+
+			writeFileSync(
+				results,
+				'[ "measurements of another code state" ]'
+			);
+
+			reporter.onEnd( { status: 'failed' } );
+
+			/*
+			 * Not writing is not the same as leaving nothing behind. The comparison
+			 * addresses this file by name, not by the run that produced it, so a file
+			 * an earlier run wrote sits exactly where compare-results.js reads and
+			 * would be reported as this run's measurements. The failure has to reach
+			 * the comparison as a missing file, which is the one thing it already
+			 * refuses to proceed on.
+			 */
+			expect(
+				existsSync( results ),
+				'a failed run must not leave the results of an earlier run in place'
+			).toBe( false );
+		} finally {
+			restoreReporterEnvironment();
+		}
+	} );
+
+	test( 'discards the results of an earlier run when this one measured nothing', () => {
+		const artifacts = mkdtempSync(
+			join( tmpdir(), 'wp-performance-reporter-' )
+		);
+		const results = join( artifacts, 'performance-results.json' );
+
+		try {
+			isolateReporterEnvironment( artifacts );
+
+			writeFileSync(
+				results,
+				'[ "measurements of another code state" ]'
+			);
+
+			new PerformanceReporter().onEnd( { status: 'passed' } );
+
+			expect(
+				existsSync( results ),
+				'a run that measured nothing must not leave earlier results in place'
+			).toBe( false );
+		} finally {
+			restoreReporterEnvironment();
+		}
+	} );
+
+	test( 'discards only the results file of the arm that refused', () => {
+		const artifacts = mkdtempSync(
+			join( tmpdir(), 'wp-performance-reporter-' )
+		);
+		const baseline = join( artifacts, 'before-performance-results.json' );
+		const results = join( artifacts, 'performance-results.json' );
+
+		try {
+			const reporter = reporterWithOneResult( artifacts );
+
+			writeFileSync( baseline, '[ "the baseline arm" ]' );
+			writeFileSync( results, '[ "the arm that is about to fail" ]' );
+
+			reporter.onEnd( { status: 'interrupted' } );
+
+			/*
+			 * Both arms of a comparison run in one artifacts directory, so a refusal
+			 * that reached beyond its own file would destroy a baseline that was
+			 * measured successfully and turn one failed arm into a whole comparison
+			 * that cannot be repeated.
+			 */
+			expect(
+				readFileSync( baseline, 'utf8' ),
+				'a refusing arm must leave the baseline arm untouched'
+			).toBe( '[ "the baseline arm" ]' );
+			expect(
+				existsSync( results ),
+				'a refusing arm must discard its own results'
+			).toBe( false );
+		} finally {
+			restoreReporterEnvironment();
+		}
+	} );
 } );
 
 test.describe( 'Performance evidence hygiene', () => {
@@ -1190,7 +1511,7 @@ test.describe( 'Performance evidence hygiene', () => {
 		expect( performanceConfig.globalTeardown ).toBeTruthy();
 	} );
 
-	test( 'deletes the run secrets once the run is over', () => {
+	test( 'deletes the run secrets once the run is over', async () => {
 		const directory = mkdtempSync(
 			join( tmpdir(), 'wp-performance-run-secrets-' )
 		);
@@ -1204,17 +1525,24 @@ test.describe( 'Performance evidence hygiene', () => {
 		writeFileSync( tokenFile, 'a'.repeat( 64 ) );
 
 		/*
-		 * Both secrets are redirected into the sandbox for the duration of the call.
-		 * The teardown withdraws the cache reset token from wherever this variable
-		 * points, and this suite runs in the same worker as the measuring specs, so
-		 * leaving it pointed at the run's own token would revoke the endpoint those
-		 * specs are still resetting through.
+		 * Every path the teardown writes to is redirected into the sandbox for the
+		 * duration of the call. The token is a secret it withdraws from wherever the
+		 * variable points, and this suite runs in the same worker as the measuring
+		 * specs, so leaving it pointed at the run's own token would revoke the endpoint
+		 * those specs are still resetting through. The theme record is redirected for
+		 * the same reason and one more: consuming the real one would leave the run's own
+		 * teardown with nothing to restore.
 		 */
 		const configured = process.env.WP_PERF_CACHE_RESET_TOKEN_FILE;
+		const configuredTheme = process.env.WP_PERF_PREVIOUS_THEME_FILE;
 		process.env.WP_PERF_CACHE_RESET_TOKEN_FILE = tokenFile;
+		process.env.WP_PERF_PREVIOUS_THEME_FILE = join(
+			directory,
+			'performance-previous-theme'
+		);
 
 		try {
-			globalTeardown( { projects: [ { use: { storageState } } ] } );
+			await globalTeardown( { projects: [ { use: { storageState } } ] } );
 
 			expect( existsSync( storageState ) ).toBe( false );
 
@@ -1225,15 +1553,46 @@ test.describe( 'Performance evidence hygiene', () => {
 			expect( existsSync( tokenFile ) ).toBe( false );
 
 			// A missing file is the desired end state, so running twice is not an error.
-			expect( () =>
+			await expect(
 				globalTeardown( { projects: [ { use: { storageState } } ] } )
-			).not.toThrow();
+			).resolves.toBeUndefined();
 		} finally {
 			if ( undefined === configured ) {
 				delete process.env.WP_PERF_CACHE_RESET_TOKEN_FILE;
 			} else {
 				process.env.WP_PERF_CACHE_RESET_TOKEN_FILE = configured;
 			}
+
+			if ( undefined === configuredTheme ) {
+				delete process.env.WP_PERF_PREVIOUS_THEME_FILE;
+			} else {
+				process.env.WP_PERF_PREVIOUS_THEME_FILE = configuredTheme;
+			}
 		}
+	} );
+
+	test( 'reads the active theme out of the themes page it will restore it through', () => {
+		const page =
+			'<div class="theme-browser"><div class="themes wp-clearfix">' +
+			'<div class="theme active"><div class="theme-screenshot"></div>' +
+			'<h2 class="theme-name" id="twentytwentyfive-name">' +
+			'<span>Active:</span> Twenty Twenty-Five</h2></div>' +
+			'<div class="theme"><h2 class="theme-name" id="twentytwentyone-name">' +
+			'Twenty Twenty-One</h2></div></div></div>';
+
+		expect( activeThemeFromThemesPage( page ) ).toBe( 'twentytwentyfive' );
+
+		/*
+		 * The slug is what the teardown passes to activateTheme(), so answering with a
+		 * guess would activate the wrong theme. A page that does not identify an active
+		 * theme has to produce nothing instead.
+		 */
+		expect(
+			activeThemeFromThemesPage(
+				page.replace( 'class="theme active"', 'class="theme"' )
+			)
+		).toBe( '' );
+		expect( activeThemeFromThemesPage( '' ) ).toBe( '' );
+		expect( activeThemeFromThemesPage( undefined ) ).toBe( '' );
 	} );
 } );

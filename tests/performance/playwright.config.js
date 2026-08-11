@@ -4,10 +4,29 @@
 import path from 'node:path';
 import { defineConfig } from '@playwright/test';
 
+const dotenv = require( 'dotenv' );
+const dotenvExpand = require( 'dotenv-expand' );
+
+/*
+ * The local environment's .env is what records which port this checkout serves on, and
+ * nothing else in a Playwright run reads it. The shared configuration resolves baseURL
+ * from WP_BASE_URL while it is being imported, and falls back to http://localhost:8889,
+ * so a checkout configured for any other port would otherwise be measured against
+ * whatever answers on 8889 - which, in a workspace holding more than one checkout, is a
+ * different site than the one whose code is under test.
+ *
+ * Loaded with require() rather than import, and before the shared configuration is
+ * required, because ES module imports are evaluated ahead of statements: an import of the
+ * shared configuration would read WP_BASE_URL before this line could set it. Neither
+ * dotenv nor the expansion overwrites a variable that is already set, so an explicit
+ * WP_BASE_URL still wins, and a checkout with no .env is unaffected.
+ */
+dotenvExpand.expand( dotenv.config() );
+
 /**
  * WordPress dependencies
  */
-import baseConfig from '@wordpress/scripts/config/playwright.config';
+const baseConfig = require( '@wordpress/scripts/config/playwright.config' );
 
 process.env.WP_ARTIFACTS_PATH ??= path.join( process.cwd(), 'artifacts' );
 

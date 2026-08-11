@@ -2,7 +2,7 @@
  * External dependencies
  */
 import { join, relative, sep } from 'node:path';
-import { writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { writeFileSync, existsSync, mkdirSync, rmSync } from 'node:fs';
 
 /**
  * Converts an absolute spec path into a repository-relative, POSIX-separated one.
@@ -38,6 +38,55 @@ function toRepositoryRelativePath( absolutePath ) {
 	}
 
 	return relativePath.split( sep ).join( '/' );
+}
+
+/**
+ * Resolves the results file the current run reads and writes.
+ *
+ * Both variables are read here rather than at each use, so the file a refused run
+ * discards is by construction the same one a successful run would have written.
+ * TEST_RESULTS_PREFIX is what distinguishes the arms of a comparison, so honouring
+ * it here is also what keeps one arm from ever touching another's artifact.
+ *
+ * @return {string|null} Absolute path, or null when no artifacts directory is configured.
+ */
+function resultsFilePath() {
+	const artifactsPath = process.env.WP_ARTIFACTS_PATH;
+
+	if ( 'string' !== typeof artifactsPath || '' === artifactsPath ) {
+		return null;
+	}
+
+	const prefix = process.env.TEST_RESULTS_PREFIX;
+
+	return join(
+		artifactsPath,
+		`${ prefix ? `${ prefix }-` : '' }performance-results.json`
+	);
+}
+
+/**
+ * Removes the results file of the arm that has just refused to write one.
+ *
+ * Refusing to write is not enough on its own: the file is not addressed by the run
+ * that produced it, so a results file left over from an earlier run stays exactly
+ * where the comparison looks for it, and `tests/performance/compare-results.js`
+ * would report medians for a code state that was never measured - with nothing in
+ * the output to indicate it. Discarding it turns that silent substitution into the
+ * missing-file error the comparison already raises.
+ *
+ * Only this arm's own file is removed, and only a file: `force` makes an absent one
+ * a no-op, which is the normal case.
+ *
+ * @param {string|null} file Results file resolved for this arm, or null when there is none.
+ * @return {void}
+ */
+function discardResults( file ) {
+	if ( null === file ) {
+		return;
+	}
+
+	rmSync( file, { force: true } );
 }
 
 /**
@@ -102,13 +151,24 @@ class PerformanceReporter {
 	 * write it is what keeps a partial run from being read as a measurement, and it
 	 * also protects a baseline that is already on disk from being replaced by one.
 	 *
+	 * A refusal discards the results file this arm would have written, because the
+	 * alternative is worse than writing nothing: an earlier run's file survives in
+	 * the one place the comparison reads, so the medians reported would describe a
+	 * code state this run never measured, with nothing in the output to say so.
+	 * Only this arm's own file is discarded, so a baseline arm and the arm it is
+	 * compared against cannot reach each other's artifact.
+	 *
 	 * @param {import('@playwright/test/reporter').FullResult} result
 	 */
 	onEnd( result ) {
+		const resultsFile = resultsFilePath();
+
 		if ( 'passed' !== result.status ) {
 			console.error(
 				`Performance results were not written: the run ${ result.status }, so its measurements are incomplete.`
 			);
+
+			discardResults( resultsFile );
 
 			return;
 		}
@@ -136,23 +196,22 @@ class PerformanceReporter {
 				'Performance results were not written: the run measured no scenarios.'
 			);
 
+			discardResults( resultsFile );
+
 			return;
+		}
+
+		if ( null === resultsFile ) {
+			throw new Error(
+				'Performance results cannot be written: WP_ARTIFACTS_PATH names no directory to write them to.'
+			);
 		}
 
 		if ( ! existsSync( process.env.WP_ARTIFACTS_PATH ) ) {
 			mkdirSync( process.env.WP_ARTIFACTS_PATH );
 		}
 
-		const prefix = process.env.TEST_RESULTS_PREFIX;
-		const fileNamePrefix = prefix ? `${ prefix }-` : '';
-
-		writeFileSync(
-			join(
-				process.env.WP_ARTIFACTS_PATH,
-				`${ fileNamePrefix }performance-results.json`
-			),
-			JSON.stringify( summary, null, 2 )
-		);
+		writeFileSync( resultsFile, JSON.stringify( summary, null, 2 ) );
 	}
 }
 

@@ -25,8 +25,42 @@ const requiredServerTimingMetrics = [
 	'wp-ext-obj-cache',
 	'wp-memory-peak',
 	'wp-files-loaded',
-	'wp-cache-hits',
-	'wp-cache-misses',
+	'wp-bootstrap',
+];
+
+/**
+ * Server-Timing entries only an installation whose object cache keeps them reports.
+ *
+ * An `object-cache.php` drop-in replaces the class these counters are members of, and
+ * the memcached drop-in the workflows install keeps neither, so the producer omits both
+ * rather than publishing a zero that would read as a measured absence of cache traffic.
+ * They are therefore required as a pair when the header carries them and not required at
+ * all when it does not - which is a stronger contract than requiring them
+ * unconditionally, because it is the one the installation can actually satisfy, and it
+ * is what makes their absence visible instead of being reported as two zeroes.
+ */
+const conditionalServerTimingMetrics = [ 'wp-cache-hits', 'wp-cache-misses' ];
+
+/**
+ * Server-Timing entries whose zero could not have been measured.
+ *
+ * A request that reached the collector loaded files, allocated memory and took time, so
+ * none of these can be zero, and a zero in one of them is a producer that stopped
+ * measuring rather than an installation that got faster. Accepting any non-negative
+ * number for them left that indistinguishable from a measurement: a metric forced to a
+ * structural zero passed every check while its median went into the report as 0.
+ *
+ * The query count and the object cache flag are deliberately absent from this list. A
+ * request served entirely from a cache can legitimately issue no query, and the flag is
+ * 0 on every installation without a drop-in.
+ */
+const positiveServerTimingMetrics = [
+	'wp-before-template',
+	'wp-template',
+	'wp-total',
+	'wp-memory-usage',
+	'wp-memory-peak',
+	'wp-files-loaded',
 	'wp-bootstrap',
 ];
 
@@ -188,12 +222,64 @@ test.describe( 'Single Post', () => {
 
 						for ( const metric of requiredServerTimingMetrics ) {
 							const value = serverTiming[ metric ];
+							const positive =
+								positiveServerTimingMetrics.includes( metric );
 
 							expect(
-								Number.isFinite( value ) && 0 <= value,
-								`Server-Timing metric ${ metric } should be reported as a finite, non-negative number, received ${ JSON.stringify(
-									value
-								) }`
+								Number.isFinite( value ) &&
+									( positive ? 0 < value : 0 <= value ),
+								`Server-Timing metric ${ metric } should be reported as a finite, ${
+									positive ? 'positive' : 'non-negative'
+								} number, received ${ JSON.stringify( value ) }`
+							).toBe( true );
+						}
+
+						/*
+						 * Absence is a measurement here, so it is asserted rather than
+						 * tolerated: the pair has to arrive together or not at all. A
+						 * header carrying one of them is a producer that lost the other,
+						 * which would otherwise reach the report as a series half as long
+						 * as the rest.
+						 */
+						const publishedCacheMetrics =
+							conditionalServerTimingMetrics.filter(
+								( metric ) =>
+									undefined !== serverTiming[ metric ]
+							);
+
+						expect(
+							0 === publishedCacheMetrics.length ||
+								conditionalServerTimingMetrics.length ===
+									publishedCacheMetrics.length,
+							`The object cache counters should be reported as a pair or not at all, received ${ JSON.stringify(
+								publishedCacheMetrics
+							) }`
+						).toBe( true );
+
+						if ( publishedCacheMetrics.length ) {
+							for ( const metric of conditionalServerTimingMetrics ) {
+								const value = serverTiming[ metric ];
+
+								expect(
+									Number.isFinite( value ) && 0 <= value,
+									`Server-Timing metric ${ metric } should be reported as a finite, non-negative number, received ${ JSON.stringify(
+										value
+									) }`
+								).toBe( true );
+							}
+
+							/*
+							 * Either counter can legitimately be 0 on its own - a
+							 * persistent cache that answered everything has no misses -
+							 * but a request that loaded WordPress read at least one
+							 * option, so a cache reporting no lookups at all is a
+							 * counter that stopped counting.
+							 */
+							expect(
+								0 <
+									serverTiming[ 'wp-cache-hits' ] +
+										serverTiming[ 'wp-cache-misses' ],
+								`A request that loaded WordPress should record at least one object cache lookup, received ${ serverTiming[ 'wp-cache-hits' ] } hits and ${ serverTiming[ 'wp-cache-misses' ] } misses`
 							).toBe( true );
 						}
 
