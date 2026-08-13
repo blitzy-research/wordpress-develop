@@ -49,6 +49,77 @@ class WP_Object_Cache {
 	public $cache_misses = 0;
 
 	/**
+	 * Per-group cache hit and miss counts.
+	 *
+	 * Empty unless $track_group_stats has been enabled. See that property for why
+	 * collection is opt-in, and stats() for how the counts are reported.
+	 *
+	 * @since 7.0.0
+	 * @var array<string, array{hits: int, misses: int}>
+	 */
+	public $cache_group_stats = array();
+
+	/**
+	 * Whether to count hits and misses per group as well as in total.
+	 *
+	 * Off by default: the per-group tally is diagnostic work on every get(), so it
+	 * is paid for only when something asks for it.
+	 *
+	 * Enable it on the cache object itself, for example from a debugging plugin or
+	 * a profiling harness:
+	 *
+	 *     if ( isset( $GLOBALS['wp_object_cache'] ) && $GLOBALS['wp_object_cache'] instanceof WP_Object_Cache ) {
+	 *         $GLOBALS['wp_object_cache']->track_group_stats = true;
+	 *     }
+	 *
+	 * Turning it on part way through a request is supported: the counts then
+	 * describe the calls made from that point on rather than the whole request.
+	 *
+	 * @since 7.0.0
+	 * @var bool
+	 */
+	public $track_group_stats = false;
+
+	/**
+	 * Largest number of groups $cache_group_stats will hold.
+	 *
+	 * A cap rather than unbounded growth, because the group name is supplied by the
+	 * caller: code that derives a group per user, per site or per object would
+	 * otherwise make this array grow with the request. Once the cap is reached, no
+	 * new group is added and $untracked_group_count records how many were left out,
+	 * so stats() can report that the breakdown is partial instead of appearing
+	 * complete. Groups already being counted keep counting.
+	 *
+	 * @since 7.0.0
+	 * @var int
+	 */
+	public $max_tracked_groups = 250;
+
+	/**
+	 * Number of distinct groups counted as left out of $cache_group_stats.
+	 *
+	 * Counting relies on $untracked_groups to recognise a group it has already
+	 * counted, and that register is capped too, so once the register is full this
+	 * stops rising and is a lower bound on the omitted groups rather than a total.
+	 *
+	 * @since 7.0.0
+	 * @var int
+	 */
+	public $untracked_group_count = 0;
+
+	/**
+	 * Group names seen after the cap was reached, so each is only counted once.
+	 *
+	 * Holds names rather than a plain total because the count it feeds is a count of
+	 * distinct groups. It is itself capped, so it cannot become the unbounded array
+	 * that $max_tracked_groups exists to prevent.
+	 *
+	 * @since 7.0.0
+	 * @var array<string, true>
+	 */
+	private $untracked_groups = array();
+
+	/**
 	 * List of global cache groups.
 	 *
 	 * @since 3.0.0
@@ -375,6 +446,11 @@ class WP_Object_Cache {
 		if ( $this->_exists( $key, $group ) ) {
 			$found             = true;
 			$this->cache_hits += 1;
+
+			if ( $this->track_group_stats ) {
+				$this->record_group_stat( $group, 'hits' );
+			}
+
 			if ( is_object( $this->cache[ $group ][ $key ] ) ) {
 				return clone $this->cache[ $group ][ $key ];
 			} else {
@@ -384,7 +460,61 @@ class WP_Object_Cache {
 
 		$found               = false;
 		$this->cache_misses += 1;
+
+		if ( $this->track_group_stats ) {
+			$this->record_group_stat( $group, 'misses' );
+		}
+
 		return false;
+	}
+
+	/**
+	 * Counts one hit or miss against a group.
+	 *
+	 * Only reached while $track_group_stats is enabled, so the cost of the lookups
+	 * below is never paid by a request that has not asked for the breakdown.
+	 *
+	 * A group that arrives after $max_tracked_groups groups are already counted is
+	 * not given counters. It is added to $untracked_group_count while the register
+	 * of omitted names has room, so the breakdown reports itself as partial rather
+	 * than silently omitting the group; groups arriving after that register is full
+	 * are neither counted nor named.
+	 *
+	 * @since 7.0.0
+	 *
+	 * @param string $group Group the call was made against.
+	 * @param string $field Either 'hits' or 'misses'.
+	 */
+	private function record_group_stat( $group, $field ) {
+		if ( isset( $this->cache_group_stats[ $group ] ) ) {
+			++$this->cache_group_stats[ $group ][ $field ];
+			return;
+		}
+
+		if ( count( $this->cache_group_stats ) < $this->max_tracked_groups ) {
+			// Seed both counters together, so the other one reads as 0 rather than unset.
+			$this->cache_group_stats[ $group ] = array(
+				'hits'   => 0,
+				'misses' => 0,
+			);
+
+			++$this->cache_group_stats[ $group ][ $field ];
+			return;
+		}
+
+		/*
+		 * Beyond the cap only the number of distinct groups is kept, and the names
+		 * are held solely to avoid counting one group twice. That register is capped
+		 * as well, so this branch cannot grow without limit either; once it is full
+		 * $untracked_group_count stops rising and becomes a lower bound, which is
+		 * what stats() reports it as.
+		 */
+		if ( ! isset( $this->untracked_groups[ $group ] )
+			&& count( $this->untracked_groups ) < $this->max_tracked_groups
+		) {
+			$this->untracked_groups[ $group ] = true;
+			++$this->untracked_group_count;
+		}
 	}
 
 	/**
@@ -625,10 +755,20 @@ class WP_Object_Cache {
 	/**
 	 * Echoes the stats of the caching.
 	 *
-	 * Gives the cache hits, and cache misses. Also prints every cached group,
-	 * key and the data.
+	 * Prints the hit and miss totals, then each group currently held in the cache
+	 * with its serialized size.
+	 *
+	 * Per-group hit and miss counts are printed alongside each group only when
+	 * $track_group_stats was enabled, since that is what collects them; when it was
+	 * not, nothing about them is printed - the output is what it has always been,
+	 * rather than a row of zeros that would read like a group nothing ever asked for
+	 * or a notice on a default path that never carried one. Any group that has
+	 * counters but no current entries is listed after the groups, followed by an
+	 * aggregate count of the groups left out by $max_tracked_groups - reported as a
+	 * lower bound when the register of omitted names is full.
 	 *
 	 * @since 2.0.0
+	 * @since 7.0.0 Added the opt-in per-group hit and miss counts.
 	 */
 	public function stats() {
 		echo '<p>';
@@ -637,8 +777,60 @@ class WP_Object_Cache {
 		echo '</p>';
 		echo '<ul>';
 		foreach ( $this->cache as $group => $cache ) {
-			echo '<li><strong>Group:</strong> ' . esc_html( $group ) . ' - ( ' . number_format( strlen( serialize( $cache ) ) / KB_IN_BYTES, 2 ) . 'k )</li>';
+			$size = number_format( strlen( serialize( $cache ) ) / KB_IN_BYTES, 2 ) . 'k';
+
+			if ( $this->track_group_stats ) {
+				$group_hits   = (int) ( $this->cache_group_stats[ $group ]['hits'] ?? 0 );
+				$group_misses = (int) ( $this->cache_group_stats[ $group ]['misses'] ?? 0 );
+
+				echo '<li><strong>Group:</strong> ' . esc_html( $group ) . ' - ( ' . $size . ' ) - ' . $group_hits . ' hits, ' . $group_misses . ' misses</li>';
+			} else {
+				echo '<li><strong>Group:</strong> ' . esc_html( $group ) . ' - ( ' . $size . ' )</li>';
+			}
 		}
 		echo '</ul>';
+
+		/*
+		 * Nothing further is printed when the breakdown was not collected, so the
+		 * default output of this public method is exactly what it was before the
+		 * per-group counters existed.
+		 */
+		if ( ! $this->track_group_stats ) {
+			return;
+		}
+
+		/*
+		 * Request counters accumulate for the whole request, while stored data can be
+		 * removed by delete(), flush() or flush_group(). A group can therefore hold
+		 * counters in $cache_group_stats while being absent from $this->cache, so
+		 * those groups are reported separately rather than left out.
+		 */
+		$unstored_groups = array_diff_key( $this->cache_group_stats, $this->cache );
+
+		if ( ! empty( $unstored_groups ) ) {
+			echo '<p><strong>Groups requested but not currently stored:</strong></p>';
+			echo '<ul>';
+			foreach ( $unstored_groups as $group => $group_stats ) {
+				echo '<li><strong>Group:</strong> ' . esc_html( $group ) . ' - ' . (int) ( $group_stats['hits'] ?? 0 ) . ' hits, ' . (int) ( $group_stats['misses'] ?? 0 ) . ' misses</li>';
+			}
+			echo '</ul>';
+		}
+
+		if ( $this->untracked_group_count > 0 ) {
+			/*
+			 * The register of omitted names is capped as well, so once it is full the
+			 * number of omitted groups is a lower bound rather than a total, and is
+			 * reported as one.
+			 */
+			$omitted = count( $this->untracked_groups ) >= $this->max_tracked_groups
+				? sprintf( 'at least %d', (int) $this->untracked_group_count )
+				: (string) (int) $this->untracked_group_count;
+
+			printf(
+				'<p>The breakdown above is partial: %1$s further group(s) were requested after the limit of %2$d tracked groups was reached and have no counters.</p>',
+				$omitted,
+				(int) $this->max_tracked_groups
+			);
+		}
 	}
 }

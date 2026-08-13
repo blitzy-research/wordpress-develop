@@ -36,17 +36,49 @@ require ABSPATH . WPINC . '/compat-utf8.php';
 require ABSPATH . WPINC . '/compat.php';
 require ABSPATH . WPINC . '/load.php';
 
+/*
+ * Register the core class autoloader before the remaining class bootstrap, so that
+ * every class, interface and trait file listed in the generated class map can be
+ * loaded the first time the name it declares is referenced rather than being
+ * required eagerly below. Registration does not load the class map: the map is
+ * read on the first autoload attempt for a name that could belong to core.
+ *
+ * Being covered by the class map is not on its own a reason to stop requiring a
+ * file here. A require below is dropped only where profiling showed the name is
+ * not referenced on the request path this bootstrap is measured on, and it is
+ * kept where any of these hold:
+ *
+ * - The name is referenced on the measured request anyway, so deferring it would
+ *   move the same work rather than remove it.
+ * - The file declares functions, which an autoloader is never asked to resolve.
+ * - Including it has side effects, such as registering a block support or a
+ *   second autoloader, that a reference to a class name would not trigger.
+ * - The name it declares is absent from the generated class map, because the
+ *   generator rejected the file as ineligible.
+ * - Code probes for the name with autoloading disabled, so the name has to be
+ *   present before that probe runs.
+ *
+ * A parent whose subclasses stay mapped is deferred even when the measured
+ * request does resolve it, because requiring it here would drop it from the map
+ * and leave those subclasses unloadable on their own.
+ *
+ * One conditional require is a deliberate exception: the WP_Site_Health branch
+ * near the end of this file does name a mapped file, because the class lives
+ * under wp-admin and the map is what keeps it reachable from here. That require
+ * sits behind class_exists( 'WP_Site_Health' ), which autoloading answers first,
+ * so it is a fallback for a tree that carries no usable generated map.
+ */
+require ABSPATH . WPINC . '/autoload.php';
+
 // Check the server requirements.
 wp_check_php_mysql_versions();
 
 // Include files required for initialization.
 require ABSPATH . WPINC . '/class-wp-paused-extensions-storage.php';
-require ABSPATH . WPINC . '/class-wp-exception.php';
 require ABSPATH . WPINC . '/class-wp-fatal-error-handler.php';
 require ABSPATH . WPINC . '/class-wp-recovery-mode-cookie-service.php';
 require ABSPATH . WPINC . '/class-wp-recovery-mode-key-service.php';
 require ABSPATH . WPINC . '/class-wp-recovery-mode-link-service.php';
-require ABSPATH . WPINC . '/class-wp-recovery-mode-email-service.php';
 require ABSPATH . WPINC . '/class-wp-recovery-mode.php';
 require ABSPATH . WPINC . '/error-protection.php';
 require ABSPATH . WPINC . '/default-constants.php';
@@ -116,15 +148,56 @@ require ABSPATH . WPINC . '/formatting.php';
 require ABSPATH . WPINC . '/meta.php';
 require ABSPATH . WPINC . '/functions.php';
 require ABSPATH . WPINC . '/class-wp-meta-query.php';
-require ABSPATH . WPINC . '/class-wp-matchesmapregex.php';
 require ABSPATH . WPINC . '/class-wp.php';
+/*
+ * WP_Error is deliberately eager, and is therefore absent from the generated
+ * class map rather than resolved on first reference: wpdb::bail() probes for the
+ * name with class_exists( 'WP_Error', false ), which disables autoloading, and
+ * assigns a plain string to the public wpdb::$error property when that probe
+ * fails. Deferring the name would change the type of that property for anyone
+ * reading it, so it is made available here, before a database connection can
+ * fail.
+ */
 require ABSPATH . WPINC . '/class-wp-error.php';
-require ABSPATH . WPINC . '/pomo/mo.php';
+/*
+ * Only the translation base classes are loaded eagerly. get_translations_for_domain()
+ * instantiates NOOP_Translations on every request that asks for a string, so
+ * pomo/translations.php - and pomo/plural-forms.php and pomo/entry.php, which it
+ * requires itself - are needed unconditionally. Reading a compiled catalogue is not:
+ * pomo/mo.php and the stream readers it pulls in are only reached once a .mo file is
+ * actually parsed, which never happens on a site running in the original locale.
+ *
+ * MO cannot be resolved through the generated class map, because pomo/mo.php requires
+ * its two dependencies at file scope and the map only carries files that declare a
+ * single symbol and nothing else, so this registers the one file that needs a loader
+ * of its own. POMO_Reader and the readers beside it are covered by the same loader
+ * because they are declared in pomo/streams.php, which mo.php requires.
+ *
+ * The one place that names MO without loading it is l10n.php, which tests
+ * `$l10n[ $domain ] instanceof MO`. `instanceof` does not autoload, and reports false
+ * for a name that is not declared, which is the same answer it gave when mo.php was
+ * loaded eagerly and no catalogue had been read.
+ */
+require ABSPATH . WPINC . '/pomo/translations.php';
+
+spl_autoload_register(
+	/**
+	 * Loads the compiled translation reader on first reference.
+	 *
+	 * @since 7.0.0
+	 *
+	 * @param string $class_name Name of the class to load.
+	 */
+	static function ( $class_name ) {
+		if ( 'MO' !== $class_name && 0 !== strncmp( $class_name, 'POMO_', 5 ) ) {
+			return;
+		}
+
+		require ABSPATH . WPINC . '/pomo/mo.php';
+	}
+);
+
 require ABSPATH . WPINC . '/l10n/class-wp-translation-controller.php';
-require ABSPATH . WPINC . '/l10n/class-wp-translations.php';
-require ABSPATH . WPINC . '/l10n/class-wp-translation-file.php';
-require ABSPATH . WPINC . '/l10n/class-wp-translation-file-mo.php';
-require ABSPATH . WPINC . '/l10n/class-wp-translation-file-php.php';
 
 /**
  * @since 0.71
@@ -155,8 +228,6 @@ require ABSPATH . WPINC . '/default-filters.php';
 
 // Initialize multisite if enabled.
 if ( is_multisite() ) {
-	require ABSPATH . WPINC . '/class-wp-site-query.php';
-	require ABSPATH . WPINC . '/class-wp-network-query.php';
 	require ABSPATH . WPINC . '/ms-blogs.php';
 	require ABSPATH . WPINC . '/ms-settings.php';
 } elseif ( ! defined( 'MULTISITE' ) ) {
@@ -180,19 +251,23 @@ require_once ABSPATH . WPINC . '/class-wp-locale-switcher.php';
 wp_not_installed();
 
 // Load most of WordPress.
-require ABSPATH . WPINC . '/class-wp-walker.php';
-require ABSPATH . WPINC . '/class-wp-ajax-response.php';
 require ABSPATH . WPINC . '/capabilities.php';
 require ABSPATH . WPINC . '/class-wp-roles.php';
 require ABSPATH . WPINC . '/class-wp-role.php';
 require ABSPATH . WPINC . '/class-wp-user.php';
 require ABSPATH . WPINC . '/class-wp-query.php';
 require ABSPATH . WPINC . '/query.php';
-require ABSPATH . WPINC . '/class-wp-date-query.php';
 require ABSPATH . WPINC . '/theme.php';
 require ABSPATH . WPINC . '/class-wp-theme.php';
 require ABSPATH . WPINC . '/class-wp-theme-json-schema.php';
 require ABSPATH . WPINC . '/class-wp-theme-json-data.php';
+/*
+ * WP_Theme_JSON is deliberately eager. Global styles resolve through it on the
+ * measured request, so deferring it would not stop it being loaded - it would only
+ * move its compilation from here to wp_head, where it lands on top of a larger
+ * resident heap rather than on top of the bootstrap's. Profiling showed that as a
+ * worse peak for no change in the loaded file count, so this class stays eager.
+ */
 require ABSPATH . WPINC . '/class-wp-theme-json.php';
 require ABSPATH . WPINC . '/class-wp-theme-json-resolver.php';
 require ABSPATH . WPINC . '/class-wp-duotone.php';
@@ -206,18 +281,12 @@ require ABSPATH . WPINC . '/theme-previews.php';
 require ABSPATH . WPINC . '/template.php';
 require ABSPATH . WPINC . '/https-detection.php';
 require ABSPATH . WPINC . '/https-migration.php';
-require ABSPATH . WPINC . '/class-wp-user-request.php';
 require ABSPATH . WPINC . '/user.php';
-require ABSPATH . WPINC . '/class-wp-user-query.php';
-require ABSPATH . WPINC . '/class-wp-session-tokens.php';
-require ABSPATH . WPINC . '/class-wp-user-meta-session-tokens.php';
 require ABSPATH . WPINC . '/general-template.php';
 require ABSPATH . WPINC . '/link-template.php';
 require ABSPATH . WPINC . '/author-template.php';
 require ABSPATH . WPINC . '/robots-template.php';
 require ABSPATH . WPINC . '/post.php';
-require ABSPATH . WPINC . '/class-walker-page.php';
-require ABSPATH . WPINC . '/class-walker-page-dropdown.php';
 require ABSPATH . WPINC . '/class-wp-post-type.php';
 require ABSPATH . WPINC . '/class-wp-post.php';
 require ABSPATH . WPINC . '/post-template.php';
@@ -225,13 +294,8 @@ require ABSPATH . WPINC . '/revision.php';
 require ABSPATH . WPINC . '/post-formats.php';
 require ABSPATH . WPINC . '/post-thumbnail-template.php';
 require ABSPATH . WPINC . '/category.php';
-require ABSPATH . WPINC . '/class-walker-category.php';
-require ABSPATH . WPINC . '/class-walker-category-dropdown.php';
 require ABSPATH . WPINC . '/category-template.php';
 require ABSPATH . WPINC . '/comment.php';
-require ABSPATH . WPINC . '/class-wp-comment.php';
-require ABSPATH . WPINC . '/class-wp-comment-query.php';
-require ABSPATH . WPINC . '/class-walker-comment.php';
 require ABSPATH . WPINC . '/comment-template.php';
 require ABSPATH . WPINC . '/rewrite.php';
 require ABSPATH . WPINC . '/class-wp-rewrite.php';
@@ -242,11 +306,29 @@ require ABSPATH . WPINC . '/kses.php';
 require ABSPATH . WPINC . '/cron.php';
 require ABSPATH . WPINC . '/deprecated.php';
 require ABSPATH . WPINC . '/script-loader.php';
-if ( file_exists( ABSPATH . WPINC . '/build/routes.php' ) ) {
-	require ABSPATH . WPINC . '/build/routes.php';
-}
-if ( file_exists( ABSPATH . WPINC . '/build/pages.php' ) ) {
-	require ABSPATH . WPINC . '/build/pages.php';
+/*
+ * The generated admin page and route loaders are required on admin requests only.
+ * Between them the two loaders reach seven generated files, and every hook those files
+ * register is an admin hook: admin_init, admin_enqueue_scripts, and the four
+ * page-specific *_init actions that only wp_font_library_render_page() and
+ * wp_options_connectors_render_page() fire. A front-end request fired none of them, so
+ * requiring these here parsed 41,680 bytes of admin page definitions to register work
+ * that request could not do.
+ *
+ * Nothing in wp-includes calls the functions they declare. The two callers in wp-admin -
+ * wp-admin/font-library.php and wp-admin/options-connectors.php - are admin screens, so
+ * is_admin() is already true by the time either runs, and each guards its call with
+ * function_exists() in any case. is_admin() is the same test the plugin.php and
+ * WP_Site_Health branches further down this file use, and it is settled here: WP_ADMIN
+ * is defined by wp-admin/admin.php before wp-load.php reaches this file.
+ */
+if ( is_admin() ) {
+	if ( file_exists( ABSPATH . WPINC . '/build/routes.php' ) ) {
+		require ABSPATH . WPINC . '/build/routes.php';
+	}
+	if ( file_exists( ABSPATH . WPINC . '/build/pages.php' ) ) {
+		require ABSPATH . WPINC . '/build/pages.php';
+	}
 }
 require ABSPATH . WPINC . '/taxonomy.php';
 require ABSPATH . WPINC . '/class-wp-taxonomy.php';
@@ -258,133 +340,83 @@ require ABSPATH . WPINC . '/canonical.php';
 require ABSPATH . WPINC . '/shortcodes.php';
 require ABSPATH . WPINC . '/embed.php';
 require ABSPATH . WPINC . '/class-wp-embed.php';
-require ABSPATH . WPINC . '/class-wp-oembed.php';
-require ABSPATH . WPINC . '/class-wp-oembed-controller.php';
 require ABSPATH . WPINC . '/media.php';
 require ABSPATH . WPINC . '/http.php';
 require ABSPATH . WPINC . '/html-api/html5-named-character-references.php';
 require ABSPATH . WPINC . '/html-api/class-wp-html-attribute-token.php';
 require ABSPATH . WPINC . '/html-api/class-wp-html-span.php';
-require ABSPATH . WPINC . '/html-api/class-wp-html-doctype-info.php';
 require ABSPATH . WPINC . '/html-api/class-wp-html-text-replacement.php';
 require ABSPATH . WPINC . '/html-api/class-wp-html-decoder.php';
 require ABSPATH . WPINC . '/html-api/class-wp-html-tag-processor.php';
-require ABSPATH . WPINC . '/html-api/class-wp-html-unsupported-exception.php';
-require ABSPATH . WPINC . '/html-api/class-wp-html-active-formatting-elements.php';
-require ABSPATH . WPINC . '/html-api/class-wp-html-open-elements.php';
-require ABSPATH . WPINC . '/html-api/class-wp-html-token.php';
-require ABSPATH . WPINC . '/html-api/class-wp-html-stack-event.php';
-require ABSPATH . WPINC . '/html-api/class-wp-html-processor-state.php';
+/*
+ * WP_HTML_Processor is eager for the reason given above WP_Theme_JSON: block
+ * rendering on the profiled block-theme front end loads it, so deferring it would
+ * only move its compilation to wp_head, on top of a larger resident heap. Its
+ * parent WP_HTML_Tag_Processor is required on the line above for the same reason,
+ * and so that it, and anything else that extends it, keeps resolving in a bootstrap
+ * that only registers the autoloader. The rest of the HTML API - the stack classes
+ * and the processor's own exception and state classes - stays deferred, because a
+ * request that never parses markup never loads any of them.
+ */
 require ABSPATH . WPINC . '/html-api/class-wp-html-processor.php';
-require ABSPATH . WPINC . '/class-wp-block-processor.php';
 require ABSPATH . WPINC . '/class-wp-http.php';
 require ABSPATH . WPINC . '/class-wp-http-streams.php';
-require ABSPATH . WPINC . '/class-wp-http-curl.php';
-require ABSPATH . WPINC . '/class-wp-http-proxy.php';
-require ABSPATH . WPINC . '/class-wp-http-cookie.php';
-require ABSPATH . WPINC . '/class-wp-http-encoding.php';
-require ABSPATH . WPINC . '/class-wp-http-response.php';
-require ABSPATH . WPINC . '/class-wp-http-requests-response.php';
+/*
+ * WP_HTTP_Requests_Hooks names a parent class that belongs to a bundled library, and
+ * that name is served by an autoloader registered here rather than alongside the core
+ * autoloader further up this file: WpOrg\Requests\Autoload::register() runs inside
+ * class-wp-http.php on the line above. Resolving WP_HTTP_Requests_Hooks through the
+ * class map before this point - in a SHORTINIT bootstrap, in an object-cache.php or
+ * advanced-cache.php drop-in, or anywhere between the core autoloader and this line -
+ * would reach an undeclared parent and raise a fatal error, so it stays eager next to
+ * the autoloader it depends on and the class map generator excludes it.
+ */
 require ABSPATH . WPINC . '/class-wp-http-requests-hooks.php';
-require ABSPATH . WPINC . '/php-ai-client/autoload.php';
-require ABSPATH . WPINC . '/ai-client/adapters/class-wp-ai-client-http-client.php';
-require ABSPATH . WPINC . '/ai-client/adapters/class-wp-ai-client-cache.php';
-require ABSPATH . WPINC . '/ai-client/adapters/class-wp-ai-client-discovery-strategy.php';
-require ABSPATH . WPINC . '/ai-client/adapters/class-wp-ai-client-event-dispatcher.php';
-require ABSPATH . WPINC . '/ai-client/class-wp-ai-client-ability-function-resolver.php';
-require ABSPATH . WPINC . '/ai-client/class-wp-ai-client-prompt-builder.php';
+/*
+ * ai-client.php is required ahead of the bundled prefix autoloader on the next line
+ * because it registers _wp_ai_client_load(), and spl_autoload_register() preserves
+ * registration order: the AI Client's WordPress-side wiring has to be reached before
+ * the prefix autoloader answers for WordPress\AiClient\AiClient, or that wiring would
+ * never run. The four adapter classes that wiring installs, the six bundled
+ * interfaces they implement, and AiClient itself are all loaded from there instead of
+ * here, because a profiled front-end request resolves none of them.
+ */
 require ABSPATH . WPINC . '/ai-client.php';
+require ABSPATH . WPINC . '/php-ai-client/autoload.php';
 require ABSPATH . WPINC . '/class-wp-connector-registry.php';
 require ABSPATH . WPINC . '/connectors.php';
-require ABSPATH . WPINC . '/class-wp-icons-registry.php';
 require ABSPATH . WPINC . '/widgets.php';
-require ABSPATH . WPINC . '/class-wp-widget.php';
 require ABSPATH . WPINC . '/class-wp-widget-factory.php';
 require ABSPATH . WPINC . '/nav-menu-template.php';
 require ABSPATH . WPINC . '/nav-menu.php';
 require ABSPATH . WPINC . '/admin-bar.php';
-require ABSPATH . WPINC . '/class-wp-application-passwords.php';
-require ABSPATH . WPINC . '/abilities-api/class-wp-ability-category.php';
-require ABSPATH . WPINC . '/abilities-api/class-wp-ability-categories-registry.php';
-require ABSPATH . WPINC . '/abilities-api/class-wp-ability.php';
-require ABSPATH . WPINC . '/abilities-api/class-wp-abilities-registry.php';
 require ABSPATH . WPINC . '/abilities-api.php';
 require ABSPATH . WPINC . '/abilities.php';
-require ABSPATH . WPINC . '/collaboration/interface-wp-sync-storage.php';
-require ABSPATH . WPINC . '/collaboration/class-wp-sync-post-meta-storage.php';
-require ABSPATH . WPINC . '/collaboration/class-wp-http-polling-sync-server.php';
 require ABSPATH . WPINC . '/collaboration.php';
 require ABSPATH . WPINC . '/rest-api.php';
-require ABSPATH . WPINC . '/rest-api/class-wp-rest-server.php';
-require ABSPATH . WPINC . '/rest-api/class-wp-rest-response.php';
-require ABSPATH . WPINC . '/rest-api/class-wp-rest-request.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-posts-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-attachments-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-global-styles-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-post-types-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-post-statuses-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-revisions-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-global-styles-revisions-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-template-revisions-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-autosaves-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-template-autosaves-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-taxonomies-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-terms-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-menu-items-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-menus-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-menu-locations-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-users-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-comments-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-search-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-blocks-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-block-types-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-block-renderer-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-settings-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-themes-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-plugins-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-block-directory-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-edit-site-export-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-pattern-directory-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-block-patterns-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-block-pattern-categories-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-application-passwords-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-site-health-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-sidebars-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-widget-types-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-widgets-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-templates-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-url-details-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-navigation-fallback-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-font-families-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-font-faces-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-font-collections-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-icons-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-abilities-v1-categories-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-abilities-v1-list-controller.php';
-require ABSPATH . WPINC . '/rest-api/endpoints/class-wp-rest-abilities-v1-run-controller.php';
-require ABSPATH . WPINC . '/rest-api/fields/class-wp-rest-meta-fields.php';
-require ABSPATH . WPINC . '/rest-api/fields/class-wp-rest-comment-meta-fields.php';
-require ABSPATH . WPINC . '/rest-api/fields/class-wp-rest-post-meta-fields.php';
-require ABSPATH . WPINC . '/rest-api/fields/class-wp-rest-term-meta-fields.php';
-require ABSPATH . WPINC . '/rest-api/fields/class-wp-rest-user-meta-fields.php';
-require ABSPATH . WPINC . '/rest-api/search/class-wp-rest-search-handler.php';
-require ABSPATH . WPINC . '/rest-api/search/class-wp-rest-post-search-handler.php';
-require ABSPATH . WPINC . '/rest-api/search/class-wp-rest-term-search-handler.php';
-require ABSPATH . WPINC . '/rest-api/search/class-wp-rest-post-format-search-handler.php';
+/*
+ * The REST API infrastructure, controller, field and search handler classes are
+ * resolved by the autoloader rather than required here. Core's default bootstrap
+ * and request path do not reference them before rest_get_server() runs: it
+ * constructs the server and then fires the rest_api_init action, which is where
+ * create_initial_rest_routes() registers the routes and instantiates their
+ * controllers, and that action fires nowhere else. On a request that never
+ * dispatches a REST route, core therefore never asks for these names, and code
+ * that does ask for one gets it from the autoloader. rest-api.php itself stays
+ * eager because it declares the functions that default-filters.php registers by
+ * name.
+ */
 require ABSPATH . WPINC . '/sitemaps.php';
 require ABSPATH . WPINC . '/sitemaps/class-wp-sitemaps.php';
 require ABSPATH . WPINC . '/sitemaps/class-wp-sitemaps-index.php';
 require ABSPATH . WPINC . '/sitemaps/class-wp-sitemaps-provider.php';
 require ABSPATH . WPINC . '/sitemaps/class-wp-sitemaps-registry.php';
 require ABSPATH . WPINC . '/sitemaps/class-wp-sitemaps-renderer.php';
-require ABSPATH . WPINC . '/sitemaps/class-wp-sitemaps-stylesheet.php';
 require ABSPATH . WPINC . '/sitemaps/providers/class-wp-sitemaps-posts.php';
 require ABSPATH . WPINC . '/sitemaps/providers/class-wp-sitemaps-taxonomies.php';
 require ABSPATH . WPINC . '/sitemaps/providers/class-wp-sitemaps-users.php';
 require ABSPATH . WPINC . '/class-wp-block-bindings-source.php';
 require ABSPATH . WPINC . '/class-wp-block-bindings-registry.php';
-require ABSPATH . WPINC . '/class-wp-block-editor-context.php';
 require ABSPATH . WPINC . '/class-wp-block-type.php';
 require ABSPATH . WPINC . '/class-wp-block-pattern-categories-registry.php';
 require ABSPATH . WPINC . '/class-wp-block-patterns-registry.php';
@@ -396,7 +428,6 @@ require ABSPATH . WPINC . '/class-wp-block-metadata-registry.php';
 require ABSPATH . WPINC . '/class-wp-block-parser-block.php';
 require ABSPATH . WPINC . '/class-wp-block-parser-frame.php';
 require ABSPATH . WPINC . '/class-wp-block-parser.php';
-require ABSPATH . WPINC . '/class-wp-classic-to-block-menu-converter.php';
 require ABSPATH . WPINC . '/class-wp-navigation-fallback.php';
 require ABSPATH . WPINC . '/block-bindings.php';
 require ABSPATH . WPINC . '/block-bindings/pattern-overrides.php';
@@ -447,7 +478,6 @@ require ABSPATH . WPINC . '/script-modules.php';
 require ABSPATH . WPINC . '/interactivity-api/class-wp-interactivity-api.php';
 require ABSPATH . WPINC . '/interactivity-api/class-wp-interactivity-api-directives-processor.php';
 require ABSPATH . WPINC . '/interactivity-api/interactivity-api.php';
-require ABSPATH . WPINC . '/class-wp-plugin-dependencies.php';
 require ABSPATH . WPINC . '/class-wp-url-pattern-prefixer.php';
 require ABSPATH . WPINC . '/class-wp-speculation-rules.php';
 require ABSPATH . WPINC . '/speculative-loading.php';
@@ -474,11 +504,6 @@ $GLOBALS['wp_embed'] = new WP_Embed();
  */
 $GLOBALS['wp_textdomain_registry'] = new WP_Textdomain_Registry();
 $GLOBALS['wp_textdomain_registry']->init();
-
-// WordPress AI Client initialization.
-WP_AI_Client_Discovery_Strategy::init();
-WordPress\AiClient\AiClient::setCache( new WP_AI_Client_Cache() );
-WordPress\AiClient\AiClient::setEventDispatcher( new WP_AI_Client_Event_Dispatcher() );
 
 // Load multisite-specific files.
 if ( is_multisite() ) {
@@ -571,11 +596,30 @@ if ( ! is_multisite() && wp_is_fatal_error_handler_enabled() ) {
 	wp_recovery_mode()->initialize();
 }
 
-// To make get_plugin_data() available in a way that's compatible with plugins also loading this file, see #62244.
-require_once ABSPATH . 'wp-admin/includes/plugin.php';
+$_wp_active_plugins = wp_get_active_and_valid_plugins();
+
+/*
+ * To make get_plugin_data() available in a way that's compatible with plugins also
+ * loading this file, see #62244.
+ *
+ * Loaded only where something reaches it. The one caller here is the loop below, which
+ * does not run when no plugin is active, and the admin loads this file again through
+ * wp-admin/includes/admin.php on every screen. On a front-end request of a site with no
+ * active plugin, requiring it here parsed 2,665 lines that nothing then called.
+ *
+ * Deferring it does not make the functions it declares unavailable to a front-end
+ * caller: every one in wp-includes that reaches them - the plugins, block directory and
+ * templates REST controllers, WP_Plugin_Dependencies, WP_Recovery_Mode_Email_Service,
+ * wp_update_plugins() and _wp_connectors_get_connector_script_module_data() - requires
+ * this same file itself before calling, as each did before #62244 added the require
+ * here.
+ */
+if ( $_wp_active_plugins || is_admin() ) {
+	require_once ABSPATH . 'wp-admin/includes/plugin.php';
+}
 
 // Load active plugins.
-foreach ( wp_get_active_and_valid_plugins() as $plugin ) {
+foreach ( $_wp_active_plugins as $plugin ) {
 	wp_register_plugin_realpath( $plugin );
 
 	$plugin_data = get_plugin_data( $plugin, false, false );
@@ -602,7 +646,7 @@ foreach ( wp_get_active_and_valid_plugins() as $plugin ) {
 	 */
 	do_action( 'plugin_loaded', $plugin );
 }
-unset( $plugin, $_wp_plugin_file, $plugin_data, $textdomain );
+unset( $plugin, $_wp_plugin_file, $plugin_data, $textdomain, $_wp_active_plugins );
 
 // Load pluggable functions.
 require ABSPATH . WPINC . '/pluggable.php';
@@ -752,11 +796,28 @@ unset( $theme, $wp_theme );
  */
 do_action( 'after_setup_theme' );
 
-// Create an instance of WP_Site_Health so that Cron events may fire.
-if ( ! class_exists( 'WP_Site_Health' ) ) {
-	require_once ABSPATH . 'wp-admin/includes/class-wp-site-health.php';
+/*
+ * Create an instance of WP_Site_Health so that Cron events may fire.
+ *
+ * Instantiated where something it registers can be reached, rather than on every
+ * request. The constructor schedules the wp_site_health_scheduled_check event and adds
+ * four callbacks, and all four are admin or Cron: admin_body_class,
+ * admin_enqueue_scripts, site_health_tab_content and wp_site_health_scheduled_check.
+ * A front-end request fires none of them, so constructing the instance there parsed
+ * 3,868 lines to register work that request could not do.
+ *
+ * The class stays reachable everywhere it was: it is in the generated class map, so
+ * class_exists( 'WP_Site_Health' ) and WP_Site_Health::get_instance() both resolve on
+ * any request, whichever bootstrap ran. That is what the Site Health REST controller
+ * relies on - create_initial_rest_routes() calls get_instance() itself - and what makes
+ * the require below a fallback for a tree that carries no usable generated map.
+ */
+if ( is_admin() || wp_doing_cron() || ( defined( 'WP_CLI' ) && WP_CLI ) ) {
+	if ( ! class_exists( 'WP_Site_Health' ) ) {
+		require_once ABSPATH . 'wp-admin/includes/class-wp-site-health.php';
+	}
+	WP_Site_Health::get_instance();
 }
-WP_Site_Health::get_instance();
 
 // Set up current user.
 $GLOBALS['wp']->init();

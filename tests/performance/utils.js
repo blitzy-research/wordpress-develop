@@ -1,17 +1,441 @@
 /**
  * External dependencies.
  */
-const { readFileSync, existsSync } = require( 'node:fs' );
-const { join } = require( 'node:path' );
+const { randomBytes } = require( 'node:crypto' );
+const {
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} = require( 'node:fs' );
+const { dirname, join } = require( 'node:path' );
+const { gzipSync } = require( 'node:zlib' );
 
 process.env.WP_ARTIFACTS_PATH ??= join( process.cwd(), 'artifacts' );
 
 const locales = [ 'en_US', 'de_DE' ];
 
-const themes = [ 'twentytwentyone', 'twentytwentythree', 'twentytwentyfour', 'twentytwentyfive' ];
+const themes = [
+	'twentytwentyone',
+	'twentytwentythree',
+	'twentytwentyfour',
+	'twentytwentyfive',
+];
+
+/**
+ * Metrics that report a configuration flag rather than a quantity.
+ *
+ * `wpExtObjCache` says whether the site under test had a persistent object cache behind
+ * it. That is a property of the environment, not of the code, and it changes what every
+ * other metric in the row means: a run with a drop-in issues fewer queries and holds a
+ * different heap than the same code without one. So a flag is reported as a value, never
+ * subtracted (see {@see isComparableMetric()}), and a pair of runs that disagree about one
+ * is refused outright by compare-results.js rather than compared.
+ *
+ * @type {Set<string>}
+ */
+const booleanMetrics = new Set( [ 'wpExtObjCache' ] );
+
+const countMetrics = new Set( [
+	'wpDbQueries',
+	'wpFilesLoaded',
+	'wpCacheHits',
+	'wpCacheMisses',
+] );
+
+/**
+ * Status the cache-reset helper requires of an authorized reset.
+ *
+ * `tests/performance/wp-content/mu-plugins/server-timing.php` answers an authorized
+ * `POST /?clear_cache` with 202 after discarding the opcode cache, the object cache and
+ * the expired transients, and refuses every other shape with 404, 405 or 403. Requiring
+ * 202 is therefore what distinguishes a request the reset handler accepted from one it
+ * refused, or from a front page that merely returned 200 because no reset helper was
+ * installed.
+ */
+const CACHE_RESET_STATUS = 202;
+
+/**
+ * Header the cache-reset secret is presented in.
+ *
+ * A header rather than a query argument, because a reset changes server state for the
+ * whole installation: a secret in the URL would be sent by any navigation, prefetch or
+ * embedded resource that copied the address, and would appear in the referrer and the
+ * browser history. A cross-origin form submission or an `img` tag cannot set a custom
+ * header either. PHP exposes this name as
+ * `$_SERVER['HTTP_X_WP_PERF_CACHE_RESET_TOKEN']`, which is where the mu-plugin reads it.
+ */
+const CACHE_RESET_TOKEN_HEADER = 'X-WP-Perf-Cache-Reset-Token';
+
+/**
+ * Grammar the mu-plugin requires of the secret before it will enable the reset at all.
+ *
+ * Kept identical to the pattern in `server-timing.php` on purpose: a token this side
+ * writes but that side would reject leaves the endpoint disabled, and the failure would
+ * surface as an unexplained 404 in the middle of a measured run rather than here.
+ */
+const CACHE_RESET_TOKEN_PATTERN = /^[A-Za-z0-9]{32,128}$/;
+
+/**
+ * Where the per-run secret is kept.
+ *
+ * Beside the installation directory rather than inside it, so it is not served over
+ * HTTP: the WordPress document root is `<repo>/src` or `<repo>/build`, and this sits in
+ * `<repo>/.cache`, which is git-ignored. Resolved from this file's own location rather
+ * than from `process.cwd()` so that it is the same path no matter which directory the
+ * suite was started from, and it is the same path the mu-plugin derives from `ABSPATH`.
+ * `WP_PERF_CACHE_RESET_TOKEN_FILE` overrides it, and the mu-plugin honours the same
+ * variable, for a deployment whose installation is not inside this repository.
+ *
+ * @return {string} Absolute path of the token file.
+ */
+function cacheResetTokenPath() {
+	return (
+		process.env.WP_PERF_CACHE_RESET_TOKEN_FILE ||
+		join( __dirname, '..', '..', '.cache', 'performance-cache-reset-token' )
+	);
+}
+
+/**
+ * Reads the active theme's stylesheet slug out of the admin themes page.
+ *
+ * Taken from the page rather than from `/wp/v2/themes`, which is the obvious source and
+ * the wrong one here: that controller reports update availability, so serving it can wait
+ * on an outbound request to the .org API, and an installation without egress - which a
+ * measurement sandbox usually is - answers it minutes later or not at all. The themes page
+ * is what `RequestUtils.activateTheme()` already reads to find its activation nonce, so
+ * recording the slug and putting it back afterwards use one page and one mechanism.
+ *
+ * The marker is core's own template: the active theme's card carries `class="theme active"`
+ * and its heading carries `id="{$stylesheet}-name"`. The stylesheet is what is wanted
+ * rather than the template, so that a child theme is restored as the child theme.
+ *
+ * @param {string} html Body of wp-admin/themes.php.
+ * @return {string} Stylesheet slug, or '' when the page does not identify one.
+ */
+function activeThemeFromThemesPage( html ) {
+	if ( 'string' !== typeof html ) {
+		return '';
+	}
+
+	const active = html.indexOf( 'class="theme active"' );
+
+	if ( 0 > active ) {
+		return '';
+	}
+
+	const name = html
+		.slice( active )
+		.match( /class="theme-name" id="([A-Za-z0-9_-]+)-name"/ );
+
+	return name ? name[ 1 ] : '';
+}
+
+/**
+ * Where the theme that was active before the run is recorded.
+ *
+ * Beside the cache reset token, and for the same reasons: git-ignored, outside the served
+ * document root, and resolved from this file's location so that it is the same path
+ * whichever directory the suite was started from. The global setup writes the slug here
+ * and the global teardown consumes it, which the two cannot do through a module variable
+ * because they are not guaranteed to share a process.
+ *
+ * @return {string} Absolute path of the record.
+ */
+function previousThemePath() {
+	return (
+		process.env.WP_PERF_PREVIOUS_THEME_FILE ||
+		join( __dirname, '..', '..', '.cache', 'performance-previous-theme' )
+	);
+}
+
+/**
+ * Provisions the secret that authorizes this run's cache resets.
+ *
+ * The mu-plugin has no reset endpoint until this file exists, so writing it is the
+ * explicit enable step for the control plane, and `globalTeardown` is what removes it
+ * again once the workers are done. Nothing is provisioned for an installation that
+ * merely has the mu-plugin present.
+ *
+ * Created exclusively, so that two processes reaching this at the same time cannot end
+ * up disagreeing about the secret: whoever loses the race reads the winner's file
+ * instead of overwriting it. The mode requested is world readable, because PHP-FPM runs
+ * as a different user than the test runner and has to read it, and the path is outside
+ * the document root the harness serves so that the value is not itself fetchable over
+ * HTTP.
+ *
+ * World readable is what that trade buys, and it is the reason the secret is scoped the
+ * way it is: any local user of the host can read this file for as long as it exists, and
+ * what it authorizes is flushing the caches of a throwaway test installation. It exists
+ * only while the suite runs - `globalTeardown` deletes it - and it is regenerated per
+ * run, so it is not a credential to anything that outlives the run. A deployment where a
+ * local user reading it would matter should point
+ * `WP_PERF_CACHE_RESET_TOKEN_FILE` at a path readable only by the runner and the PHP
+ * user, which both this file and the mu-plugin honour.
+ *
+ * No caller in this file interpolates the value into a URL, a diagnostic or a test
+ * result.
+ *
+ * @return {string} The secret for this run.
+ */
+function cacheResetToken() {
+	if ( cacheResetToken.token ) {
+		return cacheResetToken.token;
+	}
+
+	const path = cacheResetTokenPath();
+
+	const readProvisioned = () => {
+		const provisioned = readFileSync( path, 'utf8' ).trim();
+
+		if ( ! CACHE_RESET_TOKEN_PATTERN.test( provisioned ) ) {
+			throw new Error(
+				`The cache reset token at ${ path } does not match ${ CACHE_RESET_TOKEN_PATTERN }, so tests/performance/wp-content/mu-plugins/server-timing.php will refuse every reset and leave the caches warm. Delete the file and run the suite again.`
+			);
+		}
+
+		return provisioned;
+	};
+
+	if ( existsSync( path ) ) {
+		cacheResetToken.token = readProvisioned();
+
+		return cacheResetToken.token;
+	}
+
+	mkdirSync( dirname( path ), { recursive: true } );
+
+	try {
+		const token = randomBytes( 32 ).toString( 'hex' );
+
+		writeFileSync( path, token, {
+			encoding: 'utf8',
+			flag: 'wx',
+			mode: 0o644,
+		} );
+
+		cacheResetToken.token = token;
+	} catch ( error ) {
+		if ( 'EEXIST' !== error.code ) {
+			throw error;
+		}
+
+		// Another process provisioned it first; its value is the one the server will accept.
+		cacheResetToken.token = readProvisioned();
+	}
+
+	return cacheResetToken.token;
+}
+
+/**
+ * Withdraws the file-based provisioning of the secret, and this process's cached copy.
+ *
+ * Called from the global teardown, so the token this run wrote does not outlive it and
+ * the next run provisions a fresh one. A `WP_PERF_CACHE_RESET_TOKEN` constant or
+ * environment variable takes precedence over the file in the mu-plugin, so where one of
+ * those is configured the endpoint stays enabled after this returns.
+ *
+ * Only the file is removed. Its directory holds other build caches, so removing the
+ * directory could take something else with it.
+ *
+ * @return {void}
+ */
+function revokeCacheResetToken() {
+	delete cacheResetToken.token;
+
+	rmSync( cacheResetTokenPath(), { force: true } );
+}
+
+/**
+ * Discards the caches the next measured navigation would otherwise be served from.
+ *
+ * Every measured sample in this suite is reported as an uncached measurement, so the
+ * status is asserted here, once, for every spec: a 202 is the authorized reset handler
+ * reporting that it ran, and anything else means the caches this navigation is served
+ * from were not discarded. Which layers it discarded is reported separately, in the
+ * `X-WP-Perf-Cache-Reset` response header.
+ *
+ * A POST through the request API rather than a navigation, because the reset is a
+ * state-changing operation that has to be unreachable from anything a browser will do
+ * on its own. The page is deliberately left where it is: the caller navigates to the
+ * URL it means to measure immediately afterwards, so a navigation here would only add a
+ * document nobody looks at.
+ *
+ * @param {import('@playwright/test').Page} page Page whose request context to use.
+ * @return {Promise<void>} Resolves once the caches have been discarded.
+ */
+async function clearServerCaches( page ) {
+	const response = await page.request.post( '/?clear_cache', {
+		headers: { [ CACHE_RESET_TOKEN_HEADER ]: cacheResetToken() },
+	} );
+
+	const status = response.status();
+
+	if ( CACHE_RESET_STATUS === status ) {
+		return;
+	}
+
+	/*
+	 * The mu-plugin answers each category of refusal with a status of its own, so the
+	 * message below names that category and the causes it is likely to have rather than
+	 * leaving the caller to guess. None of them quotes the secret: a message that did
+	 * would put the value into the run's log and its uploaded artifacts.
+	 */
+	const reasons = {
+		404: `no cache reset endpoint answered. Either tests/performance/wp-content/mu-plugins/server-timing.php is not installed in the WordPress tree under test, or it could not read the token at ${ cacheResetTokenPath() } — check that the path is beside the installation directory and readable by the web server user.`,
+		405: 'the cache reset endpoint refused the request method. It accepts POST only, so this helper must not navigate to the URL.',
+		403: `the cache reset endpoint refused the presented token. The value at ${ cacheResetTokenPath() } is not the one the server resolved; a WP_PERF_CACHE_RESET_TOKEN constant or environment variable takes precedence over the file and may be stale.`,
+	};
+
+	throw new Error(
+		`Requesting a cache reset answered ${ status } where ${ CACHE_RESET_STATUS } was required: ${
+			reasons[ status ] ??
+			'the request was not answered by the cache reset endpoint.'
+		} The opcode cache, object cache and transients were therefore not discarded, and every sample taken after this point would be warm.`
+	);
+}
+
+/**
+ * Reports the first reason a measured series cannot be aggregated.
+ *
+ * A series reaches the report through a median, and a median only means something
+ * when every sample is a real number and there is at least one of them. An empty
+ * series medians to NaN and a null sample sorts as 0, so both survive all the way
+ * into a results cell and are indistinguishable there from a measurement.
+ *
+ * @param {unknown} samples Candidate series.
+ * @return {string|null} Reason the series is unusable, or null when it is usable.
+ */
+function invalidSeriesReason( samples ) {
+	if ( ! Array.isArray( samples ) ) {
+		return `expected an array of samples, received ${ typeof samples }`;
+	}
+
+	if ( 0 === samples.length ) {
+		return 'holds no samples, so it has no median';
+	}
+
+	for ( const [ index, sample ] of samples.entries() ) {
+		if ( 'number' !== typeof sample || ! Number.isFinite( sample ) ) {
+			return `sample ${ index } is ${ JSON.stringify(
+				sample
+			) }, which is not a finite number`;
+		}
+	}
+
+	return null;
+}
+
+/**
+ * Rejects a performance results artifact that cannot be compared.
+ *
+ * The comparison reads the first scenario, its first repetition and that
+ * repetition's first metric without checking that any of them exist, and it takes a
+ * median of whatever series it finds. So a truncated run, a scenario that lost a
+ * metric, a repetition measured a different number of times and a series holding a
+ * null all reach the results table as numbers rather than as failures. Everything
+ * the comparison assumes is therefore asserted here, at the one point where the
+ * artifact enters the reporter.
+ *
+ * @param {unknown} stats    Parsed artifact contents.
+ * @param {string}  fileName Artifact file name, for the failure message.
+ * @return {Array<{file: string, title: string, results: Record<string,number[]>[]}>} The validated artifact.
+ */
+function validateResults( stats, fileName ) {
+	const fail = ( reason ) => {
+		throw new Error( `${ fileName }: ${ reason }` );
+	};
+
+	if ( ! Array.isArray( stats ) ) {
+		fail( `expected an array of scenarios, received ${ typeof stats }` );
+	}
+
+	if ( 0 === stats.length ) {
+		fail( 'holds no scenarios, so there is nothing to compare' );
+	}
+
+	const titles = new Set();
+
+	for ( const [ index, scenario ] of stats.entries() ) {
+		if ( null === scenario || 'object' !== typeof scenario ) {
+			fail( `scenario ${ index } is not an object` );
+		}
+
+		const { title, results } = scenario;
+
+		if ( 'string' !== typeof title || '' === title ) {
+			fail( `scenario ${ index } has no title` );
+		}
+
+		if ( titles.has( title ) ) {
+			fail(
+				`scenario '${ title }' appears more than once, so one of its result sets would be discarded`
+			);
+		}
+		titles.add( title );
+
+		if ( ! Array.isArray( results ) || 0 === results.length ) {
+			fail( `scenario '${ title }' holds no repetitions` );
+		}
+
+		let metrics = null;
+		let samplesPerRepetition = null;
+
+		for ( const [ repetition, measured ] of results.entries() ) {
+			if ( null === measured || 'object' !== typeof measured ) {
+				fail(
+					`scenario '${ title }' repetition ${ repetition } is not an object`
+				);
+			}
+
+			const keys = Object.keys( measured ).sort();
+
+			if ( 0 === keys.length ) {
+				fail(
+					`scenario '${ title }' repetition ${ repetition } reports no metrics`
+				);
+			}
+
+			if ( null === metrics ) {
+				metrics = keys;
+			} else if ( keys.join( ',' ) !== metrics.join( ',' ) ) {
+				fail(
+					`scenario '${ title }' repetition ${ repetition } reports [${ keys }] where repetition 0 reports [${ metrics }]; a metric present in one repetition and missing from another shortens its series without shortening the others`
+				);
+			}
+
+			for ( const metric of keys ) {
+				const reason = invalidSeriesReason( measured[ metric ] );
+
+				if ( null !== reason ) {
+					fail(
+						`scenario '${ title }' repetition ${ repetition } metric '${ metric }' ${ reason }`
+					);
+				}
+
+				const { length } = measured[ metric ];
+
+				if ( null === samplesPerRepetition ) {
+					samplesPerRepetition = length;
+				} else if ( length !== samplesPerRepetition ) {
+					fail(
+						`scenario '${ title }' repetition ${ repetition } metric '${ metric }' holds ${ length } samples where ${ samplesPerRepetition } were measured; the medians would be taken over different iteration counts`
+					);
+				}
+			}
+		}
+	}
+
+	return stats;
+}
 
 /**
  * Parse test files into JSON objects.
+ *
+ * An absent file is reported as no scenarios, which is how a run with no baseline to
+ * compare against is expressed. A file that exists is validated, because from here on
+ * every consumer treats its contents as measurements.
  *
  * @param {string} fileName The name of the file.
  * @return {Array<{file: string, title: string, results: Record<string,number[]>[]}>} Parsed object.
@@ -22,17 +446,40 @@ function parseFile( fileName ) {
 		return [];
 	}
 
-	return JSON.parse( readFileSync( file, 'utf8' ) );
+	let parsed;
+
+	try {
+		parsed = JSON.parse( readFileSync( file, 'utf8' ) );
+	} catch ( error ) {
+		throw new Error(
+			`${ fileName }: is not valid JSON: ${ error.message }`
+		);
+	}
+
+	return validateResults( parsed, fileName );
 }
 
 /**
- * Computes the median number from an array numbers.
+ * Computes the median number from an array of numbers.
+ *
+ * The series has to hold at least one sample and every sample has to be a finite
+ * number: an empty array medians to NaN and a null sorts as zero, so either would
+ * reach the results table looking like a measurement. An unusable series is rejected
+ * rather than medianed.
  *
  * @param {number[]} array
  *
  * @return {number} Median.
  */
 function median( array ) {
+	const reason = invalidSeriesReason( array );
+
+	if ( null !== reason ) {
+		throw new Error(
+			`Cannot take the median of a series that ${ reason }`
+		);
+	}
+
 	const mid = Math.floor( array.length / 2 );
 	const numbers = [ ...array ].sort( ( a, b ) => a - b );
 	return array.length % 2 !== 0
@@ -72,7 +519,7 @@ function camelCaseDashes( str ) {
  * | 777 | 999 | No  |
  *
  * @param {Array<Object>} rows Table rows.
- * @returns {string} Markdown table content.
+ * @return {string} Markdown table content.
  */
 function formatAsMarkdownTable( rows ) {
 	let result = '';
@@ -86,7 +533,7 @@ function formatAsMarkdownTable( rows ) {
 		result += `| ${ header } `;
 	}
 	result += '|\n';
-	for ( const header of headers ) {
+	for ( let i = 0; i < headers.length; i++ ) {
 		result += '| ------ ';
 	}
 	result += '|\n';
@@ -112,15 +559,19 @@ function formatValue( metric, value ) {
 		return 'N/A';
 	}
 
-	if ( 'wpMemoryUsage' === metric ) {
+	if ( 'wpMemoryUsage' === metric || 'wpMemoryPeak' === metric ) {
 		return `${ ( value / Math.pow( 10, 6 ) ).toFixed( 2 ) } MB`;
 	}
 
-	if ( 'wpExtObjCache' === metric ) {
+	if ( 'adminJsRaw' === metric || 'adminJsGzipped' === metric ) {
+		return `${ ( value / Math.pow( 10, 3 ) ).toFixed( 2 ) } kB`;
+	}
+
+	if ( booleanMetrics.has( metric ) ) {
 		return 1 === value ? 'yes' : 'no';
 	}
 
-	if ( 'wpDbQueries' === metric ) {
+	if ( countMetrics.has( metric ) ) {
 		return value;
 	}
 
@@ -128,13 +579,56 @@ function formatValue( metric, value ) {
 }
 
 /**
+ * Determines whether the difference between two values of a metric is meaningful.
+ *
+ * Flags belong in the comparison because they qualify every other number in their row —
+ * an object cache that appeared where the previous run had none — but they are not
+ * quantities. Subtracting, averaging or deviating them is arithmetic on labels, which
+ * renders as '-1' rather than as information, so their difference columns are left empty
+ * while the value itself is still reported.
+ *
+ * @param {string} metric Metric.
+ * @return {boolean} Whether a numeric difference between two values of the metric is meaningful.
+ */
+function isComparableMetric( metric ) {
+	return ! booleanMetrics.has( metric );
+}
+
+/**
+ * Calculates deterministic raw and gzip-compressed JavaScript response sizes.
+ *
+ * HTTP servers and browsers can negotiate different transfer encodings, so the
+ * benchmark reads each decoded response body and applies the same gzip level to every
+ * sample. Each response is compressed separately, matching how JavaScript assets are
+ * transferred over HTTP rather than compressing an artificial concatenated bundle.
+ *
+ * @param {Array<{body: () => Promise<Buffer>}>} responses JavaScript responses.
+ * @return {Promise<{raw: number, gzipped: number}>} Byte totals.
+ */
+async function getJavaScriptResponseByteSizes( responses ) {
+	const bodies = await Promise.all(
+		responses.map( ( response ) => response.body() )
+	);
+
+	return bodies.reduce(
+		( sizes, body ) => {
+			sizes.raw += body.byteLength;
+			sizes.gzipped += gzipSync( body, { level: 9 } ).byteLength;
+
+			return sizes;
+		},
+		{ raw: 0, gzipped: 0 }
+	);
+}
+
+/**
  * Returns a Markdown link to a Git commit on the current GitHub repository.
  *
- * For example, turns `a5c3785ed8d6a35868bc169f07e40e889087fd2e`
- * into (https://github.com/wordpress/wordpress-develop/commit/36fe58a8c64dcc83fc21bddd5fcf054aef4efb27)[36fe58a].
+ * For example, turns `a5c3785ed8d6a35868bc169f07e40e889087fd2e` into
+ * [a5c3785](https://github.com/wordpress/wordpress-develop/commit/a5c3785ed8d6a35868bc169f07e40e889087fd2e).
  *
  * @param {string} sha Commit SHA.
- * @return string Link
+ * @return {string} Link.
  */
 function linkToSha( sha ) {
 	const repoName =
@@ -169,26 +663,82 @@ function medianAbsoluteDeviation( array = [] ) {
 }
 
 /**
+ * Merges the per-repetition series of one scenario into one series per metric.
+ *
+ * Every repetition has to expose the same set of metrics, and every series has to be
+ * finite and non-empty, before anything is merged. The same requirements are enforced
+ * in validateResults(), and they are enforced here too because this function is also
+ * reachable from a caller that assembled its results in memory rather than reading them
+ * from an artifact.
  *
  * @param {Array<Record<string, number[]>>} results
- * @returns {Record<string, number[]>}
+ * @return {Record<string, number[]>} Accumulated metric values.
  */
 function accumulateValues( results ) {
-	return results.reduce( ( acc, result ) => {
-		for ( const [ metric, values ] of Object.entries( result ) ) {
-			acc[ metric ] = acc[ metric ] ?? [];
-			acc[ metric ].push( ...values );
+	if ( ! Array.isArray( results ) || 0 === results.length ) {
+		throw new Error(
+			'Cannot accumulate a scenario that holds no repetitions.'
+		);
+	}
+
+	let metrics = null;
+
+	return results.reduce( ( acc, result, repetition ) => {
+		if ( null === result || 'object' !== typeof result ) {
+			throw new Error( `Repetition ${ repetition } is not an object.` );
 		}
+
+		const keys = Object.keys( result ).sort();
+
+		if ( 0 === keys.length ) {
+			throw new Error( `Repetition ${ repetition } reports no metrics.` );
+		}
+
+		if ( null === metrics ) {
+			metrics = keys;
+		} else if ( keys.join( ',' ) !== metrics.join( ',' ) ) {
+			throw new Error(
+				`Repetition ${ repetition } reports [${ keys }] where repetition 0 reports [${ metrics }]; accumulating them would leave the series of different lengths.`
+			);
+		}
+
+		for ( const metric of keys ) {
+			const reason = invalidSeriesReason( result[ metric ] );
+
+			if ( null !== reason ) {
+				throw new Error(
+					`Repetition ${ repetition } metric '${ metric }' ${ reason }.`
+				);
+			}
+
+			acc[ metric ] = acc[ metric ] ?? [];
+			acc[ metric ].push( ...result[ metric ] );
+		}
+
 		return acc;
 	}, {} );
 }
 
 module.exports = {
+	CACHE_RESET_STATUS,
+	CACHE_RESET_TOKEN_HEADER,
+	CACHE_RESET_TOKEN_PATTERN,
+	cacheResetTokenPath,
+	cacheResetToken,
+	activeThemeFromThemesPage,
+	previousThemePath,
+	revokeCacheResetToken,
+	clearServerCaches,
+	invalidSeriesReason,
+	validateResults,
 	parseFile,
 	median,
 	camelCaseDashes,
 	formatAsMarkdownTable,
 	formatValue,
+	isComparableMetric,
+	booleanMetrics,
+	getJavaScriptResponseByteSizes,
 	linkToSha,
 	standardDeviation,
 	medianAbsoluteDeviation,
