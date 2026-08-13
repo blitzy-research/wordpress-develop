@@ -170,4 +170,168 @@ class Tests_Option_wpLoadAlloptions extends WP_UnitTestCase {
 			'The hook name was incorrect.'
 		);
 	}
+
+	/**
+	 * Tests that the primed non-autoloaded options are answered without a query of their own.
+	 *
+	 * Three options core reads one at a time on a front-end page view - `site_logo`,
+	 * `wp_enable_real_time_collaboration` and `wp_page_for_privacy_policy` - are named in the
+	 * autoload query so that they cost no query each. This is what the reduction in queries
+	 * per front-end page load is made of, and it is only true if reading them afterwards is
+	 * free.
+	 *
+	 * @covers ::wp_load_alloptions
+	 */
+	public function test_primed_options_are_read_without_a_query() {
+		global $wpdb;
+
+		wp_cache_delete( 'alloptions', 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+		wp_load_alloptions();
+
+		$queries_before = $wpdb->num_queries;
+
+		foreach ( array( 'site_logo', 'wp_enable_real_time_collaboration', 'wp_page_for_privacy_policy' ) as $option ) {
+			get_option( $option );
+		}
+
+		$this->assertSame(
+			$queries_before,
+			$wpdb->num_queries,
+			'Reading a primed option should not need a query of its own.'
+		);
+	}
+
+	/**
+	 * Tests that a primed option that does not exist is recorded as a non-option.
+	 *
+	 * `notoptions` is what makes the read free, so it is asserted rather than inferred from
+	 * the query count alone.
+	 *
+	 * @covers ::wp_load_alloptions
+	 */
+	public function test_a_primed_option_that_does_not_exist_is_recorded_in_notoptions() {
+		delete_option( 'site_logo' );
+
+		wp_cache_delete( 'alloptions', 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+		wp_load_alloptions();
+
+		$notoptions = wp_cache_get( 'notoptions', 'options' );
+
+		$this->assertIsArray( $notoptions, 'The notoptions cache should have been primed.' );
+		$this->assertArrayHasKey( 'site_logo', $notoptions, 'A primed option with no row should be recorded as a non-option.' );
+		$this->assertFalse( get_option( 'site_logo' ), 'A primed option with no row should still read as false.' );
+	}
+
+	/**
+	 * Tests that a primed option is not added to the alloptions array.
+	 *
+	 * The array is filtered through `pre_cache_alloptions` and `alloptions`, and it is meant
+	 * to hold autoloaded options only. A primed option is cached in the `options` group
+	 * instead, which `get_option()` consults immediately afterwards, so the value is found
+	 * without the filters being handed something that was never autoloaded.
+	 *
+	 * @covers ::wp_load_alloptions
+	 */
+	public function test_a_primed_option_is_kept_out_of_alloptions() {
+		add_option( 'site_logo', '4242', '', false );
+
+		wp_cache_delete( 'alloptions', 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+		wp_cache_delete( 'site_logo', 'options' );
+
+		$this->alloptions = null;
+		add_filter( 'pre_cache_alloptions', array( $this, 'return_pre_cache_filter' ) );
+
+		$alloptions = wp_load_alloptions();
+
+		$this->assertArrayNotHasKey( 'site_logo', $alloptions, 'A non-autoloaded primed option must not be returned as an autoloaded one.' );
+		$this->assertIsArray( $this->alloptions, 'The pre_cache_alloptions filter should have run.' );
+		$this->assertArrayNotHasKey( 'site_logo', $this->alloptions, 'The pre_cache_alloptions filter must not be handed a non-autoloaded option.' );
+		$this->assertSame( '4242', get_option( 'site_logo' ), 'The primed option must still read back its stored value.' );
+	}
+
+	/**
+	 * Tests that a primed option that is autoloaded is still returned as an autoloaded one.
+	 *
+	 * The widened query matches the name whether or not the row is autoloaded, so the two
+	 * cases have to be told apart by the row's autoload value rather than by the name.
+	 *
+	 * @covers ::wp_load_alloptions
+	 */
+	public function test_a_primed_option_that_is_autoloaded_stays_in_alloptions() {
+		add_option( 'site_logo', 'auto-on', '', true );
+
+		wp_cache_delete( 'alloptions', 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+
+		$alloptions = wp_load_alloptions();
+
+		$this->assertArrayHasKey( 'site_logo', $alloptions, 'An autoloaded option must be returned as one even when it is also named for priming.' );
+		$this->assertSame( 'auto-on', $alloptions['site_logo'], 'The autoloaded value was not returned.' );
+
+		$notoptions = wp_cache_get( 'notoptions', 'options' );
+
+		if ( is_array( $notoptions ) ) {
+			$this->assertArrayNotHasKey( 'site_logo', $notoptions, 'An option that exists must never be recorded as a non-option.' );
+		}
+	}
+
+	/**
+	 * Tests that a serialized primed option is unserialized when it is read.
+	 *
+	 * The cache is primed with the raw column value, exactly as `wp_prime_option_caches()`
+	 * does, and `get_option()` is what unserializes it.
+	 *
+	 * @covers ::wp_load_alloptions
+	 */
+	public function test_a_serialized_primed_option_round_trips() {
+		$value = array(
+			'id'  => 7,
+			'url' => 'https://example.org/logo.png',
+		);
+
+		add_option( 'site_logo', $value, '', false );
+
+		wp_cache_delete( 'alloptions', 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+		wp_cache_delete( 'site_logo', 'options' );
+
+		wp_load_alloptions();
+
+		$this->assertSame( $value, get_option( 'site_logo' ), 'A serialized primed option must be unserialized on read.' );
+	}
+
+	/**
+	 * Tests that the primed option list can be filtered, including down to nothing.
+	 *
+	 * @covers ::wp_load_alloptions
+	 */
+	public function test_the_primed_option_list_is_filterable() {
+		add_filter(
+			'prime_options_with_alloptions',
+			static function ( $names ) {
+				$names[] = 'a_name_no_site_has';
+				return $names;
+			}
+		);
+
+		wp_cache_delete( 'alloptions', 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+		wp_load_alloptions();
+
+		$notoptions = wp_cache_get( 'notoptions', 'options' );
+
+		$this->assertIsArray( $notoptions, 'The notoptions cache should have been primed.' );
+		$this->assertArrayHasKey( 'a_name_no_site_has', $notoptions, 'A filtered-in name should be primed.' );
+
+		remove_all_filters( 'prime_options_with_alloptions' );
+		add_filter( 'prime_options_with_alloptions', '__return_empty_array' );
+
+		wp_cache_delete( 'alloptions', 'options' );
+		$alloptions = wp_load_alloptions();
+
+		$this->assertArrayHasKey( 'siteurl', $alloptions, 'Filtering the primed list down to nothing must still load the autoloaded options.' );
+	}
 }

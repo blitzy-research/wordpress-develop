@@ -3,17 +3,17 @@
 /**
  * Covers what the post edit and delete arms of map_meta_cap() answer from, check by check.
  *
- * Every call resolves the post, its type and the surrounding settings again, so no two
- * checks in one request can disagree because one of them was answered from something
+ * No two checks in one request may disagree because one of them was answered from something
  * stale. Each case here changes one input between two otherwise identical checks and
- * asserts that the answer moves with it, or exercises a case that has to be resolved
- * from somewhere other than the post's own fields.
+ * asserts that the answer moves with it, or exercises a case that has to be resolved from
+ * somewhere other than the post's own fields.
  *
- * These are the cases a caching layer in front of these arms would have to keep passing.
- * A request-scoped memo was built here and withdrawn - it cost memory on every request
- * that used it and could not demonstrate a time saving on a real request, which
- * docs/performance-optimization-report.md records - so they stand as the guard against a
- * future one being introduced without them.
+ * These arms are memoized for the rest of the request by
+ * {@see _wp_map_meta_cap_memo_key()}, so these are the cases that memo has to keep
+ * passing, and each of them fails if an input leaves the invalidation set the memo is
+ * discarded on. They were written before the memo existed, against the uncached function,
+ * and are unchanged by it: what they assert is the state fidelity of map_meta_cap() itself,
+ * which is the property any caching in front of it must not break.
  *
  * @group user
  * @group capabilities

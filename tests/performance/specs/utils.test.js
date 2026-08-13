@@ -126,11 +126,28 @@ const reportedAs = {
  * @return {string} Source of that collector.
  */
 function producerSection( context ) {
-	const adminAt = producerSource.indexOf( "'admin_init'" );
+	/*
+	 * The boundary between the two collectors is the shared collector's declaration,
+	 * not a hook name. Both collectors document which hooks can start a collection, so
+	 * 'admin_init' occurs in prose above the front-end collector as well as at its own
+	 * registration below; splitting on the name put the boundary at whichever comment
+	 * mentioned it first and left the front-end section with no metric assignments in
+	 * it at all - which reads as "the producer emits nothing" rather than as a parse
+	 * that missed.
+	 */
+	const sharedAt = producerSource.indexOf(
+		'function wp_perf_collect_server_timing()'
+	);
+
+	if ( -1 === sharedAt ) {
+		throw new Error(
+			'The performance mu-plugin no longer declares wp_perf_collect_server_timing(), so its front-end and admin metric vocabularies cannot be told apart. Update producerSection() to the new boundary.'
+		);
+	}
 
 	return 'admin' === context
-		? producerSource.slice( adminAt )
-		: producerSource.slice( 0, adminAt );
+		? producerSource.slice( sharedAt )
+		: producerSource.slice( 0, sharedAt );
 }
 
 /**

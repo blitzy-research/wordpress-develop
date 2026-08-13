@@ -1,5 +1,26 @@
 <?php
 
+/*
+ * This file is only meaningful when WordPress loads it as a must-use plugin, and
+ * mu-plugins sit under the document root, so a web server will serve it to anyone who
+ * asks for its path. Requested that way it used to run from its first line with no
+ * WordPress loaded, reach the first add_action() call and die there, and PHP answered
+ * with HTTP 200 carrying an uncaught-error page that named the absolute path of the file
+ * and the line it stopped on. That disclosed the installation's directory layout to an
+ * unauthenticated request, and it did so with a success status.
+ *
+ * ABSPATH is defined by the time WordPress loads a must-use plugin and is never defined
+ * on a direct request, so it is what tells the two apart. A direct request is answered
+ * with 403 and no body: the status says the file is not something to fetch, and nothing
+ * is echoed, so neither the path nor the line survives. http_response_code() is used
+ * rather than status_header() because WordPress is by definition not loaded here, and it
+ * is a no-op under CLI, where there is no response to set a status on.
+ */
+if ( ! defined( 'ABSPATH' ) ) {
+	http_response_code( 403 );
+	exit;
+}
+
 /**
  * Resolves the secret that authorizes a cache reset, or reports that there is none.
  *
@@ -449,6 +470,35 @@ function wp_perf_server_timing_value( $slug, $value ) {
 	return $value;
 }
 
+/**
+ * Claims the right to collect the metric set, once per request.
+ *
+ * Four hooks can start a collection - 'template_include' on the front end, and
+ * 'admin_init', 'rest_api_init' and 'login_init' for the responses that render no
+ * template - and more than one of them can fire on a single request. Each collector opens
+ * an output buffer and takes it back with ob_get_clean() from the first 'shutdown'
+ * callback, so a second collector would nest a buffer that the first callback does not
+ * take, and the response body inside it would never be echoed. This function is what
+ * makes the first caller the only one.
+ *
+ * @ignore
+ * @since 7.0.0
+ * @access private
+ *
+ * @return bool True for the first caller of the request, false for every later one.
+ */
+function wp_perf_claim_server_timing() {
+	static $claimed = false;
+
+	if ( $claimed ) {
+		return false;
+	}
+
+	$claimed = true;
+
+	return true;
+}
+
 add_action(
 	'wp_loaded',
 	static function () {
@@ -464,6 +514,19 @@ add_filter(
 	static function ( $template ) {
 
 		global $timestart, $wpdb;
+
+		/*
+		 * The front-end collector is the one that reports the 'before-template' and
+		 * 'template' split, so it is the one that should win on a request that renders a
+		 * template. None of the three registrations for the template-less responses fires
+		 * on such a request - 'admin_init' and 'login_init' cannot, and 'rest_api_init' is
+		 * guarded by REST_REQUEST - so in practice this claim always succeeds here. It is
+		 * still taken rather than assumed, because a nested buffer would cost the response
+		 * body rather than a metric.
+		 */
+		if ( ! wp_perf_claim_server_timing() ) {
+			return $template;
+		}
 
 		$server_timing_values = array();
 		$template_start       = microtime( true );
@@ -569,9 +632,41 @@ add_filter(
 	PHP_INT_MAX
 );
 
-add_action(
-	'admin_init',
-	static function () {
+/**
+ * Collects the metric set for a response that renders no template.
+ *
+ * The front-end collector above hangs off 'template_include', so it covers every
+ * response WordPress renders through a theme template, a 404 among them. Three response
+ * kinds reach neither that filter nor a theme: an admin screen, a REST response, and
+ * wp-login.php. They used to carry no Server-Timing header at all, so the metrics the
+ * six performance targets are measured from - files loaded, peak memory, queries, cache
+ * hits and misses, bootstrap duration, total time - simply did not exist for a REST or a
+ * login request, and neither did the evidence that a change had not regressed them.
+ *
+ * The boundary is the same one the admin collector always used and the same one the
+ * front-end collector reports as 'total': $timestart to the first 'shutdown' callback.
+ * 'before-template' and 'template' are not reported, because a response that renders no
+ * template has no such split to report, and inventing one would make the two collectors
+ * look comparable where they are not.
+ *
+ * Collecting once per request is what the static guard is for. 'rest_api_init' fires
+ * inside rest_get_server(), which any request may reach - the block editor preloads REST
+ * responses through it - so on a request that has already begun collecting, a second
+ * ob_start() would nest a buffer that the first shutdown callback's ob_get_clean() would
+ * not take, and the response body would be lost. The guard makes whichever collector
+ * arrives first the only one, and the registrations below keep that from ever being the
+ * wrong one.
+ *
+ * @ignore
+ * @since 7.0.0
+ * @access private
+ */
+function wp_perf_collect_server_timing() {
+	if ( ! wp_perf_claim_server_timing() ) {
+		return;
+	}
+
+	$callback = static function () {
 		global $timestart, $wpdb;
 
 		ob_start();
@@ -648,6 +743,46 @@ add_action(
 			},
 			PHP_INT_MIN
 		);
+	};
+
+	$callback();
+}
+
+/*
+ * The three registrations that reach the collector above, one per response kind that
+ * renders no template.
+ *
+ * 'admin_init' is where this collector has always been registered, and it is the only
+ * one of the three that fires on an admin screen.
+ *
+ * 'rest_api_init' is guarded by REST_REQUEST because the action is not by itself a sign
+ * that the response being built is a REST response: rest_get_server() fires it for any
+ * caller, including rest_do_request() from a front-end or admin request. rest_api_loaded()
+ * defines REST_REQUEST immediately before it calls rest_get_server(), so the constant is
+ * present exactly when the request being served is the REST request itself. Without the
+ * guard, a front-end request that preloads a REST response would start collecting here
+ * instead of at 'template_include' and would report no 'before-template' or 'template'
+ * split, quietly changing what the front-end scenario measures.
+ *
+ * 'login_init' fires at the top level of wp-login.php, before it emits anything, so the
+ * buffer opened by the collector holds the whole login response - including the redirect
+ * path, where the body is empty and only the header is added.
+ *
+ * All three run at PHP_INT_MAX so the collector's boundary starts as late as possible in
+ * the hook, matching how the front-end collector is registered.
+ */
+add_action( 'admin_init', 'wp_perf_collect_server_timing', PHP_INT_MAX );
+
+add_action(
+	'rest_api_init',
+	static function () {
+		if ( ! defined( 'REST_REQUEST' ) || ! REST_REQUEST ) {
+			return;
+		}
+
+		wp_perf_collect_server_timing();
 	},
 	PHP_INT_MAX
 );
+
+add_action( 'login_init', 'wp_perf_collect_server_timing', PHP_INT_MAX );

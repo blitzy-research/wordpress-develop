@@ -181,6 +181,33 @@ function _wp_connectors_resolve_ai_provider_logo_url( string $path ): ?string {
 }
 
 /**
+ * Determines whether the AI Client provider registry can hold a registered provider.
+ *
+ * The three `init` callbacks in this file read the AI Client registry to enrich the
+ * connector list with provider metadata, to register an API key setting per provider,
+ * and to hand a stored API key back to the provider. Each of those loops does nothing
+ * when the registry is empty, but reaching the registry at all used to load
+ * `AiClient`, its provider registry, and the HTTP transporter trait and interface on
+ * every request, front end included.
+ *
+ * A registry can only be non-empty if something already called
+ * `AiClient::defaultRegistry()` to register a provider in it, and that call cannot
+ * happen without `AiClient` being loaded. Probing for the loaded class with
+ * autoloading disabled therefore answers the same question the loop does, without
+ * loading anything: when it answers false the registry is provably empty and the loop
+ * would iterate nothing, and when it answers true the registry is read exactly as
+ * before.
+ *
+ * @since 7.0.0
+ * @access private
+ *
+ * @return bool True when the AI Client is loaded and its registry may hold a provider.
+ */
+function _wp_connectors_has_ai_registry(): bool {
+	return class_exists( AiClient::class, false );
+}
+
+/**
  * Initializes the connector registry with default connectors and fires the registration action.
  *
  * Creates the registry instance, registers built-in connectors (which cannot be unhooked),
@@ -234,9 +261,14 @@ function _wp_connectors_init(): void {
 
 	// Merge AI Client registry data on top of defaults.
 	// Registry values (from provider plugins) take precedence over hardcoded fallbacks.
-	$ai_registry = AiClient::defaultRegistry();
+	$provider_ids = array();
 
-	foreach ( $ai_registry->getRegisteredProviderIds() as $connector_id ) {
+	if ( _wp_connectors_has_ai_registry() ) {
+		$ai_registry  = AiClient::defaultRegistry();
+		$provider_ids = $ai_registry->getRegisteredProviderIds();
+	}
+
+	foreach ( $provider_ids as $connector_id ) {
 		$provider_class_name = $ai_registry->getProviderClassName( $connector_id );
 		$provider_metadata   = $provider_class_name::metadata();
 
@@ -490,6 +522,10 @@ add_filter( 'rest_post_dispatch', '_wp_connectors_rest_settings_dispatch', 10, 3
  * @access private
  */
 function _wp_register_default_connector_settings(): void {
+	if ( ! _wp_connectors_has_ai_registry() ) {
+		return;
+	}
+
 	$ai_registry = AiClient::defaultRegistry();
 
 	foreach ( wp_get_connectors() as $connector_id => $connector_data ) {
@@ -534,6 +570,10 @@ add_action( 'init', '_wp_register_default_connector_settings', 20 );
  * @access private
  */
 function _wp_connectors_pass_default_keys_to_ai_client(): void {
+	if ( ! _wp_connectors_has_ai_registry() ) {
+		return;
+	}
+
 	try {
 		$ai_registry = AiClient::defaultRegistry();
 		foreach ( wp_get_connectors() as $connector_id => $connector_data ) {

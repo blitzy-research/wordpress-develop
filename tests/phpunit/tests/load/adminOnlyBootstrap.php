@@ -172,6 +172,50 @@ class Tests_Load_AdminOnlyBootstrap extends WP_UnitTestCase {
 	}
 
 	/**
+	 * Tests that the generated admin page loaders are required on admin requests only.
+	 *
+	 * Between them `build/routes.php` and `build/pages.php` reach seven generated files,
+	 * and every hook those files register is an admin hook: `admin_init`,
+	 * `admin_enqueue_scripts`, and the four page-specific `*_init` actions that only
+	 * `wp_font_library_render_page()` and `wp_options_connectors_render_page()` fire. A
+	 * front-end request fired none of them, so requiring these unconditionally parsed
+	 * 41,680 bytes of admin page definitions to register work that request could not do.
+	 *
+	 * Nothing in `wp-includes/` calls the functions they declare, and the two callers in
+	 * `wp-admin/` - `font-library.php` and `options-connectors.php` - are admin screens
+	 * that guard their calls with `function_exists()` in any case.
+	 */
+	public function test_the_generated_admin_page_loaders_are_required_conditionally() {
+		foreach ( array( '/build/routes.php', '/build/pages.php' ) as $path ) {
+			$statements = self::get_include_statements( $path );
+
+			$this->assertCount(
+				1,
+				$statements,
+				"wp-settings.php should reach {$path} from exactly one statement."
+			);
+
+			$this->assertGreaterThan(
+				1,
+				$statements[0]['depth'],
+				"The {$path} require must sit inside the admin-only branch as well as its own file_exists() check: a front-end request has nothing to call in it."
+			);
+
+			$this->assertStringContainsString(
+				'is_admin()',
+				$statements[0]['condition'],
+				"The condition guarding {$path} must keep loading it on every admin request."
+			);
+
+			$this->assertStringContainsString(
+				'file_exists(',
+				$statements[0]['condition'],
+				"The condition guarding {$path} must keep tolerating a tree that carries no generated pages."
+			);
+		}
+	}
+
+	/**
 	 * Returns every bootstrap statement that loads a given file, with its nesting.
 	 *
 	 * A statement at depth 0 runs on every request. Anything deeper runs only when the

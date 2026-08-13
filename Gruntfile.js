@@ -455,9 +455,32 @@ module.exports = function(grunt) {
 			} ).join( '' );
 		} );
 
-		// Sort the entities list by length, so the longest emoji will be found first.
+		/*
+		 * Sort the entities list by length, so the longest emoji will be found first.
+		 * wp_staticize_emoji() replaces in the order it is given, so a shorter sequence
+		 * placed first would consume the leading code points of a longer one that starts
+		 * with it and the longer emoji would never match.
+		 *
+		 * Length on its own is only a partial order: it reports every pair of equal
+		 * length entities as equivalent, and Array.prototype.sort is stable, so those
+		 * pairs keep whatever order the Twemoji response happened to list them in. That
+		 * makes the generated file a function of the order of the response rather than of
+		 * the set of file names in it, and the same set of emoji can then render two
+		 * different files. Comparing the entities themselves breaks those ties, which
+		 * makes the order total and the output reproducible. Entities of equal length are
+		 * interchangeable to the replacement above, so ordering them this way is not a
+		 * behavioural change.
+		 */
 		entities.sort( function( a, b ) {
-			return b.length - a.length;
+			if ( a.length !== b.length ) {
+				return b.length - a.length;
+			}
+
+			if ( a === b ) {
+				return 0;
+			}
+
+			return a < b ? -1 : 1;
 		} );
 
 		entities = '\'' + entities.filter( function( val ) {
@@ -472,7 +495,17 @@ module.exports = function(grunt) {
 			} );
 		} );
 
-		partials = '\'' + Array.from( partialsSet ).filter( function( val ) {
+		/*
+		 * Array.from() over a Set yields insertion order, which here is the order the code
+		 * points were first met while walking the file names - again a function of the
+		 * order of the response rather than of the set of names in it. Sorting makes the
+		 * order total, so the same set of names always renders the same bytes.
+		 *
+		 * wp_encode_emoji() iterates this list performing one independent single code
+		 * point replacement per entry, and no replacement can affect whether a later entry
+		 * matches, so the order the list is given in has no effect at runtime.
+		 */
+		partials = '\'' + Array.from( partialsSet ).sort().filter( function( val ) {
 			return val.length >= 8 ? val : false ;
 		} ).map( phpSingleQuoted ).join( '\', \'' ) + '\'';
 

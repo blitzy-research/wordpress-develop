@@ -6,11 +6,12 @@
  * wp_enqueue_command_palette_assets() is registered on 'admin_enqueue_scripts' and pulls
  * in the `wp-commands` and `wp-core-commands` bundles, which are by far the largest part
  * of the default admin JavaScript payload. These cases cover the predicate that decides
- * whether they are delivered and the properties that delivery has to keep: every admin
- * screen still receives the palette by default, so the Ctrl+K capability and the `wp.*`
- * surface the bundles carry are not removed from anyone who does not ask; the filter can
- * withhold them; the assets never reach a non-admin request; and a page that asks for the
- * palette by name still gets it.
+ * whether they are delivered and the properties that delivery has to keep: the block
+ * editor screens receive the palette by default and other admin screens do not, so the
+ * Ctrl+K capability and the `wp.*` surface the bundles carry stay where the palette is
+ * used and stop being shipped where it is not; the filter can withhold them from the
+ * editor and restore them everywhere else; the assets never reach a non-admin request;
+ * and a page that asks for the palette by name still gets it.
  *
  * @group dependencies
  * @group scripts
@@ -136,15 +137,19 @@ class Tests_Dependencies_CommandPalette extends WP_UnitTestCase {
 	}
 
 	/**
-	 * Every admin screen receives the palette by default, editor or not.
+	 * The block editor screens receive the palette by default and other admin screens do not.
 	 *
-	 * The admin bar advertises Ctrl+K on every screen that has `wp-core-commands`, so a
-	 * default that withheld the bundles from ordinary admin screens would remove a working
-	 * capability from them. This is the case that fails if that default is ever narrowed.
+	 * This is the gate's whole effect. The block editor screens are where the palette is
+	 * used, and they already load `wp-commands` and `wp-core-commands` through
+	 * `wp-edit-post` and `wp-edit-site`, so delivering there adds almost nothing;
+	 * delivering on an ordinary admin screen adds the entire chain those bundles carry.
+	 * Both halves are asserted, because a default that answered the same way on both
+	 * screens would either withhold the palette from the editor or hand the chain to every
+	 * screen again.
 	 *
 	 * @covers ::wp_should_load_command_palette_assets
 	 */
-	public function test_default_delivers_on_every_admin_screen() {
+	public function test_default_delivers_on_block_editor_screens_only() {
 		$this->set_current_screen( 'post', true );
 		$this->assertTrue(
 			wp_should_load_command_palette_assets(),
@@ -152,19 +157,19 @@ class Tests_Dependencies_CommandPalette extends WP_UnitTestCase {
 		);
 
 		$this->set_current_screen( 'dashboard', false );
-		$this->assertTrue(
+		$this->assertFalse(
 			wp_should_load_command_palette_assets(),
-			'An admin screen that is not a block editor screen should receive the palette too.'
+			'An admin screen that is not a block editor screen should not receive the palette.'
 		);
 	}
 
 	/**
 	 * With no screen set up at all, the predicate answers rather than raising.
 	 *
-	 * The default does not read the screen, so a request that has not built one cannot
-	 * error on a missing global. What it does read is is_admin(), which falls back to the
-	 * WP_ADMIN constant when there is no screen - undefined here - so the answer in this
-	 * case is the non-admin refusal.
+	 * The default reads the screen through an instance test rather than by calling a method
+	 * on it, so a request that has not built one cannot error on a missing global. What it
+	 * reads first is is_admin(), which falls back to the WP_ADMIN constant when there is no
+	 * screen - undefined here - so the answer in this case is the non-admin refusal.
 	 *
 	 * @covers ::wp_should_load_command_palette_assets
 	 */
@@ -199,14 +204,14 @@ class Tests_Dependencies_CommandPalette extends WP_UnitTestCase {
 		add_filter( 'should_load_command_palette_assets', array( $this, 'record_filter_call' ) );
 		wp_should_load_command_palette_assets();
 		remove_filter( 'should_load_command_palette_assets', array( $this, 'record_filter_call' ) );
-		$this->assertSame( array( true ), $this->filter_calls, 'The filter should receive the default for the screen.' );
+		$this->assertSame( array( false ), $this->filter_calls, 'The filter should receive the default for the screen.' );
 
-		add_filter( 'should_load_command_palette_assets', '__return_false' );
-		$this->assertFalse(
+		add_filter( 'should_load_command_palette_assets', '__return_true' );
+		$this->assertTrue(
 			wp_should_load_command_palette_assets(),
-			'Returning false should withhold delivery on an ordinary admin screen.'
+			'Returning true should deliver the palette on an ordinary admin screen.'
 		);
-		remove_filter( 'should_load_command_palette_assets', '__return_false' );
+		remove_filter( 'should_load_command_palette_assets', '__return_true' );
 
 		$this->set_current_screen( 'post', true );
 
@@ -226,39 +231,66 @@ class Tests_Dependencies_CommandPalette extends WP_UnitTestCase {
 	}
 
 	/**
-	 * The automatic delivery reaches an ordinary admin screen.
+	 * The automatic delivery reaches a block editor screen.
 	 *
 	 * The bundles are what define `wp.commands` and what the admin bar's Ctrl+K button
 	 * checks for, so this is the case that fails if the Command Palette is ever withheld
-	 * from a screen that had it.
+	 * from the screens it is used on.
 	 *
 	 * @covers ::wp_enqueue_command_palette_assets
 	 */
-	public function test_enqueue_delivers_while_admin_enqueue_scripts_runs_on_an_ordinary_screen() {
+	public function test_enqueue_delivers_while_admin_enqueue_scripts_runs_on_a_block_editor_screen() {
+		$this->set_current_screen( 'post', true );
+
+		do_action( 'admin_enqueue_scripts', 'post.php' );
+
+		$this->assertTrue(
+			wp_script_is( 'wp-core-commands', 'enqueued' ),
+			'wp-core-commands should be enqueued on a block editor screen.'
+		);
+		$this->assertTrue(
+			wp_script_is( 'wp-commands', 'enqueued' ),
+			'wp-commands should be enqueued on a block editor screen.'
+		);
+	}
+
+	/**
+	 * The automatic delivery skips an admin screen that is not a block editor screen.
+	 *
+	 * This is the saving the gate exists for: against the production build the Dashboard's
+	 * JavaScript payload falls from 1,042,614 to 142,204 gzipped bytes when these bundles
+	 * and the chain they carry are not delivered.
+	 *
+	 * @covers ::wp_enqueue_command_palette_assets
+	 */
+	public function test_enqueue_is_skipped_while_admin_enqueue_scripts_runs_on_an_ordinary_screen() {
 		$this->set_current_screen( 'dashboard', false );
 
 		do_action( 'admin_enqueue_scripts', 'index.php' );
 
-		$this->assertTrue(
+		$this->assertFalse(
 			wp_script_is( 'wp-core-commands', 'enqueued' ),
-			'wp-core-commands should be enqueued on an ordinary admin screen.'
+			'wp-core-commands should not be enqueued on an ordinary admin screen.'
 		);
-		$this->assertTrue(
+		$this->assertFalse(
 			wp_script_is( 'wp-commands', 'enqueued' ),
-			'wp-commands should be enqueued on an ordinary admin screen.'
+			'wp-commands should not be enqueued on an ordinary admin screen.'
 		);
 	}
 
 	/**
 	 * The enqueue skips its work while the filter withholds the assets.
 	 *
+	 * Asserted on a block editor screen, which is the one the default would otherwise
+	 * deliver on, so the filter is what decides the outcome rather than the screen.
+	 *
 	 * @covers ::wp_enqueue_command_palette_assets
 	 */
 	public function test_enqueue_is_skipped_while_admin_enqueue_scripts_runs_on_a_declined_screen() {
-		$this->set_current_screen( 'dashboard', false );
+		$this->set_current_screen( 'post', true );
 
 		add_filter( 'should_load_command_palette_assets', '__return_false' );
-		do_action( 'admin_enqueue_scripts', 'index.php' );
+		do_action( 'admin_enqueue_scripts', 'post.php' );
 		remove_filter( 'should_load_command_palette_assets', '__return_false' );
 
 		$this->assertFalse(
@@ -268,6 +300,32 @@ class Tests_Dependencies_CommandPalette extends WP_UnitTestCase {
 		$this->assertFalse(
 			wp_script_is( 'wp-commands', 'enqueued' ),
 			'wp-commands should not be enqueued on a screen the gate declines.'
+		);
+	}
+
+	/**
+	 * The filter restores the palette on a screen the default declines.
+	 *
+	 * A site that wants the palette on every admin screen, as it was before the gate
+	 * existed, adds one filter returning true. This is the case that proves that opt-in
+	 * still reaches the enqueue rather than only the predicate.
+	 *
+	 * @covers ::wp_enqueue_command_palette_assets
+	 */
+	public function test_filter_restores_the_palette_on_an_ordinary_screen() {
+		$this->set_current_screen( 'dashboard', false );
+
+		add_filter( 'should_load_command_palette_assets', '__return_true' );
+		do_action( 'admin_enqueue_scripts', 'index.php' );
+		remove_filter( 'should_load_command_palette_assets', '__return_true' );
+
+		$this->assertTrue(
+			wp_script_is( 'wp-core-commands', 'enqueued' ),
+			'wp-core-commands should be enqueued on an ordinary screen when the filter asks for it.'
+		);
+		$this->assertTrue(
+			wp_script_is( 'wp-commands', 'enqueued' ),
+			'wp-commands should be enqueued on an ordinary screen when the filter asks for it.'
 		);
 	}
 
@@ -343,43 +401,42 @@ class Tests_Dependencies_CommandPalette extends WP_UnitTestCase {
 	 * the appearance follows from the queue, so the queue is what is set up and the node
 	 * is what is read back.
 	 *
-	 * The two arms are the default and the opt-out rather than two screens, because the
-	 * default delivers the palette on every admin screen: the filter is the only thing
-	 * that withholds it, so the filter is what the declining arm uses. Both arms run on
-	 * the same classic screen, which is what keeps the screen from being a second
-	 * variable.
+	 * The two arms are the default and the opt-in rather than two screens: both run on the
+	 * same classic screen, which is what keeps the screen from being a second variable. The
+	 * declining arm is now the default there, and the allowing arm is the one filter a site
+	 * adds to put the palette back on every admin screen.
 	 *
 	 * @covers ::wp_enqueue_command_palette_assets
 	 */
 	public function test_the_admin_bar_button_appears_only_where_the_palette_is_delivered() {
 		$this->set_current_screen( 'dashboard', false );
 
-		add_filter( 'should_load_command_palette_assets', '__return_false' );
-
 		do_action( 'admin_enqueue_scripts', 'index.php' );
-
-		remove_filter( 'should_load_command_palette_assets', '__return_false' );
 
 		$declined_bar = new WP_Admin_Bar();
 		wp_admin_bar_command_palette_menu( $declined_bar );
 
 		$this->assertFalse(
 			wp_script_is( 'wp-core-commands', 'enqueued' ),
-			'A request that opted out should not have received the palette.'
+			'An ordinary admin screen should not have received the palette.'
 		);
 		$this->assertNull(
 			$declined_bar->get_node( 'command-palette' ),
 			'A request the gate declines should show no Command Palette button in the admin bar.'
 		);
 
+		add_filter( 'should_load_command_palette_assets', '__return_true' );
+
 		do_action( 'admin_enqueue_scripts', 'index.php' );
+
+		remove_filter( 'should_load_command_palette_assets', '__return_true' );
 
 		$allowed_bar = new WP_Admin_Bar();
 		wp_admin_bar_command_palette_menu( $allowed_bar );
 
 		$this->assertTrue(
 			wp_script_is( 'wp-core-commands', 'enqueued' ),
-			'The dashboard should have received the palette by default.'
+			'The screen should have received the palette once the filter asked for it.'
 		);
 
 		$node = $allowed_bar->get_node( 'command-palette' );

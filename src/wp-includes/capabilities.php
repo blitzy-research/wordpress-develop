@@ -7,6 +7,188 @@
  */
 
 /**
+ * Reads, writes and discards the request-scoped map_meta_cap() memo.
+ *
+ * The store lives here rather than in map_meta_cap() itself so that
+ * {@see _wp_flush_map_meta_cap_memo()} can empty it, which is what keeps the memo from
+ * answering from state that has since changed.
+ *
+ * @ignore
+ * @since 7.0.0
+ * @access private
+ *
+ * @param string|null   $key  Optional. Memo key, as built by _wp_map_meta_cap_memo_key().
+ *                            Null discards the whole memo. Default null.
+ * @param string[]|null $caps Optional. Primitive capabilities to record against $key.
+ *                            Null reads instead of writing. Default null.
+ * @return string[]|null The capabilities recorded against $key, or null when $key has
+ *                       nothing recorded against it or the memo was discarded.
+ */
+function _wp_map_meta_cap_memo( $key = null, $caps = null ) {
+	static $memo = array();
+
+	if ( null === $key ) {
+		$memo = array();
+
+		return null;
+	}
+
+	if ( null !== $caps ) {
+		$memo[ $key ] = $caps;
+
+		return $caps;
+	}
+
+	return isset( $memo[ $key ] ) ? $memo[ $key ] : null;
+}
+
+/**
+ * Discards the request-scoped map_meta_cap() memo.
+ *
+ * Registered against every action that can change what a memoized capability resolves
+ * from, so a check made after that change is computed again rather than answered from the
+ * memo. Discarding all of it is deliberate: the memo is small and rebuilding an entry
+ * costs one uncached resolution, while working out which entries a given change reaches
+ * would cost more than it saves.
+ *
+ * @ignore
+ * @since 7.0.0
+ * @access private
+ *
+ * @return void
+ */
+function _wp_flush_map_meta_cap_memo() {
+	_wp_map_meta_cap_memo();
+}
+
+/**
+ * Counts the _doing_it_wrong() notices raised so far in the request.
+ *
+ * map_meta_cap() reads this before and after resolving a capability and declines to record
+ * the result when it has moved. Two of the arms the memo covers report an unregistered post
+ * type or an unregistered post status that way, and a memo that answered those from a
+ * previous call would report the problem once instead of on every check that runs into it.
+ *
+ * @ignore
+ * @since 7.0.0
+ * @access private
+ *
+ * @param bool $increment Optional. Whether to count one more notice. Default false.
+ * @return int Number of notices counted so far.
+ */
+function _wp_map_meta_cap_memo_notice_count( $increment = false ) {
+	static $count = 0;
+
+	if ( $increment ) {
+		++$count;
+	}
+
+	return $count;
+}
+
+/**
+ * Builds the key a capability check is memoized under, or reports that it is not memoized.
+ *
+ * A capability is memoized only when the answer is a function of the arguments the key is
+ * built from plus state that {@see _wp_flush_map_meta_cap_memo()} is notified about. That
+ * restricts it to the post, page and comment arms, which resolve the object, its post type,
+ * its status and one option and then recurse - the arms a list table re-enters once per row.
+ *
+ * Deliberately excluded:
+ *
+ * - Every capability that reaches the `default:` arm, and the arms that answer from a
+ *   constant or a fixed name. Those are the cheapest branches in the function, so building
+ *   a key for them would cost more than they do.
+ * - The `*_meta` capabilities, which run a registered meta authorization callback and the
+ *   `is_protected_meta` filter, neither of which this memo is entitled to answer for.
+ * - The term capabilities, which additionally resolve two per-taxonomy options that are not
+ *   in the invalidation set, and which no measured request re-enters.
+ * - An argument that is not a positive integer, which is a shape whose identity a scalar key
+ *   cannot establish. A call with no object id, or with more than one argument, never reaches
+ *   this function: map_meta_cap() tests for that itself, so that the capabilities which
+ *   cannot be memoized do not pay for a call here.
+ * - Every call made while the `map_meta_cap` filter carries a callback, because a callback
+ *   is entitled to answer differently for identical arguments. Core registers one, in
+ *   WP_Customize_Manager, and a changeset request is therefore never memoized.
+ *
+ * The first memoizable check of a request also registers the invalidation listeners, so a
+ * request that never reaches one - which every front-end request measured during this work
+ * does not - adds no hooks at all.
+ *
+ * @ignore
+ * @since 7.0.0
+ * @access private
+ *
+ * @param string $cap     Capability being checked.
+ * @param int    $user_id User ID.
+ * @param array  $args    Further parameters passed to map_meta_cap().
+ * @return string Memo key, or '' when the check is not memoized.
+ */
+function _wp_map_meta_cap_memo_key( $cap, $user_id, $args ) {
+	static $memoized_caps = array(
+		'delete_page'  => true,
+		'delete_post'  => true,
+		'edit_comment' => true,
+		'edit_page'    => true,
+		'edit_post'    => true,
+		'publish_post' => true,
+		'read_page'    => true,
+		'read_post'    => true,
+	);
+
+	if ( ! isset( $memoized_caps[ $cap ] ) || ! is_scalar( $args[0] ) ) {
+		return '';
+	}
+
+	$object_id = (int) $args[0];
+
+	// A value the object id does not round-trip through is not the object this key would name.
+	if ( $object_id < 1 || (string) $object_id !== (string) $args[0] ) {
+		return '';
+	}
+
+	if ( has_filter( 'map_meta_cap' ) ) {
+		return '';
+	}
+
+	/*
+	 * Read from the hook registry rather than remembered in a static, so that the listeners
+	 * are put back if anything empties that registry - which the test suite does between
+	 * cases. A memo whose listeners are missing cannot be told that its entries went stale,
+	 * so whatever it holds at that point is discarded here, before the caller reads it.
+	 */
+	if ( ! has_action( 'clean_post_cache', '_wp_flush_map_meta_cap_memo' ) ) {
+		_wp_flush_map_meta_cap_memo();
+
+		/*
+		 * Everything the memoized arms resolve from: the post row and its trash meta, the
+		 * comment row, the post type object, the privacy policy page setting, and - on
+		 * Multisite - which site is current.
+		 */
+		add_action( 'clean_post_cache', '_wp_flush_map_meta_cap_memo' );
+		add_action( 'added_post_meta', '_wp_flush_map_meta_cap_memo' );
+		add_action( 'updated_post_meta', '_wp_flush_map_meta_cap_memo' );
+		add_action( 'deleted_post_meta', '_wp_flush_map_meta_cap_memo' );
+		add_action( 'clean_comment_cache', '_wp_flush_map_meta_cap_memo' );
+		add_action( 'registered_post_type', '_wp_flush_map_meta_cap_memo' );
+		add_action( 'unregistered_post_type', '_wp_flush_map_meta_cap_memo' );
+		add_action( 'add_option_wp_page_for_privacy_policy', '_wp_flush_map_meta_cap_memo' );
+		add_action( 'update_option_wp_page_for_privacy_policy', '_wp_flush_map_meta_cap_memo' );
+		add_action( 'delete_option_wp_page_for_privacy_policy', '_wp_flush_map_meta_cap_memo' );
+		add_action( 'switch_blog', '_wp_flush_map_meta_cap_memo' );
+
+		add_action(
+			'doing_it_wrong_run',
+			static function () {
+				_wp_map_meta_cap_memo_notice_count( true );
+			}
+		);
+	}
+
+	return $cap . '|' . (int) $user_id . '|' . $object_id;
+}
+
+/**
  * Maps a capability to the primitive capabilities required of the given user to
  * satisfy the capability being checked.
  *
@@ -34,6 +216,8 @@
  *              `edit_app_password`, `delete_app_passwords`, `delete_app_password`,
  *              and `update_https` capabilities.
  * @since 6.7.0 Added the `edit_block_binding` capability.
+ * @since 7.0.0 The post, page and comment capabilities are memoized for the rest of the
+ *              request when no `map_meta_cap` callback is registered.
  *
  * @global array $post_type_meta_caps Used to get post type meta capabilities.
  *
@@ -44,6 +228,38 @@
  */
 function map_meta_cap( $cap, $user_id, ...$args ) {
 	$caps = array();
+
+	/*
+	 * A list table re-enters the post arms once per row per action it offers, and each
+	 * entry resolves the post, its type, its status and the privacy policy page setting
+	 * again: on the Pages screen of the site this was profiled against, 141 of 335 checks
+	 * in one request were 'edit_post' and 262 of the 335 repeated an identical check.
+	 * _wp_map_meta_cap_memo_key() decides which of them may be answered from the memo and
+	 * returns '' for the rest, which is every capability whose own arm is cheaper than
+	 * building a key would be.
+	 */
+	$memo_key       = '';
+	$notices_before = 0;
+
+	/*
+	 * Only a check that names exactly one object can be memoized, and testing that here
+	 * rather than inside the key builder is what keeps the capabilities that reach the
+	 * `default:` arm - most of an admin request, and all seven checks a front-end request
+	 * makes - from paying for a call that would only decline them.
+	 */
+	if ( 1 === count( $args ) && isset( $args[0] ) ) {
+		$memo_key = _wp_map_meta_cap_memo_key( $cap, $user_id, $args );
+	}
+
+	if ( '' !== $memo_key ) {
+		$memoized = _wp_map_meta_cap_memo( $memo_key );
+
+		if ( null !== $memoized ) {
+			return $memoized;
+		}
+
+		$notices_before = _wp_map_meta_cap_memo_notice_count();
+	}
 
 	switch ( $cap ) {
 		case 'remove_user':
@@ -876,7 +1092,18 @@ function map_meta_cap( $cap, $user_id, ...$args ) {
 	 * @param array    $args    Adds context to the capability check, typically
 	 *                          starting with an object ID.
 	 */
-	return apply_filters( 'map_meta_cap', $caps, $cap, $user_id, $args );
+	$caps = apply_filters( 'map_meta_cap', $caps, $cap, $user_id, $args );
+
+	/*
+	 * Recorded only when resolving it raised no notice. A notice here means the arm took its
+	 * unregistered post type or unregistered post status branch, and that has to be reported
+	 * on every check that runs into it rather than only on the first.
+	 */
+	if ( '' !== $memo_key && _wp_map_meta_cap_memo_notice_count() === $notices_before ) {
+		_wp_map_meta_cap_memo( $memo_key, $caps );
+	}
+
+	return $caps;
 }
 
 /**

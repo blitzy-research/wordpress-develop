@@ -79,7 +79,6 @@ require ABSPATH . WPINC . '/class-wp-fatal-error-handler.php';
 require ABSPATH . WPINC . '/class-wp-recovery-mode-cookie-service.php';
 require ABSPATH . WPINC . '/class-wp-recovery-mode-key-service.php';
 require ABSPATH . WPINC . '/class-wp-recovery-mode-link-service.php';
-require ABSPATH . WPINC . '/class-wp-recovery-mode-email-service.php';
 require ABSPATH . WPINC . '/class-wp-recovery-mode.php';
 require ABSPATH . WPINC . '/error-protection.php';
 require ABSPATH . WPINC . '/default-constants.php';
@@ -160,7 +159,44 @@ require ABSPATH . WPINC . '/class-wp.php';
  * fail.
  */
 require ABSPATH . WPINC . '/class-wp-error.php';
-require ABSPATH . WPINC . '/pomo/mo.php';
+/*
+ * Only the translation base classes are loaded eagerly. get_translations_for_domain()
+ * instantiates NOOP_Translations on every request that asks for a string, so
+ * pomo/translations.php - and pomo/plural-forms.php and pomo/entry.php, which it
+ * requires itself - are needed unconditionally. Reading a compiled catalogue is not:
+ * pomo/mo.php and the stream readers it pulls in are only reached once a .mo file is
+ * actually parsed, which never happens on a site running in the original locale.
+ *
+ * MO cannot be resolved through the generated class map, because pomo/mo.php requires
+ * its two dependencies at file scope and the map only carries files that declare a
+ * single symbol and nothing else, so this registers the one file that needs a loader
+ * of its own. POMO_Reader and the readers beside it are covered by the same loader
+ * because they are declared in pomo/streams.php, which mo.php requires.
+ *
+ * The one place that names MO without loading it is l10n.php, which tests
+ * `$l10n[ $domain ] instanceof MO`. `instanceof` does not autoload, and reports false
+ * for a name that is not declared, which is the same answer it gave when mo.php was
+ * loaded eagerly and no catalogue had been read.
+ */
+require ABSPATH . WPINC . '/pomo/translations.php';
+
+spl_autoload_register(
+	/**
+	 * Loads the compiled translation reader on first reference.
+	 *
+	 * @since 7.0.0
+	 *
+	 * @param string $class_name Name of the class to load.
+	 */
+	static function ( $class_name ) {
+		if ( 'MO' !== $class_name && 0 !== strncmp( $class_name, 'POMO_', 5 ) ) {
+			return;
+		}
+
+		require ABSPATH . WPINC . '/pomo/mo.php';
+	}
+);
+
 require ABSPATH . WPINC . '/l10n/class-wp-translation-controller.php';
 
 /**
@@ -270,11 +306,29 @@ require ABSPATH . WPINC . '/kses.php';
 require ABSPATH . WPINC . '/cron.php';
 require ABSPATH . WPINC . '/deprecated.php';
 require ABSPATH . WPINC . '/script-loader.php';
-if ( file_exists( ABSPATH . WPINC . '/build/routes.php' ) ) {
-	require ABSPATH . WPINC . '/build/routes.php';
-}
-if ( file_exists( ABSPATH . WPINC . '/build/pages.php' ) ) {
-	require ABSPATH . WPINC . '/build/pages.php';
+/*
+ * The generated admin page and route loaders are required on admin requests only.
+ * Between them the two loaders reach seven generated files, and every hook those files
+ * register is an admin hook: admin_init, admin_enqueue_scripts, and the four
+ * page-specific *_init actions that only wp_font_library_render_page() and
+ * wp_options_connectors_render_page() fire. A front-end request fired none of them, so
+ * requiring these here parsed 41,680 bytes of admin page definitions to register work
+ * that request could not do.
+ *
+ * Nothing in wp-includes calls the functions they declare. The two callers in wp-admin -
+ * wp-admin/font-library.php and wp-admin/options-connectors.php - are admin screens, so
+ * is_admin() is already true by the time either runs, and each guards its call with
+ * function_exists() in any case. is_admin() is the same test the plugin.php and
+ * WP_Site_Health branches further down this file use, and it is settled here: WP_ADMIN
+ * is defined by wp-admin/admin.php before wp-load.php reaches this file.
+ */
+if ( is_admin() ) {
+	if ( file_exists( ABSPATH . WPINC . '/build/routes.php' ) ) {
+		require ABSPATH . WPINC . '/build/routes.php';
+	}
+	if ( file_exists( ABSPATH . WPINC . '/build/pages.php' ) ) {
+		require ABSPATH . WPINC . '/build/pages.php';
+	}
 }
 require ABSPATH . WPINC . '/taxonomy.php';
 require ABSPATH . WPINC . '/class-wp-taxonomy.php';
@@ -308,25 +362,27 @@ require ABSPATH . WPINC . '/html-api/class-wp-html-processor.php';
 require ABSPATH . WPINC . '/class-wp-http.php';
 require ABSPATH . WPINC . '/class-wp-http-streams.php';
 /*
- * The five declarations below name a parent class or an implemented interface that
- * belongs to a bundled library, and those names are served by autoloaders that are
- * registered here rather than alongside the core autoloader further up this file.
- * WpOrg\Requests\Autoload::register() runs inside class-wp-http.php, and
- * php-ai-client/autoload.php registers the WordPress\AiClient and
- * WordPress\AiClientDependencies prefixes on the line below. Resolving any of these
- * five through the class map before this point - in a SHORTINIT bootstrap, in an
- * object-cache.php or advanced-cache.php drop-in, or anywhere between the core
- * autoloader and this line - would reach an undeclared parent and raise a fatal
- * error, so they stay eager next to the autoloaders they depend on and the class map
- * generator excludes them.
+ * WP_HTTP_Requests_Hooks names a parent class that belongs to a bundled library, and
+ * that name is served by an autoloader registered here rather than alongside the core
+ * autoloader further up this file: WpOrg\Requests\Autoload::register() runs inside
+ * class-wp-http.php on the line above. Resolving WP_HTTP_Requests_Hooks through the
+ * class map before this point - in a SHORTINIT bootstrap, in an object-cache.php or
+ * advanced-cache.php drop-in, or anywhere between the core autoloader and this line -
+ * would reach an undeclared parent and raise a fatal error, so it stays eager next to
+ * the autoloader it depends on and the class map generator excludes it.
  */
 require ABSPATH . WPINC . '/class-wp-http-requests-hooks.php';
-require ABSPATH . WPINC . '/php-ai-client/autoload.php';
-require ABSPATH . WPINC . '/ai-client/adapters/class-wp-ai-client-http-client.php';
-require ABSPATH . WPINC . '/ai-client/adapters/class-wp-ai-client-cache.php';
-require ABSPATH . WPINC . '/ai-client/adapters/class-wp-ai-client-discovery-strategy.php';
-require ABSPATH . WPINC . '/ai-client/adapters/class-wp-ai-client-event-dispatcher.php';
+/*
+ * ai-client.php is required ahead of the bundled prefix autoloader on the next line
+ * because it registers _wp_ai_client_load(), and spl_autoload_register() preserves
+ * registration order: the AI Client's WordPress-side wiring has to be reached before
+ * the prefix autoloader answers for WordPress\AiClient\AiClient, or that wiring would
+ * never run. The four adapter classes that wiring installs, the six bundled
+ * interfaces they implement, and AiClient itself are all loaded from there instead of
+ * here, because a profiled front-end request resolves none of them.
+ */
 require ABSPATH . WPINC . '/ai-client.php';
+require ABSPATH . WPINC . '/php-ai-client/autoload.php';
 require ABSPATH . WPINC . '/class-wp-connector-registry.php';
 require ABSPATH . WPINC . '/connectors.php';
 require ABSPATH . WPINC . '/widgets.php';
@@ -448,11 +504,6 @@ $GLOBALS['wp_embed'] = new WP_Embed();
  */
 $GLOBALS['wp_textdomain_registry'] = new WP_Textdomain_Registry();
 $GLOBALS['wp_textdomain_registry']->init();
-
-// WordPress AI Client initialization.
-WP_AI_Client_Discovery_Strategy::init();
-WordPress\AiClient\AiClient::setCache( new WP_AI_Client_Cache() );
-WordPress\AiClient\AiClient::setEventDispatcher( new WP_AI_Client_Event_Dispatcher() );
 
 // Load multisite-specific files.
 if ( is_multisite() ) {

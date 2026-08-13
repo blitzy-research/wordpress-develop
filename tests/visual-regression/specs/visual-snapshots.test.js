@@ -165,17 +165,37 @@ test.describe( 'Admin Visual Snapshots', () => {
 	} );
 
 	/*
-	 * The cases above mask `#wp-admin-bar-root-default`, which is the subtree the Command
-	 * Palette control lives in, so none of them can see that control appear or disappear.
-	 * This case screenshots the control itself, unmasked: it fails if the control stops
-	 * rendering, which is what happens when the `wp-core-commands` bundle behind it is not
-	 * enqueued on a screen.
+	 * The cases above list `#wp-admin-bar-root-default` in `elementsToHide`, which reads
+	 * as though the subtree the Command Palette control lives in were masked out of them.
+	 * It is not: that `ul` carries only floated children, so it measures 1280x0 and the
+	 * mask Playwright paints over it has no area. The only mask visible in those snapshots
+	 * is `#footer-upgrade`. So every one of them does capture the control, and each of
+	 * their baselines is specific to whether the screen it was taken on receives it.
+	 *
+	 * This case captures the control on its own, so that expectation is stated rather than
+	 * left implicit in 22 full-page images.
+	 *
+	 * Which screens receive it is deliberate: `wp_should_load_command_palette_assets()`
+	 * enqueues the palette on the block editor screens and declines it elsewhere, and
+	 * `wp_admin_bar_command_palette_menu()` renders the button only where the bundle
+	 * behind it was enqueued. So the control belongs in the editor and does not belong on
+	 * the Dashboard, and both halves are asserted here: the screenshot fails if the
+	 * control stops rendering where it should, and the count fails if it returns to a
+	 * screen where it should not. The second half is what a full-page baseline cannot
+	 * state on its own, because a baseline records only what one screen looked like on the
+	 * day it was written.
 	 */
 	test( 'Admin Bar Command Palette control', async ({ admin, page }) => {
-		await admin.visitAdminPage( '/' );
+		// createNewPost() leaves fullscreen mode off, so the admin bar is visible here.
+		await admin.createNewPost();
 		await expect(
 			page.locator( '#wp-admin-bar-command-palette' )
 		).toHaveScreenshot( 'Admin Bar Command Palette control.png' );
+
+		await admin.visitAdminPage( '/' );
+		await expect(
+			page.locator( '#wp-admin-bar-command-palette' )
+		).toHaveCount( 0 );
 	} );
 
 	/*

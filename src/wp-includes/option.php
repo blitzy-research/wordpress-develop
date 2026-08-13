@@ -621,17 +621,102 @@ function wp_load_alloptions( $force_cache = false ) {
 	}
 
 	if ( ! $alloptions ) {
+		/*
+		 * Options that core reads one at a time on a request that has to run the autoload
+		 * query anyway. Each is read through get_option() from a different point in the
+		 * request - 'wp_enable_real_time_collaboration' from create_initial_post_types() on
+		 * init, 'site_logo' from _override_custom_logo_theme_mod() while the header renders,
+		 * and 'wp_page_for_privacy_policy' from is_privacy_policy() inside get_body_class() -
+		 * so there is no earlier moment at which they could be batched with each other. None
+		 * is autoloaded, and on a site where one does not exist at all no amount of autoload
+		 * configuration can help: get_option() cannot know a row is absent without asking.
+		 *
+		 * A profiled front-end page view therefore spent three of its queries establishing
+		 * three option values, one query each. Naming them in the autoload query costs
+		 * nothing - the query runs regardless, and the three names only widen its WHERE
+		 * clause - and it answers all three at once.
+		 *
+		 * They are primed into the 'options' and 'notoptions' caches rather than returned as
+		 * part of alloptions, because they are not autoloaded and the alloptions array is
+		 * filtered: putting a non-autoloaded option in it would change what 'alloptions' and
+		 * 'pre_cache_alloptions' are handed. get_option() consults notoptions and then the
+		 * options cache immediately after alloptions, so a primed value is found there.
+		 */
+		$primed_option_names = array(
+			'site_logo',
+			'wp_enable_real_time_collaboration',
+			'wp_page_for_privacy_policy',
+		);
+
+		/**
+		 * Filters the non-autoloaded options primed by the query that loads the autoloaded ones.
+		 *
+		 * A name listed here is fetched by the same query and cached in the 'options' cache,
+		 * or recorded in the 'notoptions' cache when the site has no such row, so that the
+		 * first get_option() call for it does not need a query of its own. Adding a name is
+		 * only worth it for an option the request is going to read anyway: a name that is
+		 * never read still widens the query's WHERE clause.
+		 *
+		 * @since 7.0.0
+		 *
+		 * @param string[] $primed_option_names Option names to prime. Default is the three
+		 *                                      non-autoloaded options core reads on a
+		 *                                      front-end page view.
+		 */
+		$primed_option_names = (array) apply_filters( 'prime_options_with_alloptions', $primed_option_names );
+		$primed_option_names = array_values( array_unique( array_filter( array_map( 'strval', $primed_option_names ), 'strlen' ) ) );
+
+		$autoload_values = wp_autoload_values_to_autoload();
+		$autoload_clause = "autoload IN ( '" . implode( "', '", esc_sql( $autoload_values ) ) . "' )";
+
+		if ( $primed_option_names ) {
+			$autoload_clause .= " OR option_name IN ( '" . implode( "', '", esc_sql( $primed_option_names ) ) . "' )";
+		}
+
 		$suppress      = $wpdb->suppress_errors();
-		$alloptions_db = $wpdb->get_results( "SELECT option_name, option_value FROM $wpdb->options WHERE autoload IN ( '" . implode( "', '", esc_sql( wp_autoload_values_to_autoload() ) ) . "' )" );
+		$alloptions_db = $wpdb->get_results( "SELECT option_name, option_value, autoload FROM $wpdb->options WHERE $autoload_clause" );
 
 		if ( ! $alloptions_db ) {
 			$alloptions_db = $wpdb->get_results( "SELECT option_name, option_value FROM $wpdb->options" );
 		}
 		$wpdb->suppress_errors( $suppress );
 
-		$alloptions = array();
+		$alloptions    = array();
+		$primed_values = array();
 		foreach ( (array) $alloptions_db as $o ) {
-			$alloptions[ $o->option_name ] = $o->option_value;
+			/*
+			 * A row without an autoload property came from the fallback query above, which
+			 * selects every option and has always been treated as autoloaded here. A row that
+			 * carries one is only autoloaded if its value says so - the widened WHERE clause
+			 * also matches rows that are not.
+			 */
+			if ( ! isset( $o->autoload ) || in_array( $o->autoload, $autoload_values, true ) ) {
+				$alloptions[ $o->option_name ] = $o->option_value;
+			} else {
+				$primed_values[ $o->option_name ] = $o->option_value;
+			}
+		}
+
+		if ( $primed_option_names && ( ! wp_installing() || ! is_multisite() ) ) {
+			if ( $primed_values ) {
+				wp_cache_set_multiple( $primed_values, 'options' );
+			}
+
+			$missing_options = array_diff( $primed_option_names, array_keys( $primed_values ), array_keys( $alloptions ) );
+
+			if ( $missing_options ) {
+				$notoptions = wp_cache_get( 'notoptions', 'options' );
+
+				if ( ! is_array( $notoptions ) ) {
+					$notoptions = array();
+				}
+
+				foreach ( $missing_options as $missing_option ) {
+					$notoptions[ $missing_option ] = true;
+				}
+
+				wp_cache_set( 'notoptions', $notoptions, 'options' );
+			}
 		}
 
 		if ( ! wp_installing() || ! is_multisite() ) {

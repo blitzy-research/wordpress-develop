@@ -59,6 +59,23 @@
  * @since 7.0.0
  */
 
+/*
+ * This file has no meaning outside a WordPress bootstrap: it registers an autoloader
+ * against a map it resolves relative to ABSPATH. Requested directly over the web it
+ * answered HTTP 200 with an empty body, which reads as a successful fetch of a core
+ * file rather than as a refusal, and it registered an autoloader in a process that had
+ * nothing to autoload. ABSPATH is defined before wp-settings.php requires this file and
+ * is never defined on a direct request, so it is what tells the two apart.
+ *
+ * http_response_code() is used rather than status_header() because WordPress is by
+ * definition not loaded on the path this guards, and it is a no-op under CLI, where
+ * there is no response to set a status on.
+ */
+if ( ! defined( 'ABSPATH' ) ) {
+	http_response_code( 403 );
+	exit;
+}
+
 /**
  * Loads the file that declares a core class, interface or trait.
  *
